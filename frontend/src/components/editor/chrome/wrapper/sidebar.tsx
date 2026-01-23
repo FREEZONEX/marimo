@@ -149,11 +149,11 @@ export const Sidebar: React.FC = () => {
           </SidebarItem>
         )}
       />
-      <FeedbackButton>
+      {/* <FeedbackButton>
         <SidebarItem tooltip="Send feedback!" selected={false}>
           <MessageCircleQuestionIcon className="h-5 w-5" />
         </SidebarItem>
-      </FeedbackButton>
+      </FeedbackButton> */}
       <div className="flex-1" />
       <QueuedOrRunningStack />
     </div>
