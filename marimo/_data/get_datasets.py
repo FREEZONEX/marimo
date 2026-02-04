@@ -1,6 +1,9 @@
-# Copyright 2026 Marimo. All rights reserved.
+# Copyright 2024 Marimo. All rights reserved.
+# Tier0 Patched Version: Added namespace filtering and numeric identifier quoting
 from __future__ import annotations
 
+import os
+import re
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from marimo import _loggers
@@ -21,6 +24,23 @@ if TYPE_CHECKING:
     import duckdb
 
 
+# ============ Tier0 Patch Start ============
+def _quote_identifier(name: str) -> str:
+    """Quote identifier if it starts with a digit or contains special characters.
+
+    Tier0 Patch: Handle numeric namespace IDs like '326933050398736'
+    """
+    if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
+        return name
+    return f'"{name}"'
+
+
+# Environment variables for S3 Tables namespace filtering
+_S3TABLES_NAMESPACE = os.getenv("NAMESPACE_ID")
+_S3TABLES_DATABASE = os.getenv("S3TABLES_DATABASE", "s3tables")
+# ============ Tier0 Patch End ============
+
+
 def get_datasets_from_variables(
     variables: list[tuple[VariableName, object]],
 ) -> list[DataTable]:
@@ -33,9 +53,7 @@ def get_datasets_from_variables(
     return tables
 
 
-def _get_data_table(
-    value: object, variable_name: VariableName
-) -> Optional[DataTable]:
+def _get_data_table(value: object, variable_name: VariableName) -> Optional[DataTable]:
     try:
         table = get_table_manager_or_none(value)
         if table is None:
@@ -69,7 +87,7 @@ def _get_data_table(
 
 
 def has_updates_to_datasource(query: str) -> bool:
-    import duckdb
+    import duckdb  # type: ignore[import-not-found,import-untyped,unused-ignore] # noqa: E501
 
     try:
         statements = duckdb.extract_statements(query.strip())
@@ -77,36 +95,32 @@ def has_updates_to_datasource(query: str) -> bool:
         # May not be valid SQL
         return False
 
-    # duckdb > 1.4.0 added _STATEMENT suffix to the statement types
-    STATEMENT_TYPES = {
-        "ATTACH_STATEMENT",
-        "ATTACH",
-        "DETACH_STATEMENT",
-        "DETACH",
-        "ALTER_STATEMENT",
-        "ALTER",
+    return any(
+        statement.type == duckdb.StatementType.ATTACH
+        or statement.type == duckdb.StatementType.DETACH
+        or statement.type == duckdb.StatementType.ALTER
         # This may catch some false positives for other CREATE statements
-        "CREATE_STATEMENT",
-        "CREATE",
-    }
+        or statement.type == duckdb.StatementType.CREATE
+        for statement in statements
+    )
 
-    for statement in statements:
-        if statement.type.name in STATEMENT_TYPES:
-            return True
-    return False
+
+def _get_default_connection() -> "duckdb.DuckDBPyConnection":
+    import duckdb
+
+    return duckdb.default_connection()
 
 
 def execute_duckdb_query(
     connection: Optional[duckdb.DuckDBPyConnection], query: str
 ) -> list[Any]:
-    """Execute a DuckDB query and return the result. Uses connection if provided, otherwise uses duckdb."""
+    """Execute a DuckDB query and return the result.
+
+    Tier0 Patch: Always use default_connection() so we see S3 Tables attached
+    by sitecustomize.py, even if marimo provides a different connection.
+    """
     try:
-        if connection is None:
-            import duckdb
-
-            return duckdb.execute(query).fetchall()
-
-        return connection.execute(query).fetchall()
+        return _get_default_connection().execute(query).fetchall()
     except Exception as e:
         if DependencyManager.duckdb.has():
             import duckdb
@@ -163,12 +177,7 @@ def _get_databases_from_duckdb_internal(
     tables_result = []
     query = "SHOW ALL TABLES"
     try:
-        if connection is None:
-            import duckdb
-
-            tables_result = duckdb.execute(query).fetchall()
-        else:
-            tables_result = connection.execute(query).fetchall()
+        tables_result = _get_default_connection().execute(query).fetchall()
     except Exception as e:
         if DependencyManager.duckdb.has():
             import duckdb
@@ -212,16 +221,27 @@ def _get_databases_from_duckdb_internal(
         if name in SKIP_TABLES:
             continue
 
+        # ============ Tier0 Patch Start ============
+        # Filter S3 Tables by NAMESPACE_ID environment variable
+        if _S3TABLES_NAMESPACE and database == _S3TABLES_DATABASE:
+            if schema != _S3TABLES_NAMESPACE:
+                continue  # Skip tables from other namespaces
+        # ============ Tier0 Patch End ============
+
         assert len(column_names) == len(column_types)
         assert isinstance(column_names, list)
         assert isinstance(column_types, list)
 
         catalog_table = (
-            len(column_names) == 1
-            and column_names[0] == CATALOG_TABLE_COLUMN_NAME
+            len(column_names) == 1 and column_names[0] == CATALOG_TABLE_COLUMN_NAME
         )
         if catalog_table:
-            qualified_name = f"{database}.{schema}.{name}"
+            # ============ Tier0 Patch Start ============
+            # Quote identifiers to handle numeric namespace IDs
+            qualified_name = (
+                f"{database}.{_quote_identifier(schema)}.{_quote_identifier(name)}"
+            )
+            # ============ Tier0 Patch End ============
             columns = get_table_columns(connection, qualified_name)
         else:
             columns = [
@@ -374,6 +394,13 @@ def get_duckdb_databases_agg_query(
         table_name,
         cols,
     ) in tables_result:
+        # ============ Tier0 Patch Start ============
+        # Filter S3 Tables by NAMESPACE_ID environment variable
+        if _S3TABLES_NAMESPACE and database_name == _S3TABLES_DATABASE:
+            if schema_name != _S3TABLES_NAMESPACE:
+                continue  # Skip tables from other namespaces
+        # ============ Tier0 Patch End ============
+
         columns: list[DataTableColumn] = []
         assert isinstance(cols, list)
         for col in cols:
