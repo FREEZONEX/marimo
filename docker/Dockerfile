@@ -91,13 +91,15 @@ USER appuser
 CMD ["marimo", "edit", "--no-token", "-p", "8080", "--host", "0.0.0.0"]
 
 # ============================================================
-# tier0 - Tier0 专用（S3 Tables 支持）
+# tier0 - Tier0 专用（S3 Tables 支持，AK/SK 凭证方案）
 # ============================================================
 FROM sql AS tier0
 
 USER root
 
-# 安装 S3 Tables 依赖
+# 安装 S3 Tables 核心依赖
+# - duckdb, pyarrow, polars, sqlglot: S3 Tables / Iceberg 查询必需
+# - boto3: 可选，供 notebook 用户在代码中使用 AWS SDK（S3 连接本身不再需要）
 RUN uv pip install --system duckdb boto3 pyarrow polars sqlglot
 
 # 复制 Tier0 模块到 site-packages
