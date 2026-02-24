@@ -88,11 +88,11 @@ export const Controls = ({
       {!closed && (
         <div className={topRightControls}>
           {presenting && <LayoutSelect />}
-          <NotebookMenuDropdown
+          {/* <NotebookMenuDropdown
             disabled={disabled}
             tooltip={connectionTooltip}
           />
-          <ConfigButton disabled={disabled} tooltip={connectionTooltip} />
+          <ConfigButton disabled={disabled} tooltip={connectionTooltip} /> */}
           <ShutdownButton
             description="This will terminate the Python kernel. You'll lose all data that's in memory."
             disabled={disabled}
@@ -122,7 +122,7 @@ export const Controls = ({
           </Button>
         </Tooltip>
 
-        <CommandPaletteButton />
+        {/* <CommandPaletteButton /> */}
         <KeyboardShortcuts />
 
         <div />
