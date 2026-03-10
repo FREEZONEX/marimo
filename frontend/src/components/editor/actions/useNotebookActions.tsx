@@ -463,6 +463,7 @@ export function useNotebookActions() {
       icon: <CommandIcon size={14} strokeWidth={1.5} />,
       label: "Command palette",
       hotkey: "global.commandPalette",
+      redundant: true,
       handle: () => setCommandPaletteOpen((open) => !open),
     },
 
@@ -470,6 +471,7 @@ export function useNotebookActions() {
       icon: <KeyboardIcon size={14} strokeWidth={1.5} />,
       label: "Keyboard shortcuts",
       hotkey: "global.showHelp",
+      redundant: true,
       handle: () => setKeyboardShortcutsOpen((open) => !open),
     },
     {
@@ -481,6 +483,7 @@ export function useNotebookActions() {
     {
       icon: <ExternalLinkIcon size={14} strokeWidth={1.5} />,
       label: "Resources",
+      redundant: true,
       handle: NOOP_HANDLER,
       dropdown: [
         {
@@ -528,6 +531,7 @@ export function useNotebookActions() {
       // If file is in the url, then we ran `marimo edit`
       // without a specific file
       hidden: !location.search.includes("file"),
+      redundant: true,
       handle: () => {
         const withoutSearch = document.baseURI.split("?")[0];
         window.open(withoutSearch, "_self");
@@ -540,6 +544,7 @@ export function useNotebookActions() {
       // If file is in the url, then we ran `marimo edit`
       // without a specific file
       hidden: !location.search.includes("file"),
+      redundant: true,
       handle: () => {
         const url = newNotebookURL();
         window.open(url, "_blank");
