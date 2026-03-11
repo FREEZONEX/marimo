@@ -113,9 +113,15 @@ RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") &
 # 预下载 DuckDB 扩展
 RUN python -c "import duckdb; duckdb.sql('INSTALL iceberg; INSTALL aws;'); print('Extensions installed')"
 
+# 创建 appuser 可写的包目录，供运行时 uv install 使用
+RUN mkdir -p /app/packages && chown -R appuser:appuser /app/packages
+
 # 环境变量
 ENV PYTHONUNBUFFERED=1
 ENV PORT=2718
+# uv 运行时包安装目标：appuser 可写路径，避免写入 root 所有的 site-packages
+ENV MARIMO_UV_TARGET=/app/packages
+ENV PYTHONPATH=/app/packages
 EXPOSE 2718
 
 USER appuser

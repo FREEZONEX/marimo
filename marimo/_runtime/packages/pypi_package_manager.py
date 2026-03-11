@@ -247,6 +247,8 @@ class UvPackageManager(PypiPackageManager):
         return (
             "failed to write to the distribution cache" in output_text
             or "operation not permitted" in output_text
+            # 修复更新package报错权限问题：permission denied
+            or "permission denied" in output_text
         )
 
     def is_manager_installed(self) -> bool:
