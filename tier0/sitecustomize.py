@@ -41,8 +41,8 @@ def _early_init_s3tables():
 
         conn = duckdb.default_connection()
 
-        # 加载扩展（扩展已在 Dockerfile 中预装，直接 LOAD 避免 INSTALL 向 stdout 打印进度条）
-        conn.sql("LOAD iceberg; LOAD aws;")
+        # 安装并加载扩展（DuckDB 1.4.4 INSTALL 缓存命中时不打印 stdout，不污染 uv 子进程通信）
+        conn.sql("INSTALL iceberg; INSTALL aws; LOAD iceberg; LOAD aws;")
 
         region = os.getenv("AWS_REGION", "ap-southeast-1")
         namespace_id = os.getenv("NAMESPACE_ID")

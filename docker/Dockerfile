@@ -100,7 +100,7 @@ USER root
 # 安装 S3 Tables 核心依赖
 # - duckdb, pyarrow, polars, sqlglot: S3 Tables / Iceberg 查询必需
 # - boto3: 可选，供 notebook 用户在代码中使用 AWS SDK（S3 连接本身不再需要）
-RUN uv pip install --system duckdb boto3 pyarrow polars sqlglot
+RUN uv pip install --system duckdb==1.4.4 boto3 pyarrow polars sqlglot
 
 # 复制 Tier0 模块到 site-packages
 COPY tier0/sitecustomize.py /tmp/sitecustomize.py
@@ -110,10 +110,8 @@ RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") &
     cp /tmp/tier0_s3tables.py "$SITE_PACKAGES/" && \
     rm /tmp/sitecustomize.py /tmp/tier0_s3tables.py
 
-# 预下载 DuckDB 扩展（以 appuser 运行，确保扩展存储在 /home/appuser/.duckdb/ 而非 /root/.duckdb/）
-USER appuser
+# 预下载 DuckDB 扩展（DuckDB 1.4.4 INSTALL 缓存命中时不打印 stdout，不污染 uv 子进程通信）
 RUN python -c "import duckdb; duckdb.sql('INSTALL iceberg; INSTALL aws;'); print('Extensions installed')"
-USER root
 
 # 环境变量
 ENV PYTHONUNBUFFERED=1
