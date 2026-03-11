@@ -42,7 +42,11 @@ def _early_init_s3tables():
 
         conn = duckdb.default_connection()
 
-        # 安装并加载扩展（DuckDB 1.4.4 INSTALL 缓存命中时不打印 stdout，不污染 uv 子进程通信）
+        # 禁用进度条：ATTACH S3 Tables 是网络调用，耗时 >2s 会触发 DuckDB 进度条写入 stdout，
+        # 导致 uv pip list --format=json 的 JSON 输出被污染，packages 侧边栏显示 "No packages"
+        conn.sql("SET enable_progress_bar = false;")
+
+        # 安装并加载扩展（INSTALL 缓存命中时静默，已在 Dockerfile 以 appuser 预装到 /home/appuser/.duckdb/）
         conn.sql("INSTALL iceberg; INSTALL aws; LOAD iceberg; LOAD aws;")
 
         region = os.getenv("AWS_REGION", "ap-southeast-1")
