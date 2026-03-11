@@ -100,7 +100,7 @@ USER root
 # 安装 S3 Tables 核心依赖
 # - duckdb, pyarrow, polars, sqlglot: S3 Tables / Iceberg 查询必需
 # - boto3: 可选，供 notebook 用户在代码中使用 AWS SDK（S3 连接本身不再需要）
-RUN uv pip install --system duckdb boto3 pyarrow polars sqlglot
+RUN uv pip install --system duckdb==1.4.4 boto3 pyarrow polars sqlglot
 
 # 复制 Tier0 模块到 site-packages
 COPY tier0/sitecustomize.py /tmp/sitecustomize.py
@@ -110,15 +110,20 @@ RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") &
     cp /tmp/tier0_s3tables.py "$SITE_PACKAGES/" && \
     rm /tmp/sitecustomize.py /tmp/tier0_s3tables.py
 
-# 预下载 DuckDB 扩展
+# 预下载 DuckDB 扩展（必须以 appuser 运行，确保扩展缓存在 /home/appuser/.duckdb/）
+# 原因：运行时 marimo 以 appuser 身份启动，DuckDB 只在用户 home 下查找扩展缓存
+# 若缓存在 /root/.duckdb/，运行时 appuser 找不到缓存会触发下载并向 stdout 输出，
+# 导致 uv pip list --format=json 输出被污染，packages 侧边栏显示 "No packages"
+USER appuser
 RUN python -c "import duckdb; duckdb.sql('INSTALL iceberg; INSTALL aws;'); print('Extensions installed')"
 
 # 环境变量
 ENV PYTHONUNBUFFERED=1
 ENV PORT=2718
+# uv 运行时包安装目标：隐藏目录（以 . 开头），marimo 文件浏览器跳过，同时在 PVC 内持久化
+# 注意：不设置 PYTHONPATH（由 sitecustomize.py 在启动时动态注入 sys.path，避免污染子进程）
+ENV MARIMO_UV_TARGET=/app/.packages
 EXPOSE 2718
-
-USER appuser
 
 ENTRYPOINT ["marimo"]
 CMD ["edit", "--no-token", "--host", "0.0.0.0", "-p", "2718"]

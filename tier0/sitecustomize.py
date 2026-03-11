@@ -13,6 +13,7 @@ AK/SK 方案：使用长期 AWS 凭证（Access Key ID / Secret Access Key）
 - S3TABLES_BUCKET_ARN: S3 Tables bucket ARN（必需）
 - NAMESPACE_ID: 命名空间 ID，通常等于 workspace ID
 - S3TABLES_DATABASE: DuckDB 中的数据库名（默认 s3tables）
+- MARIMO_UV_TARGET: uv --target 安装目录，启动时自动注入 sys.path（替代 PYTHONPATH）
 """
 
 import os
@@ -41,7 +42,11 @@ def _early_init_s3tables():
 
         conn = duckdb.default_connection()
 
-        # 安装和加载扩展
+        # 禁用进度条：ATTACH S3 Tables 是网络调用，耗时 >2s 会触发 DuckDB 进度条写入 stdout，
+        # 导致 uv pip list --format=json 的 JSON 输出被污染，packages 侧边栏显示 "No packages"
+        conn.sql("SET enable_progress_bar = false;")
+
+        # 安装并加载扩展（INSTALL 缓存命中时静默，已在 Dockerfile 以 appuser 预装到 /home/appuser/.duckdb/）
         conn.sql("INSTALL iceberg; INSTALL aws; LOAD iceberg; LOAD aws;")
 
         region = os.getenv("AWS_REGION", "ap-southeast-1")
@@ -111,7 +116,21 @@ def _early_init_s3tables():
         traceback.print_exc()
 
 
+def _inject_uv_target_path():
+    """将 MARIMO_UV_TARGET 注入 sys.path，使运行时安装的包可被 Python 找到。
+
+    使用此方式替代 PYTHONPATH 环境变量，原因：
+    - PYTHONPATH 会被 uv 子进程继承，当目录不存在时 uv pip list 返回空列表
+    - sys.path 只影响当前 Python 进程，不传递给子进程
+    - 目录不存在时安全跳过，首次 uv install 后自动生效
+    """
+    uv_target = os.environ.get("MARIMO_UV_TARGET")
+    if uv_target and uv_target not in sys.path:
+        sys.path.insert(0, uv_target)
+
+
 # 确保只初始化一次
 if not hasattr(builtins, "_tier0_sitecustomize_done"):
+    _inject_uv_target_path()
     _early_init_s3tables()
     builtins._tier0_sitecustomize_done = True
