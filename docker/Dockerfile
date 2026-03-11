@@ -110,18 +110,18 @@ RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") &
     cp /tmp/tier0_s3tables.py "$SITE_PACKAGES/" && \
     rm /tmp/sitecustomize.py /tmp/tier0_s3tables.py
 
-# 预下载 DuckDB 扩展
+# 预下载 DuckDB 扩展（以 appuser 运行，确保扩展存储在 /home/appuser/.duckdb/ 而非 /root/.duckdb/）
+USER appuser
 RUN python -c "import duckdb; duckdb.sql('INSTALL iceberg; INSTALL aws;'); print('Extensions installed')"
-
-# 创建 appuser 可写的包目录，供运行时 uv install 使用
-RUN mkdir -p /app/packages && chown -R appuser:appuser /app/packages
+USER root
 
 # 环境变量
 ENV PYTHONUNBUFFERED=1
 ENV PORT=2718
-# uv 运行时包安装目标：appuser 可写路径，避免写入 root 所有的 site-packages
-ENV MARIMO_UV_TARGET=/app/packages
-ENV PYTHONPATH=/app/packages
+# uv 运行时包安装目标：隐藏目录（以 . 开头），marimo 文件浏览器跳过，同时在 PVC 内持久化
+# 注意：/app 在容器运行时会被 PVC 覆盖，.packages 目录由 uv 在首次安装时自动创建
+ENV MARIMO_UV_TARGET=/app/.packages
+ENV PYTHONPATH=/app/.packages
 EXPOSE 2718
 
 USER appuser
