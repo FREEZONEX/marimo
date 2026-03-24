@@ -1,6 +1,7 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 from marimo import _loggers
@@ -248,6 +249,14 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         except Exception:
             LOGGER.warning("Failed to get schema names", exc_info=True)
             return []
+
+        # Tier0 定制逻辑：基于多租户数据隔离安全需求，读取 TIER0_VISIBLE_SCHEMA 环境变量（由控制器下发）
+        # 执行 Schema 级别的强过滤。确保当前实例只能在左侧数据源面板中看到并操作被授权的 Schema，
+        # 从而防止越权浏览其他租户的表结构。
+        visible_schema = os.getenv("TIER0_VISIBLE_SCHEMA")
+        if visible_schema:
+            schema_names = [s for s in schema_names if s == visible_schema]
+
         schemas: list[Schema] = []
 
         for schema in schema_names:
@@ -360,7 +369,6 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
                     )
         except Exception:
             LOGGER.warning("Failed to get indexes", exc_info=True)
-            pass
 
         cols: list[DataTableColumn] = []
         for col in columns:

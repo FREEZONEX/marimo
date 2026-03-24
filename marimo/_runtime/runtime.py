@@ -662,6 +662,12 @@ class Kernel:
 
         exec("import marimo as __marimo__", self.globals)
 
+        # Tier0: 注入 sitecustomize.py 预初始化的 PG 引擎到 kernel globals
+        import builtins as _builtins
+        _t0_engine = getattr(_builtins, "_tier0_pg_engine", None)
+        if _t0_engine is not None:
+            self.globals["pg"] = _t0_engine
+
         # Lifespans
         lifespan = Lifespans(_KERNEL_LIFESPAN_REGISTRY.get_all())
         self._lifespan: Optional[
@@ -669,6 +675,35 @@ class Kernel:
         ] = None
         if lifespan.has_lifespans():
             self._lifespan = lifespan(None)
+
+    def _broadcast_tier0_engines(self) -> None:
+        """Tier0: 广播注入的 PG 引擎为数据源，确保 sidebar 在 notebook 打开时就能展示。"""
+        if "pg" not in self.globals:
+            return
+        try:
+            from marimo._messaging.notification import DataSourceConnectionsNotification
+            from marimo._messaging.notification_utils import broadcast_notification
+            from marimo._sql.get_engines import (
+                engine_to_data_source_connection,
+                get_engines_from_variables,
+            )
+            from marimo._types.ids import VariableName
+
+            engines = get_engines_from_variables(
+                [(VariableName("pg"), self.globals["pg"])]
+            )
+            if not engines:
+                return
+            broadcast_notification(
+                DataSourceConnectionsNotification(
+                    connections=[
+                        engine_to_data_source_connection(variable, engine)
+                        for variable, engine in engines
+                    ]
+                )
+            )
+        except Exception as e:
+            LOGGER.warning("[Tier0] Failed to broadcast PG datasource: %s", e)
 
     def teardown(self) -> None:
         """Teardown resources owned by the kernel."""
@@ -2105,6 +2140,10 @@ class Kernel:
             await self._lifespan.__aenter__()
 
         self.load_dotenv()
+
+        # Tier0: 在 notebook 实例化时立即广播注入的 PG 数据源
+        # on_finish hook 仅在 cell 执行后触发，用户打开 notebook 未执行 cell 时不会广播
+        self._broadcast_tier0_engines()
 
         if self.graph.cells:
             del request

@@ -1,19 +1,13 @@
 """
 sitecustomize.py - Python 启动时自动执行
 
-AK/SK 方案：使用长期 AWS 凭证（Access Key ID / Secret Access Key）
-- 从环境变量读取 AWS_ACCESS_KEY_ID 和 AWS_SECRET_ACCESS_KEY
-- 配置 DuckDB 静态 Secret，无需后台刷新线程
-- 初始化 S3 Tables 连接供 Marimo 侧边栏和 tier0_s3tables 模块使用
+PostgreSQL 直连方案：通过 DATABASE_URL 环境变量自动创建 SQLAlchemy Engine，
+供 marimo 内核自动发现并在侧边栏展示租户数据库表。
 
 环境变量:
-- AWS_ACCESS_KEY_ID: AWS Access Key ID（必需）
-- AWS_SECRET_ACCESS_KEY: AWS Secret Access Key（必需）
-- AWS_REGION: AWS 区域（默认 ap-southeast-1）
-- S3TABLES_BUCKET_ARN: S3 Tables bucket ARN（必需）
-- NAMESPACE_ID: 命名空间 ID，通常等于 workspace ID
-- S3TABLES_DATABASE: DuckDB 中的数据库名（默认 s3tables）
-- MARIMO_UV_TARGET: uv --target 安装目录，启动时自动注入 sys.path（替代 PYTHONPATH）
+- DATABASE_URL: PostgreSQL 连接串（必需，格式 postgresql://user:pass@host:5432/dbname）
+- TIER0_VISIBLE_SCHEMA: 可见 schema 白名单（默认 uns）
+- MARIMO_UV_TARGET: uv --target 安装目录，启动时自动注入 sys.path
 """
 
 import os
@@ -21,8 +15,10 @@ import sys
 import builtins
 
 
+# === S3 Tables 方案已封存，改用 PostgreSQL 直连 ===
+# 以下函数体完整保留，调用入口已注释。如需恢复 S3 方案，取消下方启动入口的注释即可。
 def _early_init_s3tables():
-    """在 Python 启动时初始化 S3 Tables 连接"""
+    """在 Python 启动时初始化 S3 Tables 连接（已封存）"""
 
     bucket_arn = os.getenv("S3TABLES_BUCKET_ARN")
     if not bucket_arn:
@@ -42,18 +38,14 @@ def _early_init_s3tables():
 
         conn = duckdb.default_connection()
 
-        # 禁用进度条：ATTACH S3 Tables 是网络调用，耗时 >2s 会触发 DuckDB 进度条写入 stdout，
-        # 导致 uv pip list --format=json 的 JSON 输出被污染，packages 侧边栏显示 "No packages"
         conn.sql("SET enable_progress_bar = false;")
 
-        # 安装并加载扩展（INSTALL 缓存命中时静默，已在 Dockerfile 以 appuser 预装到 /home/appuser/.duckdb/）
         conn.sql("INSTALL iceberg; INSTALL aws; LOAD iceberg; LOAD aws;")
 
         region = os.getenv("AWS_REGION", "ap-southeast-1")
         namespace_id = os.getenv("NAMESPACE_ID")
         s3tables_database = os.getenv("S3TABLES_DATABASE", "s3tables")
 
-        # 使用 AK/SK 创建静态 Secret（永不过期，无需刷新）
         try:
             conn.sql("DROP SECRET IF EXISTS aws_s3tables;")
         except Exception:
@@ -68,7 +60,6 @@ def _early_init_s3tables():
             );
         """)
 
-        # ATTACH S3 Tables
         conn.sql(
             f"ATTACH '{bucket_arn}' AS {s3tables_database} (TYPE ICEBERG, ENDPOINT_TYPE s3_tables);"
         )
@@ -82,7 +73,6 @@ def _early_init_s3tables():
                     file=sys.stderr,
                 )
 
-            # 获取当前 namespace 的表数量
             all_tables = conn.sql("SHOW ALL TABLES").fetchall()
             namespace_tables = [
                 row[2]
@@ -102,7 +92,6 @@ def _early_init_s3tables():
                 file=sys.stderr,
             )
 
-        # 存储连接信息供 tier0_s3tables 使用
         builtins._tier0_s3conn = conn
         builtins._tier0_credential_method = "ak_sk"
 
@@ -111,6 +100,49 @@ def _early_init_s3tables():
 
         print(
             f"[sitecustomize] Error initializing S3 Tables: {e}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+# === S3 Tables 封存结束 ===
+
+
+def _early_init_postgresql():
+    """在 Python 启动时自动创建 PostgreSQL 连接
+
+    读取 DATABASE_URL 环境变量，创建 SQLAlchemy Engine 并存入 builtins，
+    供 marimo 内核 preparation hook 注入到 globals 实现侧边栏自动发现。
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        return
+
+    try:
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(database_url, pool_pre_ping=True)
+
+        # 立即存入 builtins，pool_pre_ping 保证后续自动重连
+        # 不以连接测试结果为前提，确保 PG 暂时不可用时 marimo 仍正常启动
+        builtins._tier0_pg_engine = engine
+
+        # 连接测试仅用于日志确认，不阻塞启动
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            print(
+                "[sitecustomize] PostgreSQL initialized and verified: pool_pre_ping=True",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(
+                f"[sitecustomize] PostgreSQL engine created but connectivity check failed (will auto-reconnect): {e}",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        import traceback
+
+        print(
+            f"[sitecustomize] Error initializing PostgreSQL: {e}",
             file=sys.stderr,
         )
         traceback.print_exc()
@@ -132,5 +164,6 @@ def _inject_uv_target_path():
 # 确保只初始化一次
 if not hasattr(builtins, "_tier0_sitecustomize_done"):
     _inject_uv_target_path()
-    _early_init_s3tables()
+    # _early_init_s3tables()  # S3 方案已封存，改用 PG 直连
+    _early_init_postgresql()
     builtins._tier0_sitecustomize_done = True

@@ -15,6 +15,7 @@ from marimo._messaging.errors import (
 from marimo._messaging.notification_utils import CellNotificationUtils
 from marimo._runtime.control_flow import MarimoStopError
 from marimo._runtime.runner import cell_runner
+from marimo._runtime.runner.hooks_setup_engines import _broadcast_tier0_datasource
 from marimo._tracer import kernel_tracer
 
 LOGGER = _loggers.marimo_logger()
@@ -92,4 +93,5 @@ def _send_cancellation_errors(runner: cell_runner.Runner) -> None:
 ON_FINISH_HOOKS: list[OnFinishHookType] = [
     _send_interrupt_errors,
     _send_cancellation_errors,
+    _broadcast_tier0_datasource,
 ]

@@ -91,31 +91,36 @@ USER appuser
 CMD ["marimo", "edit", "--no-token", "-p", "8080", "--host", "0.0.0.0"]
 
 # ============================================================
-# tier0 - Tier0 专用（S3 Tables 支持，AK/SK 凭证方案）
+# tier0 - Tier0 专用（PostgreSQL 直连方案）
 # ============================================================
 FROM sql AS tier0
 
 USER root
 
-# 安装 S3 Tables 核心依赖
+# === S3 Tables 方案已封存，改用 PostgreSQL 直连 ===
+# S3 Tables 核心依赖
 # - duckdb, pyarrow, polars, sqlglot: S3 Tables / Iceberg 查询必需
-# - boto3: 可选，供 notebook 用户在代码中使用 AWS SDK（S3 连接本身不再需要）
-RUN uv pip install --system duckdb==1.4.4 boto3 pyarrow polars sqlglot
+# - boto3: 可选，供 notebook 用户在代码中使用 AWS SDK
+# RUN uv pip install --system duckdb==1.4.4 boto3 pyarrow polars sqlglot
+
+# PostgreSQL 直连依赖
+# sqlalchemy: marimo 通过 DependencyManager 动态检测，不在 marimo[sql] 中，需显式安装
+# psycopg2-binary: SQLAlchemy PostgreSQL 驱动
+RUN uv pip install --system sqlalchemy psycopg2-binary
 
 # 复制 Tier0 模块到 site-packages
 COPY tier0/sitecustomize.py /tmp/sitecustomize.py
-COPY tier0/tier0_s3tables.py /tmp/tier0_s3tables.py
+# === S3 Tables 模块已封存 ===
+# COPY tier0/tier0_s3tables.py /tmp/tier0_s3tables.py
 RUN SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") && \
     cp /tmp/sitecustomize.py "$SITE_PACKAGES/" && \
-    cp /tmp/tier0_s3tables.py "$SITE_PACKAGES/" && \
-    rm /tmp/sitecustomize.py /tmp/tier0_s3tables.py
+    rm /tmp/sitecustomize.py
 
-# 预下载 DuckDB 扩展（必须以 appuser 运行，确保扩展缓存在 /home/appuser/.duckdb/）
-# 原因：运行时 marimo 以 appuser 身份启动，DuckDB 只在用户 home 下查找扩展缓存
-# 若缓存在 /root/.duckdb/，运行时 appuser 找不到缓存会触发下载并向 stdout 输出，
-# 导致 uv pip list --format=json 输出被污染，packages 侧边栏显示 "No packages"
+# === DuckDB 扩展预下载已封存（S3 方案专用） ===
+# USER appuser
+# RUN python -c "import duckdb; duckdb.sql('INSTALL iceberg; INSTALL aws;'); print('Extensions installed')"
+
 USER appuser
-RUN python -c "import duckdb; duckdb.sql('INSTALL iceberg; INSTALL aws;'); print('Extensions installed')"
 
 # 环境变量
 ENV PYTHONUNBUFFERED=1
