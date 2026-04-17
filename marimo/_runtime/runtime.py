@@ -3047,6 +3047,19 @@ class PackagesCallbacks:
             if package_statuses[pkg] == "installed"
         ]
 
+        # Invalidate importlib's finder caches so the running kernel can see
+        # modules just written to disk. Without this, FileFinder keeps a stale
+        # directory listing and `import <newly_installed>` still raises
+        # ModuleNotFoundError even though the package is on sys.path.
+        # Also drop any None sentinels Python cached for prior failed imports.
+        if installed_modules:
+            import importlib
+
+            importlib.invalidate_caches()
+            for mod_name in installed_modules:
+                if sys.modules.get(mod_name) is None:
+                    sys.modules.pop(mod_name, None)
+
         # If a package was not installed at cell registration time, it won't
         # yet be in the script metadata.
         if self.should_update_script_metadata():
