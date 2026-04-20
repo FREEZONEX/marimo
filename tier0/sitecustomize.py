@@ -154,9 +154,17 @@ def _inject_uv_target_path():
     使用此方式替代 PYTHONPATH 环境变量，原因：
     - PYTHONPATH 会被 uv 子进程继承，当目录不存在时 uv pip list 返回空列表
     - sys.path 只影响当前 Python 进程，不传递给子进程
-    - 目录不存在时安全跳过，首次 uv install 后自动生效
+
+    目录不存在时自动创建，确保 Python 首次解析 path hook 时能缓存到有效的
+    FileFinder，避免 sys.path_importer_cache[uv_target]=None 导致后续
+    uv --target 安装的包在当前 kernel 进程里不可见（只能重启 pod 才恢复）。
     """
     uv_target = os.environ.get("MARIMO_UV_TARGET")
+    if uv_target:
+        try:
+            os.makedirs(uv_target, exist_ok=True)
+        except OSError:
+            pass
     if uv_target and uv_target not in sys.path:
         sys.path.insert(0, uv_target)
 

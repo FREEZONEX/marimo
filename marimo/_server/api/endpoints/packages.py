@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 from starlette.authentication import requires
 
 from marimo._config.settings import GLOBAL_SETTINGS
+from marimo._runtime.commands import RefreshInstalledModulesCommand
 from marimo._runtime.packages.package_manager import PackageManager
 from marimo._runtime.packages.package_managers import create_package_manager
 from marimo._runtime.packages.utils import split_packages
@@ -20,6 +21,8 @@ from marimo._server.models.packages import (
     RemovePackageRequest,
 )
 from marimo._server.router import APIRouter
+from marimo._session.model import SessionMode
+from marimo._types.ids import ConsumerId
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -72,6 +75,19 @@ async def add_package(request: Request) -> PackageOperationResponse:
         )
 
     if success:
+        app_state = AppState(request)
+        session = app_state.get_current_session()
+        if session is not None and app_state.mode == SessionMode.EDIT:
+            modules = [
+                package_manager.package_to_module(package)
+                for package in split_packages(body.package)
+            ]
+            session.put_control_request(
+                RefreshInstalledModulesCommand(modules=modules),
+                from_consumer_id=ConsumerId(
+                    app_state.require_current_session_id()
+                ),
+            )
         return PackageOperationResponse.of_success()
 
     return PackageOperationResponse.of_failure(
