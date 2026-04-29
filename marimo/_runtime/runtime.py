@@ -122,6 +122,7 @@ from marimo._runtime.commands import (
     ListSQLTablesCommand,
     PreviewDatasetColumnCommand,
     PreviewSQLTableCommand,
+    RefreshInstalledModulesCommand,
     RefreshSecretsCommand,
     RenameNotebookCommand,
     StopKernelCommand,
@@ -2344,6 +2345,13 @@ class Kernel:
             await self.packages_callbacks.install_missing_packages(request)
             broadcast_notification(CompletedRunNotification())
 
+        async def handle_refresh_installed_modules(
+            request: RefreshInstalledModulesCommand,
+        ) -> None:
+            await self.packages_callbacks.refresh_installed_modules(
+                request.modules
+            )
+
         async def handle_stop(request: StopKernelCommand) -> None:
             del request
             return None
@@ -2357,6 +2365,10 @@ class Kernel:
         handler.register(InvokeFunctionCommand, handle_function_call)
         handler.register(
             InstallPackagesCommand, handle_install_missing_packages
+        )
+        handler.register(
+            RefreshInstalledModulesCommand,
+            handle_refresh_installed_modules,
         )
         handler.register(DebugCellCommand, handle_pdb_request)
         handler.register(RenameNotebookCommand, handle_rename)
@@ -3047,6 +3059,19 @@ class PackagesCallbacks:
             if package_statuses[pkg] == "installed"
         ]
 
+        # Invalidate importlib's finder caches so the running kernel can see
+        # modules just written to disk. Without this, FileFinder keeps a stale
+        # directory listing and `import <newly_installed>` still raises
+        # ModuleNotFoundError even though the package is on sys.path.
+        # Also drop any None sentinels Python cached for prior failed imports.
+        if installed_modules:
+            import importlib
+
+            importlib.invalidate_caches()
+            for mod_name in installed_modules:
+                if sys.modules.get(mod_name) is None:
+                    sys.modules.pop(mod_name, None)
+
         # If a package was not installed at cell registration time, it won't
         # yet be in the script metadata.
         if self.should_update_script_metadata():
@@ -3068,6 +3093,37 @@ class PackagesCallbacks:
             if (
                 isinstance(cell.exception, ModuleNotFoundError)
                 and cell.exception.name in installed_modules
+            ):
+                cells_to_run.add(cid)
+
+        if cells_to_run:
+            await self._kernel._if_autorun_then_run_cells(cells_to_run)
+
+    async def refresh_installed_modules(self, modules: list[str]) -> None:
+        """Refresh the current kernel after packages were installed externally."""
+        if not modules:
+            return
+
+        import importlib
+
+        importlib.invalidate_caches()
+
+        for mod_name in modules:
+            if sys.modules.get(mod_name) is None:
+                sys.modules.pop(mod_name, None)
+            self._kernel.module_registry.excluded_modules.discard(mod_name)
+
+        cells_to_run = set(
+            cid
+            for module in modules
+            if (cid := self._kernel.module_registry.defining_cell(module))
+            is not None
+        )
+
+        for cid, cell in self._kernel.graph.cells.items():
+            if (
+                isinstance(cell.exception, ModuleNotFoundError)
+                and cell.exception.name in modules
             ):
                 cells_to_run.add(cid)
 

@@ -564,6 +564,17 @@ class InstallPackagesCommand(Command):
     versions: dict[str, str]
 
 
+class RefreshInstalledModulesCommand(Command):
+    """Refresh kernel state after packages were installed externally.
+
+    Used when the server installs packages outside the kernel's normal
+    installation flow, but the current edit session still needs to see the
+    modules immediately without restarting the kernel process.
+    """
+
+    modules: list[str]
+
+
 class PreviewDatasetColumnCommand(Command):
     """Preview a dataset column.
 
@@ -753,6 +764,7 @@ CommandMessage = Union[
     UpdateCellConfigCommand,
     # Package management
     InstallPackagesCommand,
+    RefreshInstalledModulesCommand,
     # UI element and widget model operations
     UpdateUIElementCommand,
     UpdateWidgetModelCommand,
