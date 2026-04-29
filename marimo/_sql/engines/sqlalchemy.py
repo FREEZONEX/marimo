@@ -24,6 +24,31 @@ from marimo._types.ids import VariableName
 
 LOGGER = _loggers.marimo_logger()
 
+_TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES = {
+    "supos_timeserial_long",
+    "supos_timeserial_double",
+    "supos_timeserial_string",
+    "supos_timeserial_integer",
+    "supos_timeserial_float",
+    "supos_timeserial_boolean",
+    "supos_timeserial_datetime",
+    "supos_timeserial_blob",
+    "pg_stat_statements_info",
+    "pg_stat_statements",
+}
+
+
+def _get_hidden_public_tables() -> set[str]:
+    hidden_tables = os.getenv("TIER0_HIDDEN_PUBLIC_TABLES")
+    if hidden_tables is None:
+        return _TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES
+
+    return {
+        item.strip()
+        for item in hidden_tables.split(",")
+        if item.strip()
+    }
+
 if TYPE_CHECKING:
     import pandas as pd
     import polars as pl
@@ -292,6 +317,15 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         except Exception:
             LOGGER.warning("Failed to get tables in schema", exc_info=True)
             return []
+
+        if schema.lower() == "public":
+            hidden_public_tables = _get_hidden_public_tables()
+            table_names = [
+                name for name in table_names if name not in hidden_public_tables
+            ]
+            view_names = [
+                name for name in view_names if name not in hidden_public_tables
+            ]
 
         tables: list[tuple[DataTableType, str]] = []
         for name in table_names:
