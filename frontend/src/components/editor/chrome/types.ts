@@ -88,13 +88,13 @@ export const PANELS: PanelDescriptor[] = [
     tooltip: "Manage packages",
     defaultSection: "sidebar",
   },
-  // {
-  //   type: "ai",
-  //   Icon: BotIcon,
-  //   label: "AI",
-  //   tooltip: "Chat & Agents",
-  //   defaultSection: "sidebar",
-  // },
+  {
+    type: "ai",
+    Icon: BotIcon,
+    label: "AI",
+    tooltip: "Chat & Agents",
+    defaultSection: "sidebar",
+  },
   // {
   //   type: "outline",
   //   Icon: ScrollTextIcon,

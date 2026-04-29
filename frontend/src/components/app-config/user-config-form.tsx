@@ -1366,46 +1366,8 @@ export const UserConfigForm: React.FC = () => {
         onChange={form.handleSubmit(onSubmit)}
         className="flex text-pretty overflow-hidden"
       >
-        <Tabs
-          value={activeCategory}
-          onValueChange={(value) =>
-            setActiveCategory(value as SettingCategoryId)
-          }
-          orientation="vertical"
-          className="w-1/3 border-r h-full overflow-auto p-3"
-        >
-          <TabsList className="self-start max-h-none flex flex-col gap-2 shrink-0 bg-background flex-1 min-h-full">
-            {categories.map((category) => (
-              <TabsTrigger
-                key={category.id}
-                value={category.id}
-                className="w-full text-left p-2 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground justify-start"
-              >
-                <div className="flex gap-4 items-center text-lg overflow-hidden">
-                  <span
-                    className={cn(
-                      category.className,
-                      "w-8 h-8 rounded flex items-center justify-center text-muted-foreground shrink-0",
-                    )}
-                  >
-                    <category.Icon className="w-4 h-4" />
-                  </span>
-                  <span className="truncate">{category.label}</span>
-                </div>
-              </TabsTrigger>
-            ))}
-
-            <div className="p-2 text-xs text-muted-foreground self-start flex flex-col gap-1">
-              <span>Version: {marimoVersion}</span>
-              <span>Locale: {locale}</span>
-            </div>
-
-            <div className="flex-1" />
-            {!isWasm() && configMessage}
-          </TabsList>
-        </Tabs>
-        <div className="w-2/3 pl-6 gap-2 flex flex-col overflow-auto p-6">
-          {renderBody()}
+        <div className="w-full gap-2 flex flex-col overflow-auto">
+          <AiConfig form={form} config={config} onSubmit={onSubmit} />
         </div>
       </form>
     </Form>

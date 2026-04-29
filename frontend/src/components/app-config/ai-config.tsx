@@ -72,14 +72,11 @@ import {
   SelectTrigger,
 } from "../ui/select";
 import { Switch } from "../ui/switch";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
 import { Tooltip } from "../ui/tooltip";
 import { formItemClasses, SettingSubtitle } from "./common";
 import { AWS_REGIONS } from "./constants";
 import { IncorrectModelId } from "./incorrect-model-id";
 import { IsOverridden } from "./is-overridden";
-import { MCPConfig } from "./mcp-config";
-
 interface AiConfigProps {
   form: UseFormReturn<UserConfig>;
   config: UserConfig;
@@ -234,7 +231,7 @@ interface ModelSelectorProps {
   config: UserConfig;
   name: FieldPath<UserConfig>;
   placeholder: string;
-  testId: string;
+  testId?: string;
   description?: React.ReactNode;
   disabled?: boolean;
   label: string;
@@ -1745,36 +1742,33 @@ export const AiConfig: React.FC<AiConfigProps> = ({
   config,
   onSubmit,
 }) => {
-  // MCP is not supported in WASM
-  const wasm = isWasm();
   return (
-    <Tabs defaultValue="ai-features" className="flex-1">
-      <TabsList className="mb-2">
-        <TabsTrigger value="ai-features">AI Features</TabsTrigger>
-        <TabsTrigger value="ai-providers">AI Providers</TabsTrigger>
-        <TabsTrigger value="ai-models">AI Models</TabsTrigger>
-        {!wasm && <TabsTrigger value="mcp">MCP</TabsTrigger>}
-      </TabsList>
-
-      <TabsContent value="ai-features">
-        <AiCodeCompletionConfig
-          form={form}
-          config={config}
-          onSubmit={onSubmit}
-        />
-        <AiAssistConfig form={form} config={config} onSubmit={onSubmit} />
-      </TabsContent>
-      <TabsContent value="ai-providers">
-        <AiProvidersConfig form={form} config={config} onSubmit={onSubmit} />
-      </TabsContent>
-      <TabsContent value="ai-models">
-        <AiModelDisplayConfig form={form} config={config} onSubmit={onSubmit} />
-      </TabsContent>
-      {!wasm && (
-        <TabsContent value="mcp">
-          <MCPConfig form={form} onSubmit={onSubmit} />
-        </TabsContent>
-      )}
-    </Tabs>
+    <SettingGroup>
+      <ApiKey
+        form={form}
+        config={config}
+        name="ai.open_ai.api_key"
+        placeholder="sk-proj..."
+        testId="ai-openai-api-key-input"
+      />
+      <BaseUrl
+        form={form}
+        config={config}
+        name="ai.open_ai.base_url"
+        placeholder="https://api.openai.com/v1"
+        testId="ai-base-url-input"
+        description="Base URL for OpenAI-compatible APIs. Leave blank to use the default OpenAI endpoint."
+      />
+      <ModelSelector
+        label="Model"
+        form={form}
+        config={config}
+        name="ai.models.chat_model"
+        placeholder={DEFAULT_AI_MODEL}
+        description="Model to use for chat and code editing."
+        forRole="chat"
+        onSubmit={onSubmit}
+      />
+    </SettingGroup>
   );
 };
