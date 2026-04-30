@@ -440,20 +440,38 @@ ChatInput.displayName = "ChatInput";
 
 const ChatPanel = () => {
   const aiConfigured = useAtomValue(aiEnabledAtom);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const { handleClick } = useOpenSettingsToTab();
 
   if (!aiConfigured) {
     return (
-      <PanelEmptyState
-        title="Chat with AI"
-        description="No AI provider configured or model selected"
-        action={
-          <Button variant="outline" size="sm" onClick={() => handleClick("ai")}>
-            Edit AI settings
-          </Button>
-        }
-        icon={<BotMessageSquareIcon />}
-      />
+      <>
+        <PanelEmptyState
+          title="Chat with AI"
+          description="No AI provider configured or model selected"
+          action={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                handleClick("ai");
+                setSettingsOpen(true);
+              }}
+            >
+              Edit AI settings
+            </Button>
+          }
+          icon={<BotMessageSquareIcon />}
+        />
+        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+          <DialogContent className="w-full sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>AI Settings</DialogTitle>
+            </DialogHeader>
+            <UserConfigForm />
+          </DialogContent>
+        </Dialog>
+      </>
     );
   }
 

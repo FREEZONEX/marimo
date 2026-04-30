@@ -141,6 +141,12 @@ export const ApiKey: React.FC<ApiKeyProps> = ({
                 type="password"
                 {...field}
                 value={asStringOrEmpty(field.value)}
+                onFocus={() => {
+                  if (asStringOrEmpty(field.value).includes("*")) {
+                    field.onChange("");
+                    onChange?.("");
+                  }
+                }}
                 onChange={(e) => {
                   const value = e.target.value;
                   if (!value.includes("*")) {

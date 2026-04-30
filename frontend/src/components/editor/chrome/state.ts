@@ -35,12 +35,43 @@ const DEFAULT_PANEL_LAYOUT: PanelLayout = {
   ).map((p) => p.type),
 };
 
+function reconcilePanelLayout(layout: PanelLayout): PanelLayout {
+  const sidebar = [...layout.sidebar];
+  const developerPanel = [...layout.developerPanel];
+  const existingPanels = new Set<PanelType>([...sidebar, ...developerPanel]);
+
+  for (const panel of DEFAULT_PANEL_LAYOUT.sidebar) {
+    if (!existingPanels.has(panel)) {
+      sidebar.push(panel);
+      existingPanels.add(panel);
+    }
+  }
+
+  for (const panel of DEFAULT_PANEL_LAYOUT.developerPanel) {
+    if (!existingPanels.has(panel)) {
+      developerPanel.push(panel);
+      existingPanels.add(panel);
+    }
+  }
+
+  return { sidebar, developerPanel };
+}
+
 export const panelLayoutAtom = atomWithStorage<PanelLayout>(
   "marimo:panel-layout",
   DEFAULT_PANEL_LAYOUT,
   jotaiJsonStorage,
   { getOnInit: true },
 );
+
+const initialPanelLayout = reconcilePanelLayout(store.get(panelLayoutAtom));
+if (
+  initialPanelLayout.sidebar.length !== store.get(panelLayoutAtom).sidebar.length ||
+  initialPanelLayout.developerPanel.length !==
+    store.get(panelLayoutAtom).developerPanel.length
+) {
+  store.set(panelLayoutAtom, initialPanelLayout);
+}
 
 /**
  * Resolve which section a panel belongs to based on current layout.
