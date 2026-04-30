@@ -53,6 +53,13 @@ import { cn } from "@/utils/cn";
 import { Logger } from "@/utils/Logger";
 import { AIModelDropdown } from "../ai/ai-model-dropdown";
 import { useOpenSettingsToTab } from "../app-config/state";
+import { UserConfigForm } from "../app-config/user-config-form";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "../ui/dialog";
 import { PromptInput } from "../editor/ai/add-cell-with-ai";
 import {
   addContextCompletion,
@@ -60,7 +67,6 @@ import {
 } from "../editor/ai/completion-utils";
 import { PanelEmptyState } from "../editor/chrome/panels/empty-state";
 import { CopyClipboardIcon } from "../icons/copy-icon";
-import { MCPStatusIndicator } from "../mcp/mcp-status-indicator";
 import { Input } from "../ui/input";
 import { Tooltip, TooltipProvider } from "../ui/tooltip";
 import { toast } from "../ui/use-toast";
@@ -100,7 +106,7 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
   activeChatId,
   setActiveChat,
 }) => {
-  const { handleClick } = useOpenSettingsToTab();
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
     <div className="flex border-b px-2 py-1 justify-between shrink-0 items-center">
@@ -110,17 +116,24 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
         </Button>
       </Tooltip>
       <div className="flex items-center gap-2">
-        <MCPStatusIndicator />
         <Tooltip content="AI Settings">
           <Button
             variant="text"
             size="xs"
             className="hover:bg-foreground/10 py-2"
-            onClick={() => handleClick("ai")}
+            onClick={() => setSettingsOpen(true)}
           >
             <SettingsIcon className="h-4 w-4" />
           </Button>
         </Tooltip>
+        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+          <DialogContent className="w-full sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>AI Settings</DialogTitle>
+            </DialogHeader>
+            <UserConfigForm />
+          </DialogContent>
+        </Dialog>
         <ChatHistoryPopover
           activeChatId={activeChatId}
           setActiveChat={setActiveChat}
