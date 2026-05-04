@@ -55,7 +55,10 @@ export const ConfigButton: React.FC<Props> = ({
       <DialogHeader>
         <DialogTitle>AI Settings</DialogTitle>
       </DialogHeader>
-      <UserConfigForm />
+      <UserConfigForm
+        submitMode="manual"
+        onSubmitted={() => setSettingDialog(false)}
+      />
     </DialogContent>
   );
 

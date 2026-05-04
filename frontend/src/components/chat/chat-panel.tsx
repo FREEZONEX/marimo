@@ -131,7 +131,10 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
             <DialogHeader>
               <DialogTitle>AI Settings</DialogTitle>
             </DialogHeader>
-            <UserConfigForm />
+            <UserConfigForm
+              submitMode="manual"
+              onSubmitted={() => setSettingsOpen(false)}
+            />
           </DialogContent>
         </Dialog>
         <ChatHistoryPopover
@@ -468,7 +471,10 @@ const ChatPanel = () => {
             <DialogHeader>
               <DialogTitle>AI Settings</DialogTitle>
             </DialogHeader>
-            <UserConfigForm />
+            <UserConfigForm
+              submitMode="manual"
+              onSubmitted={() => setSettingsOpen(false)}
+            />
           </DialogContent>
         </Dialog>
       </>

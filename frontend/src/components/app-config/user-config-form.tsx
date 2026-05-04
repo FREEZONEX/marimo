@@ -149,7 +149,15 @@ export const activeUserConfigCategoryAtom = atom<SettingCategoryId>(
 const FORM_DEBOUNCE = 100; // ms;
 const LOCALE_SYSTEM_VALUE = "__system__";
 
-export const UserConfigForm: React.FC = () => {
+interface UserConfigFormProps {
+  submitMode?: "auto" | "manual";
+  onSubmitted?: () => void;
+}
+
+export const UserConfigForm: React.FC<UserConfigFormProps> = ({
+  submitMode = "auto",
+  onSubmitted,
+}) => {
   const [config, setConfig] = useUserConfig();
   const formElement = useRef<HTMLFormElement>(null);
   const setKeyboardShortcutsOpen = useSetAtom(keyboardShortcutsAtom);
@@ -222,6 +230,11 @@ export const UserConfigForm: React.FC = () => {
     });
   };
   const onSubmit = useDebouncedCallback(onSubmitNotDebounced, FORM_DEBOUNCE);
+  const handleAutoSubmit = submitMode === "auto" ? onSubmit : () => {};
+  const handleConfirm = form.handleSubmit(async (values) => {
+    await onSubmitNotDebounced(values);
+    onSubmitted?.();
+  });
 
   const isWasmRuntime = isWasm();
   const htmlCheckboxId = useId();
@@ -1363,11 +1376,22 @@ export const UserConfigForm: React.FC = () => {
     <Form {...form}>
       <form
         ref={formElement}
-        onChange={form.handleSubmit(onSubmit)}
+        onChange={submitMode === "auto" ? form.handleSubmit(onSubmit) : undefined}
         className="flex text-pretty overflow-hidden"
       >
         <div className="w-full gap-2 flex flex-col overflow-auto">
-          <AiConfig form={form} config={config} onSubmit={onSubmit} />
+          <AiConfig form={form} config={config} onSubmit={handleAutoSubmit} />
+          {submitMode === "manual" && (
+            <div className="flex justify-end px-4 pb-4">
+              <Button
+                type="button"
+                onClick={handleConfirm}
+                disabled={!form.formState.isDirty || form.formState.isSubmitting}
+              >
+                Confirm
+              </Button>
+            </div>
+          )}
         </div>
       </form>
     </Form>
