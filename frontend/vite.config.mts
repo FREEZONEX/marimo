@@ -286,6 +286,38 @@ export default defineConfig({
   build: {
     minify: isDev ? false : "oxc", // default is "oxc"
     sourcemap: isDev,
+    rollupOptions: {
+      output: {
+        // 合并明确无 top-level-await 的微小 util 库，缓解首次加载 HTTP/2 排队
+        // （详见 Tier0 根仓库 bug/bug10）。
+        // 保守策略：只动产生大量 <1KB 微 chunk 的工具库；react/codemirror/ai/
+        // loro/pyodide 等含 TLA 或体积较大的依赖保持默认分包，避免触发
+        // vite-plugin-top-level-await 与 rolldown 的兼容性问题。
+        manualChunks(id) {
+          if (!id.includes("node_modules")) {
+            return undefined;
+          }
+          if (
+            id.includes("/lodash/") ||
+            id.includes("/lodash-es/") ||
+            id.includes("/lodash.")
+          ) {
+            return "vendor-lodash";
+          }
+          if (id.includes("/lucide-react/")) {
+            return "vendor-icons";
+          }
+          if (
+            id.includes("/dayjs/") ||
+            id.includes("/date-fns/") ||
+            id.includes("/@date-fns/")
+          ) {
+            return "vendor-date";
+          }
+          return undefined;
+        },
+      },
+    },
   },
   resolve: {
     tsconfigPaths: true,
