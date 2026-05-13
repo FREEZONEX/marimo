@@ -268,11 +268,6 @@ export const AddCellWithAI: React.FC<{
         )}
         <div className="ml-auto flex items-center gap-1">
           {languageDropdown}
-          <AIModelDropdown
-            triggerClassName="h-7 text-xs max-w-64"
-            iconSize="small"
-            forRole="edit"
-          />
         </div>
       </div>
     </div>

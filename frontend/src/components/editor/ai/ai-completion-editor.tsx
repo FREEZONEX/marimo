@@ -358,12 +358,6 @@ export const AiCompletionEditor: React.FC<Props> = ({
                 {isLoading && loadingStopButton}
                 {submitButton}
                 {contextButton}
-                <AIModelDropdown
-                  triggerClassName="h-7 text-xs"
-                  iconSize="small"
-                  forRole="edit"
-                  displayIconOnly={true}
-                />
               </div>
               {completion && (
                 <div className="mt-1 flex items-center gap-1">

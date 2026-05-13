@@ -256,39 +256,6 @@ const ChatInputFooter: React.FC<ChatInputFooterProps> = memo(
       <TooltipProvider>
         <div className="px-3 py-2 border-t border-border/20 flex flex-row flex-wrap items-center justify-between gap-1">
           <div className="flex items-center gap-2">
-            <FeatureFlagged feature="chat_modes">
-              <Select value={currentMode} onValueChange={saveModeChange}>
-                <SelectTrigger className="h-6 text-xs border-border shadow-none! ring-0! bg-muted hover:bg-muted/30 py-0 px-2 gap-1 capitalize">
-                  {currentMode}
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectLabel>AI Mode</SelectLabel>
-                    {modeOptions.map((option) => (
-                      <SelectItem
-                        key={option.value}
-                        value={option.value}
-                        className="text-xs"
-                      >
-                        <div className="flex flex-col">
-                          {option.label}
-                          <div className="text-muted-foreground text-xs pt-1 block">
-                            {option.subtitle}
-                          </div>
-                        </div>
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </FeatureFlagged>
-            <AIModelDropdown
-              placeholder="Model"
-              triggerClassName="h-6 text-xs shadow-none! ring-0! bg-muted hover:bg-muted/30 rounded-sm"
-              iconSize="small"
-              showAddCustomModelDocs={true}
-              forRole="chat"
-            />
           </div>
           <div className="flex flex-row">
             <Tooltip content="Add context">
