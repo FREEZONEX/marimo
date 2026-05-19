@@ -1,5 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { MockModules } from "@/__mocks__/common";
 import { toast } from "@/components/ui/use-toast";
 import type { FilePath } from "@/utils/paths";
 import { RequestingTree } from "../requesting-tree";
@@ -9,9 +10,7 @@ const sendCreateFileOrFolder = vi.fn();
 const sendDeleteFileOrFolder = vi.fn();
 const sendRenameFileOrFolder = vi.fn();
 
-vi.mock("@/components/ui/use-toast", () => ({
-  toast: vi.fn(),
-}));
+vi.mock("@/components/ui/use-toast", () => MockModules.toast());
 
 describe("RequestingTree", () => {
   let requestingTree: RequestingTree;
@@ -174,7 +173,23 @@ describe("RequestingTree", () => {
     sendCreateFileOrFolder.mockResolvedValue({ success: true });
 
     await requestingTree.createFile("file3", "1.2");
-    expect(sendCreateFileOrFolder).toHaveBeenCalled();
+    expect(sendCreateFileOrFolder).toHaveBeenCalledWith({
+      path: "/root/folder1",
+      type: "file",
+      name: "file3",
+    });
+    expect(mockOnChange).toHaveBeenCalled();
+  });
+
+  test("createFile should create a new notebook", async () => {
+    sendCreateFileOrFolder.mockResolvedValue({ success: true });
+
+    await requestingTree.createFile("notebook1", "1.2", "notebook");
+    expect(sendCreateFileOrFolder).toHaveBeenCalledWith({
+      path: "/root/folder1",
+      type: "notebook",
+      name: "notebook1",
+    });
     expect(mockOnChange).toHaveBeenCalled();
   });
 

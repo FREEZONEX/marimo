@@ -6,10 +6,14 @@ import os
 import sys
 from typing import TYPE_CHECKING
 
-from marimo._messaging.streams import (
-    redirect,
+from marimo._messaging.streams import redirect
+from marimo._messaging.thread_local_streams import (
+    ThreadLocalStreamProxy,
+    clear_thread_local_streams,
+    set_thread_local_streams,
 )
 from marimo._messaging.types import Stderr, Stdin, Stdout, Stream
+from marimo._runtime.scratch import SCRATCH_CELL_ID
 from marimo._types.ids import CellId_t
 
 if TYPE_CHECKING:
@@ -57,12 +61,17 @@ def redirect_streams(
 ) -> Iterator[None]:
     cell_id_old = stream.cell_id
 
-    # In a nested context; NOOP so messages still reach the top-level cell.
+    # In a nested context, generally NOOP so messages reach the top-level
+    # cell.  The exception is the scratchpad: when code_mode runs cells
+    # from within __scratch__, we must swap cell_id so console output
+    # routes to the real cell, not the scratchpad.
     if cell_id_old is not None:
+        if cell_id_old == SCRATCH_CELL_ID:
+            stream.cell_id = cell_id
         try:
             yield
         finally:
-            ...
+            stream.cell_id = cell_id_old
         return
 
     stream.cell_id = cell_id
@@ -73,22 +82,33 @@ def redirect_streams(
             stream.cell_id = cell_id_old
         return
 
-    # NB: Python doesn't allow monkey patching methods builtins, so
-    # we replace these streams outright
-    py_stdout = sys.stdout
-    py_stderr = sys.stderr
-    py_stdin = sys.stdin
-    sys.stdout = stdout  # type: ignore
-    sys.stderr = stderr  # type: ignore
-    sys.stdin = stdin  # type: ignore
-
-    try:
-        with redirect(stdout), redirect(stderr):
+    if isinstance(sys.stdout, ThreadLocalStreamProxy):
+        # In run mode with console redirection enabled, sys.stdout/sys.stderr
+        # are already patched to point to an object that forwards read/write.
+        #
+        # We don't support redirecting file descriptors in run mode.
+        # We also don't support sys.stdin redirection.
+        set_thread_local_streams(stdout, stderr)
+        try:
             yield
-    finally:
-        # The redirect context manager relies on these being installed;
-        # restore them after the context manager quits
-        sys.stdout = py_stdout
-        sys.stderr = py_stderr
-        sys.stdin = py_stdin
-        stream.cell_id = cell_id_old
+        finally:
+            clear_thread_local_streams()
+            stream.cell_id = cell_id_old
+    else:
+        # In edit mode, we have one process per notebook, so we can safely
+        # replace sys.stdout/sys.stderr and redirect OS streams
+        py_stdout = sys.stdout
+        py_stderr = sys.stderr
+        py_stdin = sys.stdin
+        sys.stdout = stdout  # type: ignore
+        sys.stderr = stderr  # type: ignore
+        sys.stdin = stdin  # type: ignore
+
+        try:
+            with redirect(stdout), redirect(stderr):
+                yield
+        finally:
+            sys.stdout = py_stdout
+            sys.stderr = py_stderr
+            sys.stdin = py_stdin
+            stream.cell_id = cell_id_old

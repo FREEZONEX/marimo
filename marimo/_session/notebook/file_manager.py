@@ -25,6 +25,7 @@ from marimo._session.notebook.storage import (
 from marimo._types.ids import CellId_t
 from marimo._utils.http import HTTPException, HTTPStatus
 from marimo._utils.marimo_path import MarimoPath
+from marimo._utils.scripts import with_python_version_requirement
 
 LOGGER = _loggers.marimo_logger()
 
@@ -117,14 +118,20 @@ class AppFileManager:
         # Capture deleted cells
         changed_cell_ids: set[CellId_t] = prev_cell_ids - current_cell_ids
 
-        # Check for added or modified cells
+        # Check for added or modified cells (code, config, or name)
         for cell_id in current_cell_ids:
             if cell_id not in prev_cell_ids:
                 changed_cell_ids.add(cell_id)
             else:
-                new_code = self.app.cell_manager.get_cell_code(cell_id)
-                prev_code = prev_cell_manager.get_cell_code(cell_id)
-                if new_code != prev_code:
+                new_data = self.app.cell_manager.get_cell_data(cell_id)
+                prev_data = prev_cell_manager.get_cell_data(cell_id)
+                if new_data is None or prev_data is None:
+                    changed_cell_ids.add(cell_id)
+                elif (
+                    new_data.code != prev_data.code
+                    or new_data.name != prev_data.name
+                    or new_data.config != prev_data.config
+                ):
                     changed_cell_ids.add(cell_id)
 
         return changed_cell_ids
@@ -194,7 +201,11 @@ class AppFileManager:
                 from marimo._utils.scripts import write_pyproject_to_script
 
                 header = write_pyproject_to_script(
-                    {"dependencies": ["marimo"]}
+                    with_python_version_requirement(
+                        {
+                            "dependencies": ["marimo"],
+                        }
+                    )
                 )
 
         # Rewrap with header if relevant and set filename.

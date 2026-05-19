@@ -8,7 +8,7 @@ import signal
 import sys
 import threading
 import time
-from multiprocessing import Process, connection
+from multiprocessing import connection, get_context
 from typing import TYPE_CHECKING, Any, Optional, Union
 from uuid import uuid4
 
@@ -71,7 +71,7 @@ class KernelManagerImpl(KernelManager):
         if is_edit_mode:
             # Need to use a socket for windows compatibility
             listener = connection.Listener(family="AF_INET")
-            self.kernel_task = Process(
+            self.kernel_task = get_context("spawn").Process(
                 target=runtime.launch_kernel,
                 args=(
                     self.queue_manager.control_queue,
@@ -112,6 +112,13 @@ class KernelManagerImpl(KernelManager):
             # threads (in edit mode, the single kernel process installs
             # formatters ...)
             register_formatters(theme=self.config_manager.theme)
+
+            if self.redirect_console_to_browser:
+                from marimo._messaging.thread_local_streams import (
+                    install_thread_local_proxies,
+                )
+
+                install_thread_local_proxies()
 
             assert self.queue_manager.stream_queue is not None
             # Make threads daemons so killing the server immediately brings

@@ -20,13 +20,19 @@ from marimo._runtime.commands import (
     SerializedQueryParams,
 )
 from marimo._server.app_defaults import AppDefaults
-from marimo._server.file_router import AppFileRouter, MarimoFileKey
+from marimo._server.file_router import (
+    AppFileRouter,
+    ListOfFilesAppFileRouter,
+    MarimoFileKey,
+    flatten_files,
+)
 from marimo._server.lsp import LspServer
 from marimo._server.recents import RecentFilesManager
 from marimo._server.resume_strategies import create_resume_strategy
 from marimo._server.session.listeners import RecentsTrackerListener
 from marimo._server.token_manager import TokenManager
 from marimo._server.tokens import AuthToken, SkewProtectionToken
+from marimo._session.app_host import AppHostContext, AppHostPool
 from marimo._session.consumer import SessionConsumer
 from marimo._session.events import SessionEventBus
 from marimo._session.extensions.types import SessionExtension
@@ -78,6 +84,7 @@ class SessionManager:
         ttl_seconds: Optional[int],
         watch: bool = False,
         sandbox_mode: SandboxMode | None = None,
+        isolate_apps: bool = False,
     ) -> None:
         # Core configuration
         self.file_router = file_router
@@ -92,12 +99,30 @@ class SessionManager:
         self._config_manager = config_manager
         self.sandbox_mode = sandbox_mode
 
+        # When running multiple apps, each app runs in an isolated  host
+        # process, to avoid collisions in sys.modules and other Python global
+        # structures. These processes are managed by an AppHostPool.
+        self._app_host_pool: AppHostPool | None = None
+        if isolate_apps and mode == SessionMode.RUN:
+            self._app_host_pool = AppHostPool(
+                sandbox=sandbox_mode is SandboxMode.MULTI,
+            )
+
         self._repository = SessionRepository()
 
         def _get_code() -> str:
             defaults = AppDefaults.from_config_manager(config_manager)
-            app = file_router.get_single_app_file_manager(defaults).app
-            return "".join(code for code in app.cell_manager.codes())
+            if file_router.get_unique_file_key() is not None:
+                app = file_router.get_single_app_file_manager(defaults).app
+                return "".join(code for code in app.cell_manager.codes())
+
+            files = list(flatten_files(file_router.files))
+            entries = [
+                f"{file.path}:{file.last_modified or 0.0}"
+                for file in files
+                if file.is_marimo_file
+            ]
+            return "\n".join(sorted(entries))
 
         source_code = None if mode == SessionMode.EDIT else _get_code()
         self._token_manager = TokenManager(
@@ -137,6 +162,12 @@ class SessionManager:
     def app_manager(self, key: MarimoFileKey) -> AppFileManager:
         """Get the app manager for the given key."""
         defaults = AppDefaults.from_config_manager(self._config_manager)
+        if (
+            self.mode is SessionMode.EDIT
+            and isinstance(self.file_router, ListOfFilesAppFileRouter)
+            and not key.startswith(AppFileRouter.NEW_FILE)
+        ):
+            self.file_router.register_allowed_file(key)
         return self.file_router.get_file_manager(key, defaults)
 
     def create_session(
@@ -157,12 +188,19 @@ class SessionManager:
 
         # Get app file manager
         defaults = AppDefaults.from_config_manager(self._config_manager)
+        if (
+            self.mode is SessionMode.EDIT
+            and isinstance(self.file_router, ListOfFilesAppFileRouter)
+            and not file_key.startswith(AppFileRouter.NEW_FILE)
+        ):
+            self.file_router.register_allowed_file(file_key)
         app_file_manager = self.file_router.get_file_manager(
             file_key, defaults
         )
 
         # Create the session
         from marimo._runtime.commands import AppMetadata
+        from marimo._runtime.patches import extract_docstring_from_header
 
         extensions: list[SessionExtension] = []
         if self.watch:
@@ -183,6 +221,9 @@ class SessionManager:
                 cli_args=self.cli_args,
                 argv=self.argv,
                 app_config=app_file_manager.app.config,
+                docstring=extract_docstring_from_header(
+                    app_file_manager.app._app._header
+                ),
             ),
             app_file_manager=app_file_manager,
             config_manager=self._config_manager,
@@ -192,6 +233,11 @@ class SessionManager:
             auto_instantiate=auto_instantiate,
             extensions=extensions,
             sandbox_mode=self.sandbox_mode,
+            app_host_context=AppHostContext(
+                pool=self._app_host_pool, session_id=session_id
+            )
+            if self._app_host_pool
+            else None,
         )
 
         # Add to repository
@@ -363,6 +409,8 @@ class SessionManager:
         """Shutdown the session manager and stop all file watchers."""
         LOGGER.debug("Shutting down")
         self.close_all_sessions()
+        if self._app_host_pool is not None:
+            self._app_host_pool.shutdown()
         self.lsp_server.stop()
         self._watcher_manager.stop_all()
 

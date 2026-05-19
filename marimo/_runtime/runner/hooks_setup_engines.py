@@ -15,29 +15,32 @@ from __future__ import annotations
 import builtins
 
 from marimo import _loggers
-from marimo._runtime.runner import cell_runner
+from marimo._runtime.runner.hook_context import (
+    OnFinishHookContext,
+    PreparationHookContext,
+)
 
 LOGGER = _loggers.marimo_logger()
 
 
-def _inject_tier0_engines(runner: cell_runner.Runner) -> None:
+def _inject_tier0_engines(ctx: PreparationHookContext) -> None:
     """preparation hook: 将 sitecustomize.py 中预创建的 SQLAlchemy engine 注入 kernel globals。"""
     engine = getattr(builtins, "_tier0_pg_engine", None)
-    if engine is not None and "pg" not in runner.glbls:
-        runner.glbls["pg"] = engine
+    if engine is not None and "pg" not in ctx.glbls:
+        ctx.glbls["pg"] = engine
 
 
-def _broadcast_tier0_datasource(runner: cell_runner.Runner) -> None:
+def _broadcast_tier0_datasource(ctx: OnFinishHookContext) -> None:
     """on_finish hook: 广播 Tier0 注入的 PG 引擎为数据源，触发侧边栏展示。
 
     post-execution hook 只扫描 cell.defs，不会发现通过 globals 注入的 pg 变量。
     此钩子在所有 cell 执行完毕后运行一次，主动广播 PG 数据源连接。
     """
-    if "pg" not in runner.glbls:
+    if "pg" not in ctx.glbls:
         return
 
     # 避免重复广播（同一个 runner 生命周期内只广播一次）
-    if getattr(runner, "_tier0_pg_broadcasted", False):
+    if ctx.glbls.get("_tier0_pg_broadcasted"):
         return
 
     try:
@@ -50,7 +53,7 @@ def _broadcast_tier0_datasource(runner: cell_runner.Runner) -> None:
         from marimo._types.ids import VariableName
 
         engines = get_engines_from_variables(
-            [(VariableName("pg"), runner.glbls["pg"])]
+            [(VariableName("pg"), ctx.glbls["pg"])]
         )
         if not engines:
             return
@@ -63,6 +66,6 @@ def _broadcast_tier0_datasource(runner: cell_runner.Runner) -> None:
                 ]
             )
         )
-        runner._tier0_pg_broadcasted = True  # type: ignore[attr-defined]
+        ctx.glbls["_tier0_pg_broadcasted"] = True
     except Exception as e:
         LOGGER.warning("[Tier0] Failed to broadcast PG datasource: %s", e)

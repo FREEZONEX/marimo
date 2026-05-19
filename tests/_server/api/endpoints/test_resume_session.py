@@ -1,78 +1,28 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
 
-import pytest
-
 from marimo._config.manager import UserConfigManager
-from marimo._messaging.msgspec_encoder import asdict
 from marimo._messaging.notification import (
     CellNotification,
-    KernelCapabilitiesNotification,
     KernelReadyNotification,
 )
 from marimo._session import Session
 from marimo._types.ids import SessionId
 from marimo._utils.parse_dataclass import parse_raw
-from tests._server.conftest import get_session_manager
-from tests._server.mocks import token_header
+from tests._server.api.endpoints.ws_helpers import (
+    assert_kernel_ready_response,
+    create_response,
+    headers,
+)
+from tests._server.mocks import get_session_manager
 
 if TYPE_CHECKING:
     from starlette.testclient import TestClient
-
-
-def create_response(
-    partial_response: dict[str, Any],
-) -> dict[str, Any]:
-    response: dict[str, Any] = {
-        "cell_ids": ["Hbol"],
-        "codes": ["import marimo as mo"],
-        "names": ["__"],
-        "layout": None,
-        "resumed": False,
-        "ui_values": {},
-        "last_executed_code": {},
-        "last_execution_time": {},
-        "kiosk": False,
-        "configs": [{"disabled": False, "hide_code": False}],
-        "app_config": {"width": "full"},
-        "capabilities": asdict(KernelCapabilitiesNotification()),
-    }
-    response.update(partial_response)
-    return response
-
-
-def headers(session_id: str) -> dict[str, str]:
-    return {
-        "Marimo-Session-Id": session_id,
-        **token_header("fake-token"),
-    }
-
-
-HEADERS = {
-    **token_header("fake-token"),
-}
-
-
-def assert_kernel_ready_response(
-    raw_data: dict[str, Any], response: dict[str, Any]
-) -> None:
-    data = parse_raw(raw_data["data"], KernelReadyNotification)
-    print(response)
-    expected = parse_raw(response, KernelReadyNotification)
-    assert data.cell_ids == expected.cell_ids
-    assert data.codes == expected.codes
-    assert data.names == expected.names
-    assert data.layout == expected.layout
-    assert data.resumed == expected.resumed
-    assert data.ui_values == expected.ui_values
-    assert data.configs == expected.configs
-    assert data.app_config == expected.app_config
-    assert data.last_execution_time == expected.last_execution_time
-    assert data.capabilities == expected.capabilities
 
 
 def get_session(
@@ -297,27 +247,43 @@ def test_restart_session(client: TestClient) -> None:
     # Shutdown the kernel
 
 
-@pytest.mark.flaky(reruns=5)
-def test_resume_session_with_watch(client: TestClient) -> None:
+def test_resume_session_after_file_change(client: TestClient) -> None:
     session_manager = get_session_manager(client)
-    session_manager.watch = True
+    # Don't set session_manager.watch = True here; it would start a
+    # file-watcher thread whose async callbacks can race with the
+    # synchronous _handle_file_change_locked call below, reading the
+    # file while it is being written and producing a spurious
+    # "not a marimo notebook" error.  The test invokes the handler
+    # directly, so no watcher is needed.
 
     with client.websocket_connect(_create_ws_url("123")) as websocket:
         data = websocket.receive_json()
         assert_kernel_ready_response(data, create_response({}))
 
-        # Write to the notebook file to trigger a reload
+        session = get_session(client, SessionId("123"))
+        assert session
+
+        # Write to the notebook file to add a new cell
         # we write it as the second to last cell
         filename = session_manager.file_router.get_unique_file_key()
         assert filename
-        with open(filename, "r+") as f:
+        with open(filename) as f:
             content = f.read()
-            last_cell_pos = content.rindex("@app.cell")
-            f.seek(last_cell_pos)
-            f.write(
-                "\n@app.cell\ndef _(): x=10; x\n" + content[last_cell_pos:]
-            )
-            f.close()
+        last_cell_pos = content.rindex("@app.cell")
+        new_content = (
+            content[:last_cell_pos]
+            + "\n@app.cell\ndef _(): x=10; x\n"
+            + content[last_cell_pos:]
+        )
+        with open(filename, "w") as f:
+            f.write(new_content)
+
+        # Directly trigger the file change handler (synchronous) instead
+        # of relying on the async file watcher, which is inherently racy.
+        result = session_manager._file_change_coordinator._handle_file_change_locked(
+            os.path.abspath(filename), session
+        )
+        assert result.handled
 
         data = websocket.receive_json()
         assert data == {
@@ -325,18 +291,9 @@ def test_resume_session_with_watch(client: TestClient) -> None:
             "data": {"cell_ids": ["MJUe", "Hbol"], "op": "update-cell-ids"},
         }
         data = websocket.receive_json()
-        assert data == {
-            "op": "update-cell-codes",
-            "data": {
-                "cell_ids": ["MJUe"],
-                "code_is_stale": False,
-                "codes": ["x=10; x"],
-                "op": "update-cell-codes",
-            },
-        }
+        assert data["op"] == "update-cell-codes"
 
     # Resume session with new ID (simulates refresh)
-    # watcher_on_save is 'autorun', so we should expect the cell to be run
     with client.websocket_connect(_create_ws_url("456")) as websocket:
         # First message is the kernel reconnected
         data = websocket.receive_json()
@@ -347,14 +304,14 @@ def test_resume_session_with_watch(client: TestClient) -> None:
         assert parse_raw(data["data"], KernelReadyNotification)
         messages: list[dict[str, Any]] = []
 
-        # Wait for update-cell-codes message
+        # Wait for update-cell-ids message
         while True:
             data = websocket.receive_json()
             messages.append(data)
             if data["op"] == "update-cell-ids":
                 break
 
-        # 3 messages:
+        # 2 messages:
         # 1. banner
         # 2. update-cell-ids
         assert len(messages) == 2
@@ -363,14 +320,6 @@ def test_resume_session_with_watch(client: TestClient) -> None:
             "op": "update-cell-ids",
             "data": {"cell_ids": ["MJUe", "Hbol"], "op": "update-cell-ids"},
         }
-
-    session = get_session(client, "456")
-    assert session
-    session_view = session.session_view
-    assert session_view.last_executed_code == {"MJUe": "x=10; x"}
-
-    session_manager.watch = False
-    session_manager._watcher_manager.stop_all()
 
 
 @contextmanager

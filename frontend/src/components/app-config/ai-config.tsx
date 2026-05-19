@@ -59,6 +59,7 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "../ui/accordion";
+import { Alert, AlertDescription } from "../ui/alert";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import { DropdownMenuSeparator } from "../ui/dropdown-menu";
@@ -77,6 +78,7 @@ import { formItemClasses, SettingSubtitle } from "./common";
 import { AWS_REGIONS } from "./constants";
 import { IncorrectModelId } from "./incorrect-model-id";
 import { IsOverridden } from "./is-overridden";
+
 interface AiConfigProps {
   form: UseFormReturn<UserConfig>;
   config: UserConfig;
@@ -239,7 +241,6 @@ interface ModelSelectorProps {
   placeholder: string;
   testId?: string;
   description?: React.ReactNode;
-  disabled?: boolean;
   label: string;
   forRole: SupportedRole;
   onSubmit: (values: UserConfig) => void;
@@ -250,9 +251,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   config,
   name,
   placeholder,
-  testId,
   description,
-  disabled = false,
   label,
   forRole,
   onSubmit,
@@ -290,12 +289,10 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                     </p>
                     <div className="px-2 py-1">
                       <Input
-                        data-testid={testId}
                         className="w-full border-border shadow-none focus-visible:shadow-xs"
                         placeholder={placeholder}
                         {...field}
                         value={asStringOrEmpty(field.value)}
-                        disabled={disabled}
                         onKeyDown={Events.stopPropagation()}
                       />
                       {value && (
@@ -435,7 +432,6 @@ const renderCopilotProvider = ({
         config={config}
         name="ai.models.autocomplete_model"
         placeholder="ollama/qwen2.5-coder:1.5b"
-        testId="custom-model-input"
         description="Model to use for code completion when using a custom provider."
         onSubmit={onSubmit}
         forRole="autocomplete"
@@ -617,9 +613,13 @@ export const CustomProvidersConfig: React.FC<AiConfigProps> = ({
   const isDuplicate =
     KNOWN_PROVIDERS.includes(normalizedName as KnownProviderId) ||
     (customProviders && Object.keys(customProviders).includes(normalizedName));
+  const hasInvalidChars = normalizedName.includes(".");
 
   const hasValidValues =
-    normalizedName.trim() && newProviderBaseUrl.trim() && !isDuplicate;
+    normalizedName.trim() &&
+    newProviderBaseUrl.trim() &&
+    !isDuplicate &&
+    !hasInvalidChars;
 
   const resetForm = () => {
     setNewProviderName("");
@@ -677,7 +677,12 @@ export const CustomProvidersConfig: React.FC<AiConfigProps> = ({
                   A provider with this name already exists.
                 </p>
               )}
-              {newProviderName && (
+              {hasInvalidChars && (
+                <p className="text-xs text-destructive">
+                  Provider names cannot contain '.' characters.
+                </p>
+              )}
+              {newProviderName && !hasInvalidChars && (
                 <p className="text-xs text-muted-secondary">
                   Use models with prefix:{" "}
                   <Kbd className="inline text-xs">{normalizedName}/</Kbd>
@@ -965,6 +970,15 @@ export const AiProvidersConfig: React.FC<AiConfigProps> = ({
           provider="github"
           isConfigured={hasValue("ai.github.api_key")}
         >
+          <Alert variant="warning" className="py-1.5 px-3 text-xs">
+            <AlertDescription>
+              Free tier models have low token limits which can cause errors with
+              larger prompts.{" "}
+              <ExternalLink href="https://docs.github.com/en/github-models/prototyping-with-ai-models#rate-limits">
+                Learn more
+              </ExternalLink>
+            </AlertDescription>
+          </Alert>
           <ApiKey
             form={form}
             config={config}
@@ -982,7 +996,7 @@ export const AiProvidersConfig: React.FC<AiConfigProps> = ({
             form={form}
             config={config}
             name="ai.github.base_url"
-            placeholder="https://api.githubcopilot.com/"
+            placeholder="https://models.github.ai/inference"
             testId="ai-github-base-url-input"
           />
         </AccordionFormItem>
@@ -1212,8 +1226,6 @@ export const AiAssistConfig: React.FC<AiConfigProps> = ({
   config,
   onSubmit,
 }) => {
-  const isWasmRuntime = isWasm();
-
   return (
     <SettingGroup>
       <SettingSubtitle>AI Assistant</SettingSubtitle>
@@ -1247,8 +1259,6 @@ export const AiAssistConfig: React.FC<AiConfigProps> = ({
         config={config}
         name="ai.models.chat_model"
         placeholder={DEFAULT_AI_MODEL}
-        testId="ai-chat-model-input"
-        disabled={isWasmRuntime}
         description={
           <span>Model to use for chat conversations in the Chat panel.</span>
         }
@@ -1261,8 +1271,6 @@ export const AiAssistConfig: React.FC<AiConfigProps> = ({
         config={config}
         name="ai.models.edit_model"
         placeholder={DEFAULT_AI_MODEL}
-        testId="ai-edit-model-input"
-        disabled={isWasmRuntime}
         description={
           <span>
             Model to use for code editing with the{" "}
@@ -1272,18 +1280,6 @@ export const AiAssistConfig: React.FC<AiConfigProps> = ({
         forRole="edit"
         onSubmit={onSubmit}
       />
-
-      <ul className="bg-muted p-2 rounded-md list-disc space-y-1 pl-6">
-        <li className="text-xs text-muted-secondary">
-          Models should include the provider name and model name separated by a
-          slash. For example, "anthropic/claude-3-5-sonnet-latest" or
-          "google/gemini-2.0-flash-exp"
-        </li>
-        <li className="text-xs text-muted-secondary">
-          Depending on the provider, we will use the respective API key and
-          additional configuration.
-        </li>
-      </ul>
 
       <FormField
         control={form.control}
@@ -1437,6 +1433,7 @@ export const AiModelDisplayConfig: React.FC<AiConfigProps> = ({
 
     form.setValue("ai.models.displayed_models", newModels, {
       shouldDirty: true,
+      shouldTouch: true,
     });
     onSubmit(form.getValues());
   });
@@ -1456,6 +1453,7 @@ export const AiModelDisplayConfig: React.FC<AiConfigProps> = ({
 
       form.setValue("ai.models.displayed_models", newModels, {
         shouldDirty: true,
+        shouldTouch: true,
       });
       onSubmit(form.getValues());
     },
@@ -1469,9 +1467,11 @@ export const AiModelDisplayConfig: React.FC<AiConfigProps> = ({
     );
     form.setValue("ai.models.displayed_models", newDisplayedModels, {
       shouldDirty: true,
+      shouldTouch: true,
     });
     form.setValue("ai.models.custom_models", newModels, {
       shouldDirty: true,
+      shouldTouch: true,
     });
     onSubmit(form.getValues());
   });
@@ -1551,6 +1551,7 @@ export const AddModelForm: React.FC<{
 
     form.setValue("ai.models.custom_models", [newModel.id, ...customModels], {
       shouldDirty: true,
+      shouldTouch: true,
     });
     onSubmit(form.getValues());
     resetForm();
@@ -1742,6 +1743,12 @@ const AddButton = ({
     </Button>
   );
 };
+
+export type AiSettingsSubTab =
+  | "ai-features"
+  | "ai-providers"
+  | "ai-models"
+  | "mcp";
 
 export const AiConfig: React.FC<AiConfigProps> = ({
   form,

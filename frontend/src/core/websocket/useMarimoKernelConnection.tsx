@@ -11,7 +11,6 @@ import { useConnectionTransport } from "@/core/websocket/useWebSocket";
 import { renderHTML } from "@/plugins/core/RenderHTML";
 import {
   handleWidgetMessage,
-  isMessageWidgetState,
   MODEL_MANAGER,
 } from "@/plugins/impl/anywidget/model";
 import { logNever } from "@/utils/assertNever";
@@ -25,7 +24,7 @@ import { Logger } from "@/utils/Logger";
 import { reloadSafe } from "@/utils/reload-safe";
 import { useAlertActions } from "../alerts/state";
 import { cacheInfoAtom } from "../cache/requests";
-import { type CellId, SCRATCH_CELL_ID, type UIElementId } from "../cells/ids";
+import { SCRATCH_CELL_ID } from "../cells/ids";
 import { useRunsActions } from "../cells/runs";
 import { focusAndScrollCellOutputIntoView } from "../cells/scrollCellIntoView";
 import type { CellData } from "../cells/types";
@@ -57,6 +56,11 @@ import type { RequestId } from "../network/DeferredRequestRegistry";
 import { useRuntimeManager } from "../runtime/config";
 import { SECRETS_REGISTRY } from "../secrets/request-registry";
 import { isStaticNotebook } from "../static/static-state";
+import {
+  DownloadStorage,
+  ListStorageEntries,
+} from "../storage/request-registry";
+import { useStorageActions } from "../storage/state";
 import { useVariablesActions } from "../variables/state";
 import type { VariableName } from "../variables/types";
 import { isWasm } from "../wasm/utils";
@@ -106,6 +110,10 @@ export function useMarimoKernelConnection(opts: {
   const runtimeManager = useRuntimeManager();
   const setCacheInfo = useSetAtom(cacheInfoAtom);
   const setKernelStartupError = useSetAtom(kernelStartupErrorAtom);
+  const {
+    setNamespaces: setStorageNamespaces,
+    filterFromVariables: filterStorageFromVariables,
+  } = useStorageActions();
 
   const handleMessage = (e: MessageEvent<JsonString<NotificationPayload>>) => {
     const msg = jsonParseWithSpecialChar(e.data);
@@ -141,30 +149,21 @@ export function useMarimoKernelConnection(opts: {
         return;
 
       case "send-ui-element-message": {
-        const modelId = msg.data.model_id;
         const uiElement = msg.data.ui_element;
-        const message = msg.data.message;
-        const buffers = safeExtractSetUIElementMessageBuffers(msg.data);
-
-        if (modelId && isMessageWidgetState(message)) {
-          handleWidgetMessage({
-            modelId,
-            msg: message,
-            buffers,
-            modelManager: MODEL_MANAGER,
-          });
-        }
-
         if (uiElement) {
+          const buffers = safeExtractSetUIElementMessageBuffers(msg.data);
           UI_ELEMENT_REGISTRY.broadcastMessage(
-            uiElement as UIElementId,
+            uiElement,
             msg.data.message,
             buffers,
           );
         }
-
         return;
       }
+
+      case "model-lifecycle":
+        handleWidgetMessage(MODEL_MANAGER, msg.data);
+        return;
 
       case "remove-ui-elements":
         handleRemoveUIElements(msg.data);
@@ -174,14 +173,11 @@ export function useMarimoKernelConnection(opts: {
         AUTOCOMPLETER.resolve(msg.data.completion_id as RequestId, msg.data);
         return;
       case "function-call-result":
-        FUNCTIONS_REGISTRY.resolve(
-          msg.data.function_call_id as RequestId,
-          msg.data,
-        );
+        FUNCTIONS_REGISTRY.resolve(msg.data.function_call_id, msg.data);
         return;
       case "cell-op": {
         handleCellNotificationeration(msg.data, handleCellMessage);
-        const cellData = getNotebook().cellData[msg.data.cell_id as CellId];
+        const cellData = getNotebook().cellData[msg.data.cell_id];
         if (!cellData) {
           return;
         }
@@ -196,14 +192,17 @@ export function useMarimoKernelConnection(opts: {
         setVariables(
           msg.data.variables.map((v) => ({
             name: v.name as VariableName,
-            declaredBy: v.declared_by as CellId[],
-            usedBy: v.used_by as CellId[],
+            declaredBy: v.declared_by,
+            usedBy: v.used_by,
           })),
         );
         filterDatasetsFromVariables(
           msg.data.variables.map((v) => v.name as VariableName),
         );
         filterDataSourcesFromVariables(
+          msg.data.variables.map((v) => v.name as VariableName),
+        );
+        filterStorageFromVariables(
           msg.data.variables.map((v) => v.name as VariableName),
         );
         return;
@@ -269,16 +268,16 @@ export function useMarimoKernelConnection(opts: {
         addColumnPreview(msg.data);
         return;
       case "sql-table-preview":
-        PreviewSQLTable.resolve(msg.data.request_id as RequestId, msg.data);
+        PreviewSQLTable.resolve(msg.data.request_id, msg.data);
         return;
       case "sql-table-list-preview":
-        PreviewSQLTableList.resolve(msg.data.request_id as RequestId, msg.data);
+        PreviewSQLTableList.resolve(msg.data.request_id, msg.data);
         return;
       case "validate-sql-result":
         ValidateSQL.resolve(msg.data.request_id as RequestId, msg.data);
         return;
       case "secret-keys-result":
-        SECRETS_REGISTRY.resolve(msg.data.request_id as RequestId, msg.data);
+        SECRETS_REGISTRY.resolve(msg.data.request_id, msg.data);
         return;
       case "cache-info":
         setCacheInfo(msg.data);
@@ -294,22 +293,33 @@ export function useMarimoKernelConnection(opts: {
           })),
         });
         return;
+      case "storage-namespaces":
+        setStorageNamespaces(msg.data);
+        return;
+      case "storage-entries":
+        ListStorageEntries.resolve(msg.data.request_id as RequestId, msg.data);
+        return;
+      case "storage-download-ready":
+        DownloadStorage.resolve(msg.data.request_id as RequestId, msg.data);
+        return;
 
       case "reconnected":
         return;
 
       case "focus-cell":
-        focusAndScrollCellOutputIntoView(msg.data.cell_id as CellId);
+        focusAndScrollCellOutputIntoView(msg.data.cell_id);
         return;
       case "update-cell-codes":
         setCellCodes({
           codes: msg.data.codes,
-          ids: msg.data.cell_ids as CellId[],
+          ids: msg.data.cell_ids,
           codeIsStale: msg.data.code_is_stale,
+          names: msg.data.names,
+          configs: msg.data.configs,
         });
         return;
       case "update-cell-ids":
-        setCellIds({ cellIds: msg.data.cell_ids as CellId[] });
+        setCellIds({ cellIds: msg.data.cell_ids });
         return;
       default:
         logNever(msg.data);

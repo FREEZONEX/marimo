@@ -38,6 +38,7 @@ import type { DownloadActionProps } from "./download-actions";
 import { FilterPills } from "./filter-pills";
 import { FocusRowFeature } from "./focus-row/feature";
 import { useColumnPinning } from "./hooks/use-column-pinning";
+import { CellSelectionStats } from "./range-focus/cell-selection-stats";
 import { CellSelectionProvider } from "./range-focus/provider";
 import { DataTableBody, renderTableHeader } from "./renderers";
 import { SearchBar } from "./SearchBar";
@@ -51,6 +52,7 @@ interface DataTableProps<TData> extends Partial<DownloadActionProps> {
   maxHeight?: number;
   columns: ColumnDef<TData>[];
   data: TData[];
+  rawData?: TData[]; // raw data for filtering/copying (present only if format_mapping is provided)
   // Sorting
   manualSorting?: boolean; // server-side sorting
   sorting?: SortingState; // controlled sorting
@@ -102,6 +104,7 @@ const DataTableInternal = <TData,>({
   maxHeight,
   columns,
   data,
+  rawData,
   selection,
   totalColumns,
   totalRows,
@@ -116,6 +119,7 @@ const DataTableInternal = <TData,>({
   paginationState,
   setPaginationState,
   downloadAs,
+  downloadFileName,
   manualPagination = false,
   pagination = false,
   onRowSelectionChange,
@@ -195,6 +199,7 @@ const DataTableInternal = <TData,>({
     ],
     data,
     columns,
+    meta: { rawData },
     getCoreRowModel: getCoreRowModel(),
     // pagination
     rowCount: totalRows === "too_many" ? undefined : totalRows,
@@ -297,22 +302,22 @@ const DataTableInternal = <TData,>({
   return (
     <div className={cn(wrapperClassName, "flex flex-col space-y-1")}>
       <FilterPills filters={filters} table={table} />
-      <div className={cn(className || "rounded-md border overflow-hidden")}>
-        {onSearchQueryChange && enableSearch && (
-          <SearchBar
-            value={searchQuery || ""}
-            onHide={() => setIsSearchEnabled(false)}
-            handleSearch={onSearchQueryChange}
-            hidden={!isSearchEnabled}
-            reloading={reloading}
-          />
-        )}
-        <Table className="relative" ref={tableRef}>
-          {showLoadingBar && (
-            <thead className="absolute top-0 left-0 h-[3px] w-1/2 bg-primary animate-slide" />
+      <CellSelectionProvider>
+        <div className={cn(className || "rounded-md border overflow-hidden")}>
+          {onSearchQueryChange && enableSearch && (
+            <SearchBar
+              value={searchQuery || ""}
+              onHide={() => setIsSearchEnabled(false)}
+              handleSearch={onSearchQueryChange}
+              hidden={!isSearchEnabled}
+              reloading={reloading}
+            />
           )}
-          {renderTableHeader(table, Boolean(maxHeight))}
-          <CellSelectionProvider>
+          <Table className="relative" ref={tableRef}>
+            {showLoadingBar && (
+              <thead className="absolute top-0 left-0 h-[3px] w-1/2 bg-primary animate-slide" />
+            )}
+            {renderTableHeader(table, Boolean(maxHeight))}
             <DataTableBody
               table={table}
               columns={columns}
@@ -320,9 +325,10 @@ const DataTableInternal = <TData,>({
               getRowIndex={getPaginatedRowIndex}
               viewedRowIdx={viewedRowIdx}
             />
-          </CellSelectionProvider>
-        </Table>
-      </div>
+          </Table>
+        </div>
+        <CellSelectionStats table={table} className="px-2 pt-1 ml-auto" />
+      </CellSelectionProvider>
       <TableActions
         enableSearch={enableSearch}
         totalColumns={totalColumns}
@@ -334,6 +340,7 @@ const DataTableInternal = <TData,>({
         onRowSelectionChange={onRowSelectionChange}
         table={table}
         downloadAs={downloadAs}
+        downloadFileName={downloadFileName}
         getRowIds={getRowIds}
         toggleDisplayHeader={toggleDisplayHeader}
         showChartBuilder={showChartBuilder}

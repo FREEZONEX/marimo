@@ -18,9 +18,9 @@ if typing.TYPE_CHECKING:
 
     from marimo._messaging.types import KernelMessage
     from marimo._runtime.commands import (
+        BatchableCommand,
         CodeCompletionCommand,
         CommandMessage,
-        UpdateUIElementCommand,
     )
 
 LOGGER = _loggers.marimo_logger()
@@ -86,7 +86,7 @@ class Connection:
     context: zmq.Context[zmq.Socket[bytes]]
 
     control: Channel[CommandMessage]
-    ui_element: Channel[UpdateUIElementCommand]
+    ui_element: Channel[BatchableCommand]
     completion: Channel[CodeCompletionCommand]
     win32_interrupt: Channel[bool] | None
 
@@ -131,7 +131,7 @@ class Connection:
             win32_interrupt=(
                 Channel.Push(context) if sys.platform == "win32" else None
             ),
-            input=Channel.Pull(context, maxsize=1),
+            input=Channel.Push(context, maxsize=1),
             stream=Channel.Pull(context),
         )
         info = ConnectionInfo(
@@ -170,7 +170,7 @@ class Connection:
             win32_interrupt=Channel.Pull(context)
             if connection_info.win32_interrupt
             else None,
-            input=Channel.Push(context, maxsize=1),
+            input=Channel.Pull(context, maxsize=1),
             stream=Channel.Push(context),
         )
 
@@ -194,5 +194,7 @@ class Connection:
         if self._receiver_thread.is_alive():
             self._receiver_thread.join(timeout=1)
 
-        # Close all associated sockets (and finally terminate)
-        self.context.destroy()
+        # Close all sockets and terminate the context.
+        # linger=0 drops any unsent messages immediately, preventing
+        # hangs during shutdown when the remote end is already gone.
+        self.context.destroy(linger=0)

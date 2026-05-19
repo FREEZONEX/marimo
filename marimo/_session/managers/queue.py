@@ -11,6 +11,7 @@ from typing import Optional, Union
 
 from marimo._messaging.types import KernelMessage
 from marimo._runtime import commands
+from marimo._session.queue import route_control_request
 from marimo._session.types import QueueManager
 
 
@@ -27,12 +28,12 @@ class QueueManagerImpl(QueueManager):
             queue.Queue[commands.CommandMessage],
         ] = context.Queue() if context is not None else queue.Queue()
 
-        # Set UI element queues are stored in both the control queue and
-        # this queue, so that the backend can merge/batch set-ui-element
-        # requests.
+        # UI element updates and model commands are stored in both the
+        # control queue and this queue, so that the backend can
+        # merge/batch requests (last-write-wins per element/model ID).
         self.set_ui_element_queue: Union[
-            MPQueue[commands.UpdateUIElementCommand],
-            queue.Queue[commands.UpdateUIElementCommand],
+            MPQueue[commands.BatchableCommand],
+            queue.Queue[commands.BatchableCommand],
         ] = context.Queue() if context is not None else queue.Queue()
 
         # Code completion requests are sent through a separate queue
@@ -95,15 +96,12 @@ class QueueManagerImpl(QueueManager):
 
     def put_control_request(self, request: commands.CommandMessage) -> None:
         """Put a control request in the control queue."""
-        # Completions are on their own queue
-        if isinstance(request, commands.CodeCompletionCommand):
-            self.completion_queue.put(request)
-            return
-
-        self.control_queue.put(request)
-        # Update UI elements are on both queues so they can be batched
-        if isinstance(request, commands.UpdateUIElementCommand):
-            self.set_ui_element_queue.put(request)
+        route_control_request(
+            request,
+            self.control_queue,
+            self.completion_queue,
+            self.set_ui_element_queue,
+        )
 
     def put_input(self, text: str) -> None:
         """Put an input request in the input queue."""

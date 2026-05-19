@@ -20,12 +20,14 @@ from marimo._runtime.commands import (
     ListDataSourceConnectionCommand,
     ListSecretKeysCommand,
     ListSQLTablesCommand,
+    ModelCommand,
     PreviewDatasetColumnCommand,
     PreviewSQLTableCommand,
+    StorageDownloadCommand,
+    StorageListEntriesCommand,
     UpdateCellConfigCommand,
     UpdateUIElementCommand,
     UpdateUserConfigCommand,
-    UpdateWidgetModelCommand,
     ValidateSQLCommand,
 )
 from marimo._types.ids import CellId_t, UIElementId
@@ -76,9 +78,9 @@ class UpdateUIElementRequest(UpdateUIElementCommand, tag=False):
         )
 
 
-class UpdateWidgetModelRequest(UpdateWidgetModelCommand, tag=False):
-    def as_command(self) -> UpdateWidgetModelCommand:
-        return UpdateWidgetModelCommand(
+class ModelRequest(ModelCommand, tag=False):
+    def as_command(self) -> ModelCommand:
+        return ModelCommand(
             model_id=self.model_id,
             message=self.message,
             buffers=self.buffers,
@@ -135,6 +137,26 @@ class ValidateSQLRequest(ValidateSQLCommand, tag=False):
         )
 
 
+class StorageListEntriesRequest(StorageListEntriesCommand, tag=False):
+    def as_command(self) -> StorageListEntriesCommand:
+        return StorageListEntriesCommand(
+            request_id=self.request_id,
+            namespace=self.namespace,
+            limit=self.limit,
+            prefix=self.prefix,
+        )
+
+
+class StorageDownloadRequest(StorageDownloadCommand, tag=False):
+    def as_command(self) -> StorageDownloadCommand:
+        return StorageDownloadCommand(
+            request_id=self.request_id,
+            namespace=self.namespace,
+            path=self.path,
+            preview=self.preview,
+        )
+
+
 class UpdateUserConfigRequest(UpdateUserConfigCommand, tag=False):
     def as_command(self) -> UpdateUserConfigCommand:
         return UpdateUserConfigCommand(config=self.config)
@@ -148,7 +170,7 @@ class DeleteCellRequest(DeleteCellCommand, tag=False):
 class InstallPackagesRequest(InstallPackagesCommand, tag=False):
     def as_command(self) -> InstallPackagesCommand:
         return InstallPackagesCommand(
-            manager=self.manager, versions=self.versions
+            manager=self.manager, versions=self.versions, source=self.source
         )
 
 
@@ -218,6 +240,10 @@ class RenameNotebookRequest(msgspec.Struct, rename="camel"):
 
 class UpdateCellIdsRequest(msgspec.Struct, rename="camel"):
     cell_ids: list[CellId_t]
+
+
+class FocusCellRequest(msgspec.Struct, rename="camel"):
+    cell_id: CellId_t
 
 
 class ExecuteCellsRequest(msgspec.Struct, rename="camel"):

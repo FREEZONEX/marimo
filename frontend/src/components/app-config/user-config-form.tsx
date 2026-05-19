@@ -2,6 +2,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { atom, useAtom, useAtomValue, useSetAtom } from "jotai";
+import { merge } from "lodash-es";
 import {
   AlertTriangleIcon,
   BrainIcon,
@@ -14,7 +15,7 @@ import {
 } from "lucide-react";
 import React, { useId, useRef } from "react";
 import { useLocale } from "react-aria";
-import type { FieldValues } from "react-hook-form";
+import type { FieldPath, FieldValues } from "react-hook-form";
 import { useForm } from "react-hook-form";
 import type z from "zod";
 import { Button } from "@/components/ui/button";
@@ -95,6 +96,68 @@ export function getDirtyValues<T extends FieldValues>(
   return result;
 }
 
+type ManualInjector = (
+  values: UserConfig,
+  dirtyValues: Partial<UserConfig>,
+) => void;
+
+const modelsAiInjection = (
+  values: UserConfig,
+  dirtyValues: Partial<UserConfig>,
+) => {
+  dirtyValues.ai = {
+    ...dirtyValues.ai,
+    models: {
+      ...dirtyValues.ai?.models,
+      displayed_models: values.ai?.models?.displayed_models ?? [],
+      custom_models: values.ai?.models?.custom_models ?? [],
+    },
+  };
+};
+
+// Some fields (like AI model lists) have empty arrays as default values.
+// If a user explicitly clears them, RHF won't mark them dirty, so we use
+// touchedFields to force-include those values in the payload.
+const MANUAL_INJECT_ENTRIES = [
+  ["ai.models.displayed_models", modelsAiInjection],
+  ["ai.models.custom_models", modelsAiInjection],
+] as const satisfies readonly (readonly [
+  FieldPath<UserConfig>,
+  ManualInjector,
+])[];
+
+const MANUAL_INJECT_FIELDS = new Map(MANUAL_INJECT_ENTRIES);
+
+const isTouchedPath = (
+  touched: unknown,
+  path: FieldPath<UserConfig>,
+): boolean => {
+  if (!touched) {
+    return false;
+  }
+  let current: unknown = touched;
+  for (const segment of path.split(".")) {
+    if (typeof current !== "object" || current === null) {
+      return false;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current === true;
+};
+
+export const applyManualInjections = (opts: {
+  values: UserConfig;
+  dirtyValues: Partial<UserConfig>;
+  touchedFields: unknown;
+}) => {
+  const { values, dirtyValues, touchedFields } = opts;
+  for (const [fieldPath, injector] of MANUAL_INJECT_FIELDS) {
+    if (isTouchedPath(touchedFields, fieldPath)) {
+      injector(values, dirtyValues);
+    }
+  }
+};
+
 const categories = [
   {
     id: "editor",
@@ -174,6 +237,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
       pylsp: true,
       ty: true,
       basedpyright: true,
+      pyrefly: true,
     };
   }
 
@@ -189,7 +253,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
     defaultValues: config,
   });
 
-  const setAiModels = (values: UserConfig, dirtyAiConfig: UserConfig["ai"]) => {
+  const setAiModels = (
+    values: UserConfig["ai"],
+    dirtyAiConfig: UserConfig["ai"],
+  ) => {
     const { chatModel, editModel } = autoPopulateModels(values);
     if (chatModel || editModel) {
       dirtyAiConfig = {
@@ -215,19 +282,24 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
     // Only send values that were actually changed to avoid
     // overwriting backend values the form doesn't manage
     const dirtyValues = getDirtyValues(values, form.formState.dirtyFields);
+    applyManualInjections({
+      values,
+      dirtyValues,
+      touchedFields: form.formState.touchedFields,
+    });
     if (Object.keys(dirtyValues).length === 0) {
       return; // Nothing changed
     }
 
     // Auto-populate AI models when credentials are set, makes it easier to get started
     if (dirtyValues.ai) {
-      dirtyValues.ai = setAiModels(values, dirtyValues.ai);
+      dirtyValues.ai = setAiModels(values.ai, dirtyValues.ai);
     }
 
-    await saveUserConfig({ config: dirtyValues }).then(() => {
-      // Update local state with form values
-      setConfig((prev) => ({ ...prev, ...values }));
-    });
+    await saveUserConfig({ config: dirtyValues });
+    // Only apply the changed keys; this avoids stale request responses
+    // overwriting newer config changes.
+    setConfig((prev) => merge({}, prev, dirtyValues));
   };
   const onSubmit = useDebouncedCallback(onSubmitNotDebounced, FORM_DEBOUNCE);
   const handleAutoSubmit = submitMode === "auto" ? onSubmit : () => {};
@@ -610,6 +682,48 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         environment. Please install{" "}
                         <Kbd className="inline">basedpyright</Kbd> in your
                         environment.
+                      </Banner>
+                    )}
+                  </div>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="language_servers.pyrefly.enabled"
+                render={({ field }) => (
+                  <div className="flex flex-col gap-1">
+                    <FormItem className={formItemClasses}>
+                      <FormLabel>
+                        <Badge variant="defaultOutline" className="mr-2">
+                          Beta
+                        </Badge>
+                        Pyrefly (
+                        <ExternalLink href="https://github.com/facebook/pyrefly">
+                          docs
+                        </ExternalLink>
+                        )
+                      </FormLabel>
+                      <FormControl>
+                        <Checkbox
+                          data-testid="pyrefly-checkbox"
+                          checked={field.value}
+                          disabled={field.disabled}
+                          onCheckedChange={(checked) => {
+                            field.onChange(Boolean(checked));
+                          }}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                      <IsOverridden
+                        userConfig={config}
+                        name="language_servers.pyrefly.enabled"
+                      />
+                    </FormItem>
+                    {field.value && !capabilities.pyrefly && (
+                      <Banner kind="danger">
+                        Pyrefly is not available in your current environment.
+                        Please install <Kbd className="inline">pyrefly</Kbd> in
+                        your environment.
                       </Banner>
                     )}
                   </div>
@@ -1241,34 +1355,6 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
             />
             <FormField
               control={form.control}
-              name="experimental.performant_table_charts"
-              render={({ field }) => (
-                <div className="flex flex-col gap-y-1">
-                  <FormItem className={formItemClasses}>
-                    <FormLabel className="font-normal">
-                      Performant Table Charts
-                    </FormLabel>
-                    <FormControl>
-                      <Checkbox
-                        data-testid="performant-table-charts-checkbox"
-                        checked={field.value === true}
-                        onCheckedChange={field.onChange}
-                      />
-                    </FormControl>
-                  </FormItem>
-                  <IsOverridden
-                    userConfig={config}
-                    name="experimental.performant_table_charts"
-                  />
-                  <FormDescription>
-                    Enable experimental table charts which are computed on the
-                    backend.
-                  </FormDescription>
-                </div>
-              )}
-            />
-            <FormField
-              control={form.control}
               name="experimental.external_agents"
               render={({ field }) => (
                 <div className="flex flex-col gap-y-1">
@@ -1301,42 +1387,16 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
             />
             <FormField
               control={form.control}
-              name="experimental.chat_modes"
-              render={({ field }) => (
-                <div className="flex flex-col gap-y-1">
-                  <FormItem className={formItemClasses}>
-                    <FormLabel className="font-normal">Chat Mode</FormLabel>
-                    <FormControl>
-                      <Checkbox
-                        data-testid="chat-mode-checkbox"
-                        checked={field.value === true}
-                        onCheckedChange={field.onChange}
-                      />
-                    </FormControl>
-                  </FormItem>
-                  <IsOverridden
-                    userConfig={config}
-                    name="experimental.chat_modes"
-                  />
-                  <FormDescription>
-                    Switch between different modes in the Chat sidebar, to
-                    enable tool use.
-                  </FormDescription>
-                </div>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="experimental.server_side_pdf_export"
+              name="experimental.storage_inspector"
               render={({ field }) => (
                 <div className="flex flex-col gap-y-1">
                   <FormItem className={formItemClasses}>
                     <FormLabel className="font-normal">
-                      Better PDF Export
+                      Storage Inspector
                     </FormLabel>
                     <FormControl>
                       <Checkbox
-                        data-testid="server-side-pdf-export-checkbox"
+                        data-testid="storage-inspector-checkbox"
                         checked={field.value === true}
                         onCheckedChange={field.onChange}
                       />
@@ -1344,16 +1404,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </FormItem>
                   <IsOverridden
                     userConfig={config}
-                    name="experimental.server_side_pdf_export"
+                    name="experimental.storage_inspector"
                   />
                   <FormDescription>
-                    Enable PDF export using{" "}
-                    <Kbd className="inline">nbconvert</Kbd> and{" "}
-                    <Kbd className="inline">playwright</Kbd>. Refer to{" "}
-                    <ExternalLink href="https://docs.marimo.io/guides/exporting/#exporting-to-pdf-slides-or-rst">
-                      the docs
-                    </ExternalLink>
-                    .
+                    Enable experimental storage inspector.
                   </FormDescription>
                 </div>
               )}

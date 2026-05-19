@@ -19,11 +19,11 @@ components:
 
         /example/foo-0.1.0-py3-none-any.whl'
       properties:
-        dev:
+        group:
           anyOf:
-          - type: boolean
+          - type: string
           - type: 'null'
-          default: false
+          default: null
         package:
           type: string
         upgrade:
@@ -256,6 +256,9 @@ components:
       - description
       title: BannerNotification
       type: object
+    Base64String:
+      contentEncoding: base64
+      type: string
     BaseResponse:
       properties:
         success:
@@ -366,6 +369,8 @@ components:
       required: []
       title: CellConfig
       type: object
+    CellId:
+      type: string
     CellNotification:
       description: "Updates a cell's state in the frontend.\n\n    Only fields that\
         \ are set (not None) will update the cell state.\n    Omitting a field leaves\
@@ -379,7 +384,7 @@ components:
         \ Creation timestamp, auto-set."
       properties:
         cell_id:
-          type: string
+          $ref: '#/components/schemas/CellId'
         console:
           anyOf:
           - items:
@@ -489,6 +494,7 @@ components:
           - text/html
           - text/latex
           - text/markdown
+          - text/password
           - text/plain
           - video/mp4
           - video/mpeg
@@ -618,7 +624,7 @@ components:
         document:
           type: string
         id:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         type:
           enum:
           - code-completion
@@ -636,7 +642,7 @@ components:
         document:
           type: string
         id:
-          type: string
+          $ref: '#/components/schemas/RequestId'
       required:
       - id
       - document
@@ -825,12 +831,16 @@ components:
       description: "Instantiate and initialize a notebook.\n\n    Sent when a notebook\
         \ is first loaded. Contains all cells and initial UI element values.\n\n \
         \   Attributes:\n        execution_requests: ExecuteCellCommand for each notebook\
-        \ cell.\n        set_ui_element_value_request: Initial UI element values.\n\
-        \        auto_run: Whether to automatically execute cells on instantiation.\n\
-        \        request: HTTP request context if available."
+        \ cell.\n        cell_ids: Initial cell IDs in the notebook.\n        set_ui_element_value_request:\
+        \ Initial UI element values.\n        auto_run: Whether to automatically execute\
+        \ cells on instantiation.\n        request: HTTP request context if available."
       properties:
         autoRun:
           type: boolean
+        cellIds:
+          items:
+            type: string
+          type: array
         executionRequests:
           items:
             $ref: '#/components/schemas/ExecuteCellCommand'
@@ -848,6 +858,7 @@ components:
       required:
       - type
       - executionRequests
+      - cellIds
       - setUiElementValueRequest
       - autoRun
       title: CreateNotebookCommand
@@ -1016,7 +1027,7 @@ components:
           type: array
         engine:
           anyOf:
-          - type: string
+          - $ref: '#/components/schemas/VariableName'
           - type: 'null'
           default: null
         indexes:
@@ -1058,7 +1069,7 @@ components:
           - view
         variable_name:
           anyOf:
-          - type: string
+          - $ref: '#/components/schemas/VariableName'
           - type: 'null'
       required:
       - source_type
@@ -1109,7 +1120,7 @@ components:
           type: string
         engine:
           anyOf:
-          - type: string
+          - $ref: '#/components/schemas/VariableName'
           - type: 'null'
           default: null
         name:
@@ -1239,6 +1250,17 @@ components:
       - key
       title: DeleteSecretRequest
       type: object
+    DependencyTag:
+      properties:
+        kind:
+          type: string
+        value:
+          type: string
+      required:
+      - kind
+      - value
+      title: DependencyTag
+      type: object
     DependencyTreeNode:
       properties:
         dependencies:
@@ -1249,9 +1271,7 @@ components:
           type: string
         tags:
           items:
-            additionalProperties:
-              type: string
-            type: object
+            $ref: '#/components/schemas/DependencyTag'
           type: array
         version:
           anyOf:
@@ -1515,6 +1535,25 @@ components:
       type: object
     ExportAsPDFRequest:
       properties:
+        includeInputs:
+          default: false
+          type: boolean
+        preset:
+          default: document
+          enum:
+          - document
+          - slides
+        rasterScale:
+          default: 4.0
+          type: number
+        rasterServer:
+          default: static
+          enum:
+          - live
+          - static
+        rasterizeOutputs:
+          default: true
+          type: boolean
         webpdf:
           type: boolean
       required:
@@ -1544,6 +1583,7 @@ components:
           enum:
           - directory
           - file
+          - notebook
       required:
       - path
       - type
@@ -1635,6 +1675,11 @@ components:
           default: null
         name:
           type: string
+        opengraph:
+          anyOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/OpenGraphMetadata'
+          default: null
         path:
           type: string
       required:
@@ -1785,7 +1830,7 @@ components:
         \ Cell to focus."
       properties:
         cell_id:
-          type: string
+          $ref: '#/components/schemas/CellId'
         op:
           enum:
           - focus-cell
@@ -1793,6 +1838,14 @@ components:
       - op
       - cell_id
       title: FocusCellNotification
+      type: object
+    FocusCellRequest:
+      properties:
+        cellId:
+          type: string
+      required:
+      - cellId
+      title: FocusCellRequest
       type: object
     FormatCellsRequest:
       properties:
@@ -1834,7 +1887,7 @@ components:
         \ status."
       properties:
         function_call_id:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         op:
           enum:
           - function-call-result
@@ -1980,10 +2033,20 @@ components:
         \ the specified package manager. Triggered\n    automatically on import errors\
         \ or manually by the user.\n\n    Attributes:\n        manager: Package manager\
         \ to use ('pip', 'conda', 'uv', etc.).\n        versions: Package names mapped\
-        \ to version specifiers. Empty version\n                  means install latest."
+        \ to version specifiers. Empty version\n                  means install latest.\n\
+        \        source: Where to install. \"kernel\" (default) dispatches to the\
+        \ kernel\n                subprocess; \"server\" installs directly into the\
+        \ server's Python\n                environment (sys.executable), used when\
+        \ the server itself needs\n                a package (e.g. nbformat for IPYNB\
+        \ auto-export in sandbox mode)."
       properties:
         manager:
           type: string
+        source:
+          default: kernel
+          enum:
+          - kernel
+          - server
         type:
           enum:
           - install-packages
@@ -2001,6 +2064,11 @@ components:
       properties:
         manager:
           type: string
+        source:
+          default: kernel
+          enum:
+          - kernel
+          - server
         versions:
           additionalProperties:
             type: string
@@ -2165,6 +2233,9 @@ components:
         pylsp:
           default: false
           type: boolean
+        pyrefly:
+          default: false
+          type: boolean
         terminal:
           default: false
           type: boolean
@@ -2196,7 +2267,7 @@ components:
           $ref: '#/components/schemas/KernelCapabilitiesNotification'
         cell_ids:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
         codes:
           items:
@@ -2307,8 +2378,9 @@ components:
           - $ref: '#/components/schemas/SyncGraphCommand'
           - $ref: '#/components/schemas/UpdateCellConfigCommand'
           - $ref: '#/components/schemas/InstallPackagesCommand'
+          - $ref: '#/components/schemas/RefreshInstalledModulesCommand'
           - $ref: '#/components/schemas/UpdateUIElementCommand'
-          - $ref: '#/components/schemas/UpdateWidgetModelCommand'
+          - $ref: '#/components/schemas/ModelCommand'
           - $ref: '#/components/schemas/InvokeFunctionCommand'
           - $ref: '#/components/schemas/UpdateUserConfigCommand'
           - $ref: '#/components/schemas/PreviewDatasetColumnCommand'
@@ -2316,6 +2388,8 @@ components:
           - $ref: '#/components/schemas/ListSQLTablesCommand'
           - $ref: '#/components/schemas/ValidateSQLCommand'
           - $ref: '#/components/schemas/ListDataSourceConnectionCommand'
+          - $ref: '#/components/schemas/StorageListEntriesCommand'
+          - $ref: '#/components/schemas/StorageDownloadCommand'
           - $ref: '#/components/schemas/ListSecretKeysCommand'
           - $ref: '#/components/schemas/RefreshSecretsCommand'
           - $ref: '#/components/schemas/ClearCacheCommand'
@@ -2337,16 +2411,19 @@ components:
               list-data-source-connection: '#/components/schemas/ListDataSourceConnectionCommand'
               list-secret-keys: '#/components/schemas/ListSecretKeysCommand'
               list-sql-tables: '#/components/schemas/ListSQLTablesCommand'
+              model: '#/components/schemas/ModelCommand'
               preview-dataset-column: '#/components/schemas/PreviewDatasetColumnCommand'
               preview-sql-table: '#/components/schemas/PreviewSQLTableCommand'
+              refresh-installed-modules: '#/components/schemas/RefreshInstalledModulesCommand'
               refresh-secrets: '#/components/schemas/RefreshSecretsCommand'
               rename-notebook: '#/components/schemas/RenameNotebookCommand'
               stop-kernel: '#/components/schemas/StopKernelCommand'
+              storage-download: '#/components/schemas/StorageDownloadCommand'
+              storage-list-entries: '#/components/schemas/StorageListEntriesCommand'
               sync-graph: '#/components/schemas/SyncGraphCommand'
               update-cell-config: '#/components/schemas/UpdateCellConfigCommand'
               update-ui-element: '#/components/schemas/UpdateUIElementCommand'
               update-user-config: '#/components/schemas/UpdateUserConfigCommand'
-              update-widget-model: '#/components/schemas/UpdateWidgetModelCommand'
               validate-sql: '#/components/schemas/ValidateSQLCommand'
             propertyName: type
         data_type:
@@ -2395,6 +2472,7 @@ components:
           - $ref: '#/components/schemas/CellNotification'
           - $ref: '#/components/schemas/FunctionCallResultNotification'
           - $ref: '#/components/schemas/UIElementMessageNotification'
+          - $ref: '#/components/schemas/ModelLifecycleNotification'
           - $ref: '#/components/schemas/RemoveUIElementsNotification'
           - $ref: '#/components/schemas/ReloadNotification'
           - $ref: '#/components/schemas/ReconnectedNotification'
@@ -2420,6 +2498,9 @@ components:
           - $ref: '#/components/schemas/SQLTableListPreviewNotification'
           - $ref: '#/components/schemas/DataSourceConnectionsNotification'
           - $ref: '#/components/schemas/ValidateSQLResultNotification'
+          - $ref: '#/components/schemas/StorageNamespacesNotification'
+          - $ref: '#/components/schemas/StorageEntriesNotification'
+          - $ref: '#/components/schemas/StorageDownloadReadyNotification'
           - $ref: '#/components/schemas/SecretKeysResultNotification'
           - $ref: '#/components/schemas/CacheClearedNotification'
           - $ref: '#/components/schemas/CacheInfoNotification'
@@ -2445,6 +2526,7 @@ components:
               kernel-ready: '#/components/schemas/KernelReadyNotification'
               kernel-startup-error: '#/components/schemas/KernelStartupErrorNotification'
               missing-package-alert: '#/components/schemas/MissingPackageAlertNotification'
+              model-lifecycle: '#/components/schemas/ModelLifecycleNotification'
               query-params-append: '#/components/schemas/QueryParamsAppendNotification'
               query-params-clear: '#/components/schemas/QueryParamsClearNotification'
               query-params-delete: '#/components/schemas/QueryParamsDeleteNotification'
@@ -2457,6 +2539,9 @@ components:
               sql-table-list-preview: '#/components/schemas/SQLTableListPreviewNotification'
               sql-table-preview: '#/components/schemas/SQLTablePreviewNotification'
               startup-logs: '#/components/schemas/StartupLogsNotification'
+              storage-download-ready: '#/components/schemas/StorageDownloadReadyNotification'
+              storage-entries: '#/components/schemas/StorageEntriesNotification'
+              storage-namespaces: '#/components/schemas/StorageNamespacesNotification'
               update-cell-codes: '#/components/schemas/UpdateCellCodesNotification'
               update-cell-ids: '#/components/schemas/UpdateCellIdsNotification'
               validate-sql-result: '#/components/schemas/ValidateSQLResultNotification'
@@ -2472,12 +2557,15 @@ components:
       type: object
     LanguageServersConfig:
       description: "Configuration options for language servers.\n\n    **Keys.**\n\
-        \n    - `pylsp`: the pylsp config"
+        \n    - `pylsp`: the pylsp config\n    - `basedpyright`: the basedpyright\
+        \ config\n    - `ty`: the ty config\n    - `pyrefly`: the pyrefly config"
       properties:
         basedpyright:
           $ref: '#/components/schemas/BasedpyrightServerConfig'
         pylsp:
           $ref: '#/components/schemas/PythonLanguageServerConfig'
+        pyrefly:
+          $ref: '#/components/schemas/PyreflyLanguageServerConfig'
         ty:
           $ref: '#/components/schemas/TyLanguageServerConfig'
       required: []
@@ -2604,6 +2692,94 @@ components:
       - keys
       title: ListSecretKeysResponse
       type: object
+    LspHealthResponse:
+      description: Aggregated health response for all LSP servers.
+      properties:
+        servers:
+          items:
+            $ref: '#/components/schemas/LspServerHealth'
+          type: array
+        status:
+          enum:
+          - degraded
+          - healthy
+          - unhealthy
+      required:
+      - status
+      - servers
+      title: LspHealthResponse
+      type: object
+    LspRestartRequest:
+      description: Request to restart LSP servers.
+      properties:
+        serverIds:
+          anyOf:
+          - items:
+              type: string
+            type: array
+          - type: 'null'
+          default: null
+      required: []
+      title: LspRestartRequest
+      type: object
+    LspRestartResponse:
+      description: Response from restart operation.
+      properties:
+        errors:
+          additionalProperties:
+            type: string
+          default: {}
+          type: object
+        restarted:
+          items:
+            type: string
+          type: array
+        success:
+          type: boolean
+      required:
+      - success
+      - restarted
+      title: LspRestartResponse
+      type: object
+    LspServerHealth:
+      description: "Health status for a single LSP server.\n\n    Status meanings:\n\
+        \    - starting: process launched, initializing\n    - running: healthy and\
+        \ responsive to pings\n    - stopped: not running (never started or cleanly\
+        \ stopped)\n    - crashed: exited with non-zero code\n    - unresponsive:\
+        \ process alive but not responding to pings"
+      properties:
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        lastPingMs:
+          anyOf:
+          - type: number
+          - type: 'null'
+          default: null
+        port:
+          type: integer
+        serverId:
+          type: string
+        startedAt:
+          anyOf:
+          - type: number
+          - type: 'null'
+          default: null
+        status:
+          enum:
+          - crashed
+          - running
+          - starting
+          - stopped
+          - unresponsive
+      required:
+      - serverId
+      - status
+      - port
+      title: LspServerHealth
+      type: object
     MCPConfig:
       description: 'Configuration for MCP servers
 
@@ -2674,12 +2850,12 @@ components:
       properties:
         blamed_cell:
           anyOf:
-          - type: string
+          - $ref: '#/components/schemas/CellId'
           - type: 'null'
         msg:
           type: string
         raising_cell:
-          type: string
+          $ref: '#/components/schemas/CellId'
         type:
           enum:
           - ancestor-prevented
@@ -2695,7 +2871,7 @@ components:
         msg:
           type: string
         raising_cell:
-          type: string
+          $ref: '#/components/schemas/CellId'
         type:
           enum:
           - ancestor-stopped
@@ -2761,7 +2937,7 @@ components:
           type: string
         raising_cell:
           anyOf:
-          - type: string
+          - $ref: '#/components/schemas/CellId'
           - type: 'null'
         type:
           enum:
@@ -2872,7 +3048,7 @@ components:
       properties:
         blamed_cell:
           anyOf:
-          - type: string
+          - $ref: '#/components/schemas/CellId'
           - type: 'null'
         msg:
           type: string
@@ -2907,8 +3083,11 @@ components:
       type: object
     MissingPackageAlertNotification:
       description: "Alert for missing packages with install option.\n\n    Attributes:\n\
-        \        packages: Missing package names.\n        isolated: Whether in isolated\
-        \ environment."
+        \        packages: Missing package names.\n        isolated: Whether auto-install\
+        \ is possible in this environment.\n        source: Which Python environment\
+        \ to install into. \"kernel\" (default)\n                installs in the kernel's\
+        \ venv; \"server\" installs in the\n                server's own Python env\
+        \ (e.g. for formatter tools like ruff)."
       properties:
         isolated:
           type: boolean
@@ -2919,17 +3098,204 @@ components:
           items:
             type: string
           type: array
+        source:
+          default: kernel
+          enum:
+          - kernel
+          - server
       required:
       - op
       - packages
       - isolated
       title: MissingPackageAlertNotification
       type: object
-    ModelMessage:
-      description: "Widget model state update message.\n\n    State changes for anywidget\
-        \ models, including state dict and binary buffer paths.\n\n    Attributes:\n\
-        \        state: Model state updates.\n        buffer_paths: Paths within state\
-        \ dict pointing to binary buffers."
+    ModelClose:
+      description: Widget destruction.
+      properties:
+        method:
+          enum:
+          - close
+      required:
+      - method
+      title: ModelClose
+      type: object
+    ModelCommand:
+      description: "Widget model message command.\n\n    Handles widget model communication\
+        \ between frontend and backend.\n\n    Attributes:\n        model_id: Widget\
+        \ model identifier.\n        message: Model message (update or custom).\n\
+        \        buffers: Base64-encoded binary buffers.\n        token: Unique identifier\
+        \ for deduplication across dual queues."
+      properties:
+        buffers:
+          items:
+            $ref: '#/components/schemas/Base64String'
+          type: array
+        message:
+          anyOf:
+          - $ref: '#/components/schemas/ModelUpdateMessage'
+          - $ref: '#/components/schemas/ModelCustomMessage'
+          discriminator:
+            mapping:
+              custom: '#/components/schemas/ModelCustomMessage'
+              update: '#/components/schemas/ModelUpdateMessage'
+            propertyName: method
+        modelId:
+          type: string
+        token:
+          type: string
+        type:
+          enum:
+          - model
+      required:
+      - type
+      - modelId
+      - message
+      - buffers
+      title: ModelCommand
+      type: object
+    ModelCustom:
+      description: Custom application message.
+      properties:
+        buffers:
+          items:
+            $ref: '#/components/schemas/Base64String'
+          type: array
+        content: {}
+        method:
+          enum:
+          - custom
+      required:
+      - method
+      - content
+      - buffers
+      title: ModelCustom
+      type: object
+    ModelCustomMessage:
+      description: "Custom widget message.\n\n    Attributes:\n        content: Arbitrary\
+        \ content for the custom message."
+      properties:
+        content: {}
+        method:
+          enum:
+          - custom
+      required:
+      - method
+      - content
+      title: ModelCustomMessage
+      type: object
+    ModelLifecycleNotification:
+      description: "Widget model lifecycle message.\n\n    Mirrors the Jupyter widget\
+        \ comm protocol with open/update/custom/close.\n\n    Attributes:\n      \
+        \  model_id: Widget model identifier.\n        message: The lifecycle message\
+        \ (open/update/custom/close)."
+      properties:
+        message:
+          anyOf:
+          - $ref: '#/components/schemas/ModelOpen'
+          - $ref: '#/components/schemas/ModelUpdate'
+          - $ref: '#/components/schemas/ModelCustom'
+          - $ref: '#/components/schemas/ModelClose'
+          discriminator:
+            mapping:
+              close: '#/components/schemas/ModelClose'
+              custom: '#/components/schemas/ModelCustom'
+              open: '#/components/schemas/ModelOpen'
+              update: '#/components/schemas/ModelUpdate'
+            propertyName: method
+        model_id:
+          type: string
+        op:
+          enum:
+          - model-lifecycle
+      required:
+      - op
+      - model_id
+      - message
+      title: ModelLifecycleNotification
+      type: object
+    ModelOpen:
+      description: Initial widget state on creation.
+      properties:
+        buffer_paths:
+          items:
+            items:
+              anyOf:
+              - type: string
+              - type: integer
+            type: array
+          type: array
+        buffers:
+          items:
+            $ref: '#/components/schemas/Base64String'
+          type: array
+        method:
+          enum:
+          - open
+        state:
+          type: object
+      required:
+      - method
+      - state
+      - buffer_paths
+      - buffers
+      title: ModelOpen
+      type: object
+    ModelRequest:
+      properties:
+        buffers:
+          items:
+            $ref: '#/components/schemas/Base64String'
+          type: array
+        message:
+          anyOf:
+          - $ref: '#/components/schemas/ModelUpdateMessage'
+          - $ref: '#/components/schemas/ModelCustomMessage'
+          discriminator:
+            mapping:
+              custom: '#/components/schemas/ModelCustomMessage'
+              update: '#/components/schemas/ModelUpdateMessage'
+            propertyName: method
+        modelId:
+          type: string
+        token:
+          type: string
+      required:
+      - modelId
+      - message
+      - buffers
+      title: ModelRequest
+      type: object
+    ModelUpdate:
+      description: State sync - changed traits only.
+      properties:
+        buffer_paths:
+          items:
+            items:
+              anyOf:
+              - type: string
+              - type: integer
+            type: array
+          type: array
+        buffers:
+          items:
+            $ref: '#/components/schemas/Base64String'
+          type: array
+        method:
+          enum:
+          - update
+        state:
+          type: object
+      required:
+      - method
+      - state
+      - buffer_paths
+      - buffers
+      title: ModelUpdate
+      type: object
+    ModelUpdateMessage:
+      description: "Widget model state update message.\n\n    Attributes:\n      \
+        \  state: Model state updates.\n        buffer_paths: Paths within state dict\
+        \ pointing to binary buffers."
       properties:
         bufferPaths:
           items:
@@ -2939,18 +3305,22 @@ components:
               - type: integer
             type: array
           type: array
+        method:
+          enum:
+          - update
         state:
           type: object
       required:
+      - method
       - state
       - bufferPaths
-      title: ModelMessage
+      title: ModelUpdateMessage
       type: object
     MultipleDefinitionError:
       properties:
         cells:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
         name:
           type: string
@@ -2995,6 +3365,29 @@ components:
           type: boolean
       required: []
       title: OpenAiConfig
+      type: object
+    OpenGraphMetadata:
+      description: "OpenGraph-style metadata for a notebook.\n\n    The `image` field\
+        \ may be either:\n    - a relative path (typically under `__marimo__/`), or\n\
+        \    - an absolute HTTPS URL."
+      properties:
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        image:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+      required: []
+      title: OpenGraphMetadata
       type: object
     OpenTutorialRequest:
       properties:
@@ -3168,6 +3561,17 @@ components:
       - tableName
       title: PreviewSQLTableRequest
       type: object
+    PyreflyLanguageServerConfig:
+      description: 'Configuration options for Pyrefly Language Server.
+
+
+        Pyrefly handles completion, hover, go-to-definition, and diagnostics.'
+      properties:
+        enabled:
+          type: boolean
+      required: []
+      title: PyreflyLanguageServerConfig
+      type: object
     PythonLanguageServerConfig:
       description: 'Configuration options for Python Language Server.
 
@@ -3287,6 +3691,24 @@ components:
       - op
       title: ReconnectedNotification
       type: object
+    RefreshInstalledModulesCommand:
+      description: "Refresh kernel state after packages were installed externally.\n\
+        \n    Used when the server installs packages outside the kernel's normal\n\
+        \    installation flow, but the current edit session still needs to see the\n\
+        \    modules immediately without restarting the kernel process."
+      properties:
+        modules:
+          items:
+            type: string
+          type: array
+        type:
+          enum:
+          - refresh-installed-modules
+      required:
+      - type
+      - modules
+      title: RefreshInstalledModulesCommand
+      type: object
     RefreshSecretsCommand:
       description: "Refresh secrets from the secrets store.\n\n    Reloads secrets\
         \ from the provider without restarting the kernel."
@@ -3310,11 +3732,11 @@ components:
       type: object
     RemovePackageRequest:
       properties:
-        dev:
+        group:
           anyOf:
-          - type: boolean
+          - type: string
           - type: 'null'
-          default: false
+          default: null
         package:
           type: string
       required:
@@ -3327,7 +3749,7 @@ components:
         \ UI elements should be removed."
       properties:
         cell_id:
-          type: string
+          $ref: '#/components/schemas/CellId'
         op:
           enum:
           - remove-ui-elements
@@ -3359,6 +3781,8 @@ components:
       - filename
       title: RenameNotebookRequest
       type: object
+    RequestId:
+      type: string
     RunningNotebooksResponse:
       properties:
         files:
@@ -3387,14 +3811,16 @@ components:
         \ file changes when saving. `\"lazy\"` marks\n        affected cells as stale,\
         \ `\"autorun\"` automatically runs affected cells.\n    - `output_max_bytes`:\
         \ the maximum size in bytes of cell outputs; larger\n        values may affect\
-        \ frontend performance\n    - `std_stream_max_bytes`: the maximum size in\
-        \ bytes of console outputs;\n      larger values may affect frontend performance\n\
-        \    - `pythonpath`: a list of directories to add to the Python search path.\n\
-        \        Directories will be added to the head of sys.path. Similar to the\n\
-        \        `PYTHONPATH` environment variable, the directories will be included\
-        \ in\n        where Python will look for imported modules.\n    - `dotenv`:\
-        \ a list of paths to `.env` files to load.\n        If the file does not exist,\
-        \ it will be silently ignored.\n        The default is `[\".env\"]` if a pyproject.toml\
+        \ frontend performance\n    - `serve_cached_sessions_in_apps`: if `True`,\
+        \ initialize applications with session cache.\n        The default is `False`.\n\
+        \    - `std_stream_max_bytes`: the maximum size in bytes of console outputs;\n\
+        \      larger values may affect frontend performance\n    - `pythonpath`:\
+        \ a list of directories to add to the Python search path.\n        Directories\
+        \ will be added to the head of sys.path. Similar to the\n        `PYTHONPATH`\
+        \ environment variable, the directories will be included in\n        where\
+        \ Python will look for imported modules.\n    - `dotenv`: a list of paths\
+        \ to `.env` files to load.\n        If the file does not exist, it will be\
+        \ silently ignored.\n        The default is `[\".env\"]` if a pyproject.toml\
         \ is found, otherwise `[]`.\n    - `default_sql_output`: the default output\
         \ format for SQL queries. Can be one of:\n        `\"auto\"`, `\"native\"\
         `, `\"polars\"`, `\"lazy-polars\"`, or `\"pandas\"`.\n        The default\
@@ -3441,6 +3867,8 @@ components:
             type: string
           type: array
         reactive_tests:
+          type: boolean
+        serve_cached_sessions_in_apps:
           type: boolean
         std_stream_max_bytes:
           type: integer
@@ -3496,7 +3924,7 @@ components:
           enum:
           - sql-table-list-preview
         request_id:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         tables:
           default: []
           items:
@@ -3525,7 +3953,7 @@ components:
           enum:
           - sql-table-preview
         request_id:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         table:
           anyOf:
           - type: 'null'
@@ -3658,7 +4086,7 @@ components:
           enum:
           - secret-keys-result
         request_id:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         secrets:
           items:
             $ref: '#/components/schemas/SecretKeysWithProvider'
@@ -3709,6 +4137,8 @@ components:
       - follow_symlink
       title: ServerConfig
       type: object
+    SessionId:
+      type: string
     SetupRootError:
       properties:
         edges_with_vars:
@@ -3901,6 +4331,259 @@ components:
       - type
       title: StopKernelCommand
       type: object
+    StorageDownloadCommand:
+      description: "Download a storage entry.\n\n    Obtains a pre-signed URL or downloads\
+        \ the file locally and returns a virtual file URL\n    so the frontend can\
+        \ fetch the contents.\n\n    Attributes:\n        request_id: Unique identifier\
+        \ for this request.\n        namespace: Variable name identifying the storage\
+        \ backend.\n        path: Full path of the entry to download.\n        preview:\
+        \ If true, a local preview of the file is returned.\n            This is useful\
+        \ if you need to bypass CORS."
+      properties:
+        namespace:
+          type: string
+        path:
+          type: string
+        preview:
+          default: false
+          type: boolean
+        requestId:
+          type: string
+        type:
+          enum:
+          - storage-download
+      required:
+      - type
+      - requestId
+      - namespace
+      - path
+      title: StorageDownloadCommand
+      type: object
+    StorageDownloadReadyNotification:
+      description: "Signals that a storage file download is ready.\n\n    The url\
+        \ may be a signed cloud URL (preferred) or a virtual file URL\n    (fallback\
+        \ for backends that don't support signing).\n\n    Attributes:\n        request_id:\
+        \ Request ID this responds to.\n        url: Signed or virtual-file URL to\
+        \ download from.\n        filename: Suggested filename for the download.\n\
+        \        error: Error message if the download failed."
+      properties:
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        filename:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        op:
+          enum:
+          - storage-download-ready
+        request_id:
+          type: string
+        url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+      required:
+      - op
+      - request_id
+      title: StorageDownloadReadyNotification
+      type: object
+    StorageDownloadRequest:
+      properties:
+        namespace:
+          type: string
+        path:
+          type: string
+        preview:
+          default: false
+          type: boolean
+        requestId:
+          type: string
+      required:
+      - requestId
+      - namespace
+      - path
+      title: StorageDownloadRequest
+      type: object
+    StorageEntriesNotification:
+      description: "Result of a storage operation that returns entries.\n\n    Attributes:\n\
+        \        request_id: Request ID this responds to.\n        entries: Storage\
+        \ entries returned by the operation.\n        namespace: Variable name of\
+        \ the storage backend.\n        prefix: The prefix that was listed (set by\
+        \ list_entries).\n        query: The search query that was used (set by search).\n\
+        \        error: Error message if the operation failed."
+      properties:
+        entries:
+          items:
+            $ref: '#/components/schemas/StorageEntry'
+          type: array
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        namespace:
+          type: string
+        op:
+          enum:
+          - storage-entries
+        prefix:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        query:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        request_id:
+          type: string
+      required:
+      - op
+      - request_id
+      - entries
+      - namespace
+      title: StorageEntriesNotification
+      type: object
+    StorageEntry:
+      description: "A storage entry is a file, directory, or object for external storage\
+        \ systems\n\n    Attributes:\n        path: The path of the storage entry.\n\
+        \        kind: The kind of the storage entry.\n        size: The size of the\
+        \ storage entry.\n        last_modified: The last modified time of the storage\
+        \ entry.\n        metadata: The metadata of the storage entry.\n        mime_type:\
+        \ The MIME type of the storage entry, or None for directories."
+      properties:
+        kind:
+          enum:
+          - directory
+          - file
+          - object
+        lastModified:
+          anyOf:
+          - type: number
+          - type: 'null'
+        metadata:
+          default: {}
+          type: object
+        mimeType:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        path:
+          type: string
+        size:
+          type: integer
+      required:
+      - path
+      - kind
+      - size
+      - lastModified
+      title: StorageEntry
+      type: object
+    StorageListEntriesCommand:
+      description: "List storage entries at a prefix.\n\n    Navigates storage like\
+        \ a folder tree using delimiter-based listing.\n    Returns entries (files/objects)\
+        \ and virtual directories at one level.\n\n    Attributes:\n        request_id:\
+        \ Unique identifier for this request.\n        namespace: Variable name identifying\
+        \ the storage backend.\n        limit: Max entries to return.\n        prefix:\
+        \ Path prefix to list (None = root)."
+      properties:
+        limit:
+          type: integer
+        namespace:
+          type: string
+        prefix:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        requestId:
+          type: string
+        type:
+          enum:
+          - storage-list-entries
+      required:
+      - type
+      - requestId
+      - namespace
+      - limit
+      title: StorageListEntriesCommand
+      type: object
+    StorageListEntriesRequest:
+      properties:
+        limit:
+          type: integer
+        namespace:
+          type: string
+        prefix:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        requestId:
+          type: string
+      required:
+      - requestId
+      - namespace
+      - limit
+      title: StorageListEntriesRequest
+      type: object
+    StorageNamespace:
+      description: "Represents external storage systems (filesystems and object storage)\n\
+        \n    Attributes:\n        name: The variable name of the storage namespace.\n\
+        \        display_name: The display name of the storage namespace.\n      \
+        \  protocol: The protocol of the storage namespace. E.g. s3, gcs, azure, http,\
+        \ file, in-memory.\n        root_path: The root path of the storage namespace.\n\
+        \        backend_type: The type of the storage backend (fsspec or obstore)\n\
+        \        storage_entries: The storage entries in the storage namespace."
+      properties:
+        backendType:
+          enum:
+          - fsspec
+          - obstore
+        displayName:
+          type: string
+        name:
+          $ref: '#/components/schemas/VariableName'
+        protocol:
+          type: string
+        rootPath:
+          type: string
+        storageEntries:
+          items:
+            $ref: '#/components/schemas/StorageEntry'
+          type: array
+      required:
+      - name
+      - displayName
+      - protocol
+      - rootPath
+      - backendType
+      - storageEntries
+      title: StorageNamespace
+      type: object
+    StorageNamespacesNotification:
+      description: "Available storage namespaces for storage inspector.\n\n    Attributes:\n\
+        \        namespaces: Available storage namespaces."
+      properties:
+        namespaces:
+          items:
+            $ref: '#/components/schemas/StorageNamespace'
+          type: array
+        op:
+          enum:
+          - storage-namespaces
+      required:
+      - op
+      - namespaces
+      title: StorageNamespacesNotification
+      type: object
     StoreConfig:
       description: Configuration for cache stores.
       properties:
@@ -3998,37 +4681,30 @@ components:
       required: []
       title: TyLanguageServerConfig
       type: object
+    UIElementId:
+      type: string
     UIElementMessageNotification:
       description: "Sends a message to a UI element/widget.\n\n    Attributes:\n \
-        \       ui_element: UI element identifier (legacy).\n        model_id: Widget\
-        \ model ID (newer architecture).\n        message: Message payload as dictionary.\n\
-        \        buffers: Optional binary buffers for large data."
+        \       ui_element: UI element identifier.\n        message: Message payload\
+        \ as dictionary.\n        buffers: Optional binary buffers for large data."
       properties:
         buffers:
           anyOf:
           - items:
-              contentEncoding: base64
-              type: string
+              $ref: '#/components/schemas/Base64String'
             type: array
           - type: 'null'
           default: null
         message:
           type: object
-        model_id:
-          anyOf:
-          - type: string
-          - type: 'null'
         op:
           enum:
           - send-ui-element-message
         ui_element:
-          anyOf:
-          - type: string
-          - type: 'null'
+          $ref: '#/components/schemas/UIElementId'
       required:
       - op
       - ui_element
-      - model_id
       - message
       title: UIElementMessageNotification
       type: object
@@ -4050,18 +4726,30 @@ components:
       title: UnknownError
       type: object
     UpdateCellCodesNotification:
-      description: "Updates cell code contents (kiosk mode).\n\n    Attributes:\n\
-        \        cell_ids: Cells to update.\n        codes: New code for each cell.\n\
-        \        code_is_stale: If True, code was not executed on backend (output\
-        \ may not match)."
+      description: "Updates cell code contents (kiosk mode and edit-mode file reload).\n\
+        \n    Attributes:\n        cell_ids: Cells to update.\n        codes: New\
+        \ code for each cell.\n        code_is_stale: If True, code was not executed\
+        \ on backend (output may not match).\n        names: Cell names for each cell\
+        \ (optional, for file reload).\n        configs: Cell configs for each cell\
+        \ (optional, for file reload)."
       properties:
         cell_ids:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
         code_is_stale:
           type: boolean
         codes:
+          items:
+            type: string
+          type: array
+        configs:
+          default: []
+          items:
+            $ref: '#/components/schemas/CellConfig'
+          type: array
+        names:
+          default: []
           items:
             type: string
           type: array
@@ -4109,7 +4797,7 @@ components:
       properties:
         cell_ids:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
         op:
           enum:
@@ -4158,6 +4846,7 @@ components:
               - text/html
               - text/latex
               - text/markdown
+              - text/password
               - text/plain
               - video/mp4
               - video/mpeg
@@ -4253,51 +4942,6 @@ components:
       required:
       - config
       title: UpdateUserConfigRequest
-      type: object
-    UpdateWidgetModelCommand:
-      description: "Update anywidget model state.\n\n    Updates widget model state\
-        \ for bidirectional Python-JavaScript communication.\n\n    Attributes:\n\
-        \        model_id: Widget model identifier.\n        message: Model message\
-        \ with state updates and buffer paths.\n        buffers: Base64-encoded binary\
-        \ buffers referenced by buffer_paths."
-      properties:
-        buffers:
-          anyOf:
-          - items:
-              type: string
-            type: array
-          - type: 'null'
-          default: null
-        message:
-          $ref: '#/components/schemas/ModelMessage'
-        modelId:
-          type: string
-        type:
-          enum:
-          - update-widget-model
-      required:
-      - type
-      - modelId
-      - message
-      title: UpdateWidgetModelCommand
-      type: object
-    UpdateWidgetModelRequest:
-      properties:
-        buffers:
-          anyOf:
-          - items:
-              type: string
-            type: array
-          - type: 'null'
-          default: null
-        message:
-          $ref: '#/components/schemas/ModelMessage'
-        modelId:
-          type: string
-      required:
-      - modelId
-      - message
-      title: UpdateWidgetModelRequest
       type: object
     ValidateSQLCommand:
       description: "Validate an SQL query.\n\n    Checks if an SQL query is valid\
@@ -4409,13 +5053,13 @@ components:
       properties:
         declared_by:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
         name:
           type: string
         used_by:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
       required:
       - name
@@ -4423,6 +5067,8 @@ components:
       - used_by
       title: VariableDeclarationNotification
       type: object
+    VariableName:
+      type: string
     VariableValue:
       description: "Variable value and type for variables panel.\n\n    Attributes:\n\
         \        name: Variable name.\n        value: String representation of value.\n\
@@ -4491,6 +5137,8 @@ components:
       required: []
       title: VenvConfig
       type: object
+    WidgetModelId:
+      type: string
     WorkspaceFilesRequest:
       properties:
         includeMarkdown:
@@ -4570,7 +5218,6 @@ components:
       type: object
 info:
   title: marimo API
-  version: 0.19.4
 openapi: 3.1.0
 paths:
   /@file/{filename_and_length}:
@@ -4920,6 +5567,28 @@ paths:
           description: Export the notebook as HTML
         400:
           description: File must be saved before downloading
+  /api/export/ipynb:
+    post:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportAsIPYNBRequest'
+      responses:
+        200:
+          content:
+            text/plain:
+              schema:
+                type: string
+          description: Export the notebook as IPYNB
+        400:
+          description: File must be saved before downloading
   /api/export/markdown:
     post:
       parameters:
@@ -5243,6 +5912,26 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
           description: Delete a cell
+  /api/kernel/focus_cell:
+    post:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FocusCellRequest'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+          description: Focus a cell in kiosk-mode consumers
   /api/kernel/format:
     post:
       requestBody:
@@ -5541,7 +6230,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpdateWidgetModelRequest'
+              $ref: '#/components/schemas/ModelRequest'
       responses:
         200:
           content:
@@ -5642,6 +6331,29 @@ paths:
                     type: string
                 type: object
           description: Successfully closed existing sessions
+  /api/lsp/health:
+    get:
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LspHealthResponse'
+          description: Get health status of all LSP servers
+  /api/lsp/restart:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LspRestartRequest'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LspRestartResponse'
+          description: Restart LSP servers
   /api/packages/add:
     post:
       requestBody:
@@ -5801,6 +6513,46 @@ paths:
                     type: integer
                 type: object
           description: Get the number of active websocket connections
+  /api/storage/download:
+    post:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StorageDownloadRequest'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+          description: Download a storage entry
+  /api/storage/list_entries:
+    post:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StorageListEntriesRequest'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+          description: List storage entries at a prefix
   /api/usage:
     get:
       responses:

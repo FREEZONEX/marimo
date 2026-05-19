@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
     Optional,
     TypeVar,
     Union,
@@ -441,6 +442,7 @@ class AppMetadata(msgspec.Struct, rename="camel"):
         app_config: Application-level configuration.
         argv: Full argument vector if available.
         filename: Path to the notebook file.
+        docstring: Module docstring extracted from the notebook header.
     """
 
     query_params: SerializedQueryParams
@@ -449,6 +451,7 @@ class AppMetadata(msgspec.Struct, rename="camel"):
     argv: Union[list[str], None] = None
 
     filename: Optional[str] = None
+    docstring: Optional[str] = None
 
 
 class UpdateCellConfigCommand(Command):
@@ -488,12 +491,14 @@ class CreateNotebookCommand(Command):
 
     Attributes:
         execution_requests: ExecuteCellCommand for each notebook cell.
+        cell_ids: Initial cell IDs in the notebook.
         set_ui_element_value_request: Initial UI element values.
         auto_run: Whether to automatically execute cells on instantiation.
         request: HTTP request context if available.
     """
 
     execution_requests: tuple[ExecuteCellCommand, ...]
+    cell_ids: tuple[CellId_t, ...]
     set_ui_element_value_request: UpdateUIElementCommand
     auto_run: bool
     request: Optional[HTTPRequest] = None
@@ -553,6 +558,10 @@ class InstallPackagesCommand(Command):
         manager: Package manager to use ('pip', 'conda', 'uv', etc.).
         versions: Package names mapped to version specifiers. Empty version
                   means install latest.
+        source: Where to install. "kernel" (default) dispatches to the kernel
+                subprocess; "server" installs directly into the server's Python
+                environment (sys.executable), used when the server itself needs
+                a package (e.g. nbformat for IPYNB auto-export in sandbox mode).
     """
 
     # TODO: index URL (index/channel/...)
@@ -562,6 +571,8 @@ class InstallPackagesCommand(Command):
     # If the package name is not in the map, the latest version
     # will be installed
     versions: dict[str, str]
+
+    source: Literal["kernel", "server"] = "kernel"
 
 
 class RefreshInstalledModulesCommand(Command):
@@ -679,6 +690,45 @@ class ValidateSQLCommand(Command):
     dialect: Optional[str] = None
 
 
+class StorageListEntriesCommand(Command):
+    """List storage entries at a prefix.
+
+    Navigates storage like a folder tree using delimiter-based listing.
+    Returns entries (files/objects) and virtual directories at one level.
+
+    Attributes:
+        request_id: Unique identifier for this request.
+        namespace: Variable name identifying the storage backend.
+        limit: Max entries to return.
+        prefix: Path prefix to list (None = root).
+    """
+
+    request_id: RequestId
+    namespace: str
+    limit: int
+    prefix: Optional[str] = None
+
+
+class StorageDownloadCommand(Command):
+    """Download a storage entry.
+
+    Obtains a pre-signed URL or downloads the file locally and returns a virtual file URL
+    so the frontend can fetch the contents.
+
+    Attributes:
+        request_id: Unique identifier for this request.
+        namespace: Variable name identifying the storage backend.
+        path: Full path of the entry to download.
+        preview: If true, a local preview of the file is returned.
+            This is useful if you need to bypass CORS.
+    """
+
+    request_id: RequestId
+    namespace: str
+    path: str
+    preview: bool = False
+
+
 class ListSecretKeysCommand(Command):
     """List available secret keys.
 
@@ -691,10 +741,10 @@ class ListSecretKeysCommand(Command):
     request_id: RequestId
 
 
-class ModelMessage(msgspec.Struct, rename="camel"):
+class ModelUpdateMessage(
+    msgspec.Struct, tag="update", tag_field="method", rename="camel"
+):
     """Widget model state update message.
-
-    State changes for anywidget models, including state dict and binary buffer paths.
 
     Attributes:
         state: Model state updates.
@@ -704,21 +754,66 @@ class ModelMessage(msgspec.Struct, rename="camel"):
     state: dict[str, Any]
     buffer_paths: list[list[Union[str, int]]]
 
+    def into_comm_payload_content(self) -> dict[str, Any]:
+        return {
+            "data": {
+                "method": "update",
+                "state": self.state,
+                "buffer_paths": self.buffer_paths,
+            }
+        }
 
-class UpdateWidgetModelCommand(Command):
-    """Update anywidget model state.
 
-    Updates widget model state for bidirectional Python-JavaScript communication.
+class ModelCustomMessage(
+    msgspec.Struct, tag="custom", tag_field="method", rename="camel"
+):
+    """Custom widget message.
+
+    Attributes:
+        content: Arbitrary content for the custom message.
+    """
+
+    content: Any
+
+    def into_comm_payload_content(self) -> dict[str, Any]:
+        return {
+            "data": {
+                "method": "custom",
+                "content": self.content,
+            }
+        }
+
+
+ModelMessage = Union[ModelUpdateMessage, ModelCustomMessage]
+
+
+class ModelCommand(Command):
+    """Widget model message command.
+
+    Handles widget model communication between frontend and backend.
 
     Attributes:
         model_id: Widget model identifier.
-        message: Model message with state updates and buffer paths.
-        buffers: Base64-encoded binary buffers referenced by buffer_paths.
+        message: Model message (update or custom).
+        buffers: Base64-encoded binary buffers.
+        token: Unique identifier for deduplication across dual queues.
     """
 
     model_id: WidgetModelId
     message: ModelMessage
-    buffers: Optional[list[str]] = None
+    buffers: list[bytes]
+    token: str = msgspec.field(default_factory=lambda: str(uuid4()))
+
+    def into_comm_payload(self) -> dict[str, Any]:
+        return {
+            "content": self.message.into_comm_payload_content(),
+            "buffers": self.buffers,
+        }
+
+
+# Commands that can be batched and merged (last-write-wins) by the
+# SetUIElementRequestManager to avoid redundant cell re-executions.
+BatchableCommand = Union[UpdateUIElementCommand, ModelCommand]
 
 
 class RefreshSecretsCommand(Command):
@@ -767,7 +862,7 @@ CommandMessage = Union[
     RefreshInstalledModulesCommand,
     # UI element and widget model operations
     UpdateUIElementCommand,
-    UpdateWidgetModelCommand,
+    ModelCommand,
     InvokeFunctionCommand,
     # User/configuration operations
     UpdateUserConfigCommand,
@@ -777,6 +872,9 @@ CommandMessage = Union[
     ListSQLTablesCommand,
     ValidateSQLCommand,
     ListDataSourceConnectionCommand,
+    # Storage operations
+    StorageListEntriesCommand,
+    StorageDownloadCommand,
     # Secrets management
     ListSecretKeysCommand,
     RefreshSecretsCommand,

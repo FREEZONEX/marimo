@@ -52,7 +52,7 @@ class TestHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "haIqC9yzlTaNo-ClmY11Kvtiv08oQPz3-SlnOLfhJYM"
+            expected_hash = "RSccsMCC0dBqvdcnBN1mdxlvKUr4zzR_qupKBW_P_qE"
 
             return expected_hash, persistent_cache, MockLoader
 
@@ -538,6 +538,208 @@ class TestHash:
             assert direct() == module(), "direct() != module()"
 
 
+class TestHashMemo:
+    @staticmethod
+    @pytest.mark.skipif(
+        not DependencyManager.numpy.has(),
+        reason="optional dependencies not installed",
+    )
+    def test_data_primitive_memoized_across_cells(app) -> None:
+        """Data primitives should be memoized — same array used in two cells
+        should only be serialized once."""
+
+        @app.cell
+        def load() -> tuple[Any]:
+            import numpy as np
+
+            from marimo._save.save import persistent_cache
+            from tests._save.loaders.mocks import MockLoader
+
+            arr = np.ones((64, 64))
+            return MockLoader, persistent_cache, arr, np
+
+        @app.cell
+        def one(MockLoader, persistent_cache, arr, np) -> tuple[Any]:
+            from marimo._runtime.context.types import get_context
+
+            ctx = get_context()
+            with persistent_cache(name="one", _loader=MockLoader()) as c1:
+                _v = np.sum(arr)
+            # After hashing, arr should be memoized
+            assert len(ctx.cache.hash_memo) > 0
+            return c1, ctx
+
+        @app.cell
+        def two(MockLoader, persistent_cache, arr, np, c1, ctx) -> None:
+            memo_before = dict(ctx.cache.hash_memo)
+            with persistent_cache(name="two", _loader=MockLoader()) as c2:
+                _v = np.sum(arr)
+            # Same arr, so memo should have been used (same entry)
+            assert c1._cache.hash == c2._cache.hash
+            assert memo_before == dict(ctx.cache.hash_memo)
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not DependencyManager.numpy.has(),
+        reason="optional dependencies not installed",
+    )
+    def test_same_cell_def_not_memoized(app) -> None:
+        """Variables defined by the current cell should not use memo
+        (values can mutate within a cell)."""
+
+        @app.cell
+        def one() -> tuple[Any]:
+            import numpy as np
+
+            from marimo._runtime.context.types import get_context
+            from marimo._save.save import persistent_cache
+            from tests._save.loaders.mocks import MockLoader
+
+            arr = np.ones((4, 4))
+            with persistent_cache(name="one", _loader=MockLoader()) as c:
+                _v = np.sum(arr)
+            ctx = get_context()
+            # arr is defined in this cell, so should NOT be memoized
+            assert len(ctx.cache.hash_memo) == 0
+            return c, ctx
+
+    @staticmethod
+    def test_list_mutation_not_stale(app) -> None:
+        """Lists are not memoized, so in-place mutation produces different
+        hashes."""
+
+        @app.cell
+        def one() -> tuple[Any]:
+            from marimo._save.save import persistent_cache
+            from tests._save.loaders.mocks import MockLoader
+
+            data = [1, 2, 3]
+            with persistent_cache(name="one", _loader=MockLoader()) as c1:
+                _v = sum(data)
+            data.append(4)
+            with persistent_cache(name="two", _loader=MockLoader()) as c2:
+                _v = sum(data)
+            assert c1._cache.hash != c2._cache.hash
+
+    @staticmethod
+    def test_dict_mutation_not_stale(app) -> None:
+        """Dicts are not memoized, so mutation produces different hashes."""
+
+        @app.cell
+        def one() -> tuple[Any]:
+            from marimo._save.save import persistent_cache
+            from tests._save.loaders.mocks import MockLoader
+
+            data = {"a": 1}
+            with persistent_cache(name="one", _loader=MockLoader()) as c1:
+                _v = sum(data.values())
+            data["b"] = 2
+            with persistent_cache(name="two", _loader=MockLoader()) as c2:
+                _v = sum(data.values())
+            assert c1._cache.hash != c2._cache.hash
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not DependencyManager.numpy.has(),
+        reason="optional dependencies not installed",
+    )
+    def test_memo_with_cached_function(app) -> None:
+        """Memoization works with @mo.cache deferred hashing."""
+
+        @app.cell
+        def load() -> tuple[Any]:
+            import numpy as np
+
+            import marimo as mo
+
+            arr = np.ones((32, 32))
+            return mo, np, arr
+
+        @app.cell
+        def one(mo, np, arr) -> tuple[Any]:
+            @mo.cache
+            def compute(x):
+                return np.sum(x)
+
+            r1 = compute(arr)
+            r2 = compute(arr)
+            assert r1 == r2
+            assert compute.hits == 1
+            return (compute,)
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not DependencyManager.numpy.has(),
+        reason="optional dependencies not installed",
+    )
+    def test_lifecycle_cleanup(app) -> None:
+        """HashMemoCleanup clears memo when defining cell is disposed."""
+
+        @app.cell
+        def load() -> tuple[Any]:
+            import numpy as np
+
+            from marimo._runtime.context.types import get_context
+            from marimo._save.cache import HashMemoCleanup
+            from marimo._save.save import persistent_cache
+            from tests._save.loaders.mocks import MockLoader
+
+            arr = np.ones((4, 4))
+            return (
+                MockLoader,
+                persistent_cache,
+                arr,
+                np,
+                get_context,
+                HashMemoCleanup,
+            )
+
+        @app.cell
+        def one(
+            MockLoader, persistent_cache, arr, np, get_context, HashMemoCleanup
+        ) -> tuple[Any]:
+            with persistent_cache(name="one", _loader=MockLoader()) as c:
+                _v = np.sum(arr)
+            ctx = get_context()
+            assert len(ctx.cache.hash_memo) > 0
+            # Simulate lifecycle disposal — should clear memo
+            cleanup = HashMemoCleanup()
+            cleanup.dispose(ctx, deletion=False)
+            assert len(ctx.cache.hash_memo) == 0
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not DependencyManager.numpy.has(),
+        reason="optional dependencies not installed",
+    )
+    def test_globals_mutation_stale_memo(app) -> None:
+        """Known limitation: mutating a data primitive via globals() bypasses
+        lifecycle cleanup, producing a stale memo hit. This is expected (but
+        highly discouraged) since globals() sidesteps marimo's reactivity — but
+        we capture the behavior so it doesn't silently change."""
+
+        @app.cell
+        def load() -> tuple[Any]:
+            import numpy as np
+
+            from marimo._save.save import persistent_cache
+            from tests._save.loaders.mocks import MockLoader
+
+            arr = np.ones((4, 4))
+            return MockLoader, persistent_cache, arr, np
+
+        @app.cell
+        def one(MockLoader, persistent_cache, arr, np) -> tuple[Any]:
+            with persistent_cache(name="one", _loader=MockLoader()) as c1:
+                _v = np.sum(arr)
+            # Mutate via globals — no lifecycle disposal triggered
+            globals()["arr"] = np.zeros((4, 4))
+            with persistent_cache(name="two", _loader=MockLoader()) as c2:
+                _v = np.sum(arr)
+            # Stale memo: hashes match even though arr changed
+            assert c1._cache.hash == c2._cache.hash
+
+
 class TestDataHash:
     @staticmethod
     @pytest.mark.skipif(
@@ -557,7 +759,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "w_Bjhpz2xMVQC6Y61GgqB8O80u_UyoJ-1xQmJU3j0Gg"
+            expected_hash = "zLpFb6ANG99kP-4yWoH4zdV_FfrUodnEom1tILpF55c"
             return MockLoader, persistent_cache, expected_hash, np
 
         @app.cell
@@ -610,7 +812,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "aAL9QNoQIQ1zOJgm_xDbHG63Bc4Atnpn58pGW9x9A_A"
+            expected_hash = "IaLyzmZZ4nwXMveSQjMVAa682QAyd2O90iSeHJvlb44"
             return MockLoader, persistent_cache, expected_hash, np
 
         @app.cell
@@ -663,7 +865,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "stIOtiKIn4yscvKd-uK6mbmZpWzzfGm8Ccz7mvnRrnI"
+            expected_hash = "6EJfKOu_iB6jpSTtCnUV1kjYy2u96m_w_3VzOUOn5Hg"
             return MockLoader, persistent_cache, expected_hash, torch
 
         @app.cell
@@ -723,7 +925,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "rTAh8yNbBbq9qkF1nGNUw4DXhZSxRqGe4ptbDh2AwBI"
+            expected_hash = "QIjIEzceYIH7WIvdIasBLceU3Ad40kYqTCSBnUmJZV4"
             return MockLoader, persistent_cache, expected_hash, torch
 
         @app.cell
@@ -763,7 +965,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "ggxwHLzWcyDQltN_Zq0_zYVP_w86a9AAQLQwleAMuH8"
+            expected_hash = "1eEgTTthH-FyKbziqYse1ITogQUMat0JW1meFZtMWCI"
             return MockLoader, persistent_cache, expected_hash, DNA, copy
 
         @app.cell
@@ -801,7 +1003,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "wtrS6NoH2AOH3DnWm7wooK4Bgw8TmMotgMbiY0bu5as"
+            expected_hash = "ycCqtVaQAODpfHyimtlbxj1TIQB3WtLnhDIGq59yiqw"
             return MockLoader, persistent_cache, expected_hash, np, pd
 
         @app.cell
@@ -865,7 +1067,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "n4KGJ3wrRHd6pDCyekTWZXShmtT_ZkDY4Wo3C6BXzh4"
+            expected_hash = "C9MbH1ov4US2mrm_T_clm4VpI9WT97tg5BGEpOAbF1g"
             return MockLoader, persistent_cache, expected_hash, np, pd
 
         @app.cell
@@ -906,7 +1108,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "rC6YiNsuaZKQ1JqMgSRa0iyEDwi7ZTl6InABjuM0RDY"
+            expected_hash = "DtWHQ972QmRo2kBlzgoGQDi-bRnRknWZsSFk_rT4lRA"
             return MockLoader, persistent_cache, expected_hash, pl
 
         @app.cell
@@ -963,7 +1165,7 @@ class TestDataHash:
             from marimo._save.save import persistent_cache
             from tests._save.loaders.mocks import MockLoader
 
-            expected_hash = "jMEurCFLl9VI2sSaQOdCShS1MnudIRZNu84578qM3Jc"
+            expected_hash = "1HlOXWU-oQ5MNB5B9YRNLnHcn3I8sngJvLuHV_ICLGY"
             return MockLoader, persistent_cache, expected_hash, pl
 
         @app.cell
@@ -2035,3 +2237,459 @@ class TestWrappedFunctionCache:
             f"Expected different hashes for different impure dependencies, "
             f"got {first_hash} == {second_hash}"
         )
+
+    @staticmethod
+    async def test_default_argument_cache_invalidation(
+        k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        """Test that changing default argument values invalidates the cache (issue #7977)."""
+
+        cell_id = "test_cell"
+
+        # First execution with config_version=1
+        await k.run(
+            [
+                exec_req.get_with_id(
+                    cell_id,
+                    """
+            import marimo as mo
+
+            @mo.cache
+            def get_data_with_config(query: str, config_version=1):
+                return query, config_version
+
+            result1 = get_data_with_config("test")
+            hash1 = get_data_with_config._last_hash
+            """,
+                )
+            ]
+        )
+
+        assert not k.stderr.messages, k.stderr
+        assert k.globals["result1"] == ("test", 1)
+        first_hash = k.globals["hash1"]
+
+        # Second execution with config_version=2 (same cell, different default)
+        await k.run(
+            [
+                exec_req.get_with_id(
+                    cell_id,
+                    """
+            import marimo as mo
+
+            @mo.cache
+            def get_data_with_config(query: str, config_version=2):
+                return query, config_version
+
+            result2 = get_data_with_config("test")
+            hash2 = get_data_with_config._last_hash
+            """,
+                )
+            ]
+        )
+
+        assert not k.stderr.messages, k.stderr
+        assert k.globals["result2"] == ("test", 2)
+        second_hash = k.globals["hash2"]
+
+        # The hashes should be different because the default argument changed
+        assert first_hash != second_hash, (
+            f"Expected different hashes when default argument changes, "
+            f"got {first_hash} == {second_hash}"
+        )
+
+    @staticmethod
+    async def test_explicit_arg_matches_previous_default(
+        k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        """Test that explicit args matching defaults produce the same hash.
+
+        Calling fn() with default a=1 should produce the same hash as
+        calling fn(1) with explicit arg, because the resolved value is the same.
+        """
+
+        # Test within a single cell to verify hash computation is correct
+        await k.run(
+            [
+                exec_req.get(
+                    """
+            import marimo as mo
+
+            @mo.cache
+            def fn(a=1):
+                return a + 1
+
+            # Call with default
+            result1 = fn()
+            hash_default = fn._last_hash
+
+            # Call with explicit arg matching the default
+            result2 = fn(1)
+            hash_explicit = fn._last_hash
+
+            # Call with different value
+            result3 = fn(2)
+            hash_different = fn._last_hash
+            """,
+                )
+            ]
+        )
+
+        assert not k.stderr.messages, k.stderr
+        assert k.globals["result1"] == 2  # 1 + 1
+        assert k.globals["result2"] == 2  # 1 + 1
+        assert k.globals["result3"] == 3  # 2 + 1
+
+        # fn() and fn(1) should have the same hash (same resolved value)
+        assert k.globals["hash_default"] == k.globals["hash_explicit"], (
+            f"Expected same hash for fn() and fn(1), "
+            f"got {k.globals['hash_default']} != {k.globals['hash_explicit']}"
+        )
+        # fn(2) should have a different hash
+        assert k.globals["hash_default"] != k.globals["hash_different"], (
+            f"Expected different hash for fn() and fn(2), "
+            f"got same hash {k.globals['hash_default']}"
+        )
+
+    @staticmethod
+    async def test_various_function_signature_forms(
+        k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        """Test cache works with various function signature forms.
+
+        Tests: positional-only (/), keyword-only (*), defaults, *args, **kwargs
+        """
+
+        await k.run(
+            [
+                exec_req.get(
+                    """
+import marimo as mo
+
+# Test 1: Keyword-only parameters with defaults
+@mo.cache
+def kwonly(a, *, value=1):
+    return a + value
+
+kw_r1 = kwonly(10)           # Call with default
+kw_h1 = kwonly._last_hash
+kw_r2 = kwonly(10, value=1)  # Call with explicit same value
+kw_h2 = kwonly._last_hash
+kw_r3 = kwonly(10, value=2)  # Call with different value
+kw_h3 = kwonly._last_hash
+kw_hits = kwonly.hits
+
+# Test 2: Positional-only parameters with defaults
+@mo.cache
+def posonly(a, b=5, /):
+    return a + b
+
+po_r1 = posonly(10)      # Call with default
+po_h1 = posonly._last_hash
+po_r2 = posonly(10, 5)   # Call with explicit same value
+po_h2 = posonly._last_hash
+po_r3 = posonly(10, 7)   # Call with different value
+po_h3 = posonly._last_hash
+po_hits = posonly.hits
+
+# Test 3: Mixed positional-only, regular, and keyword-only
+@mo.cache
+def mixed(a, /, b, c=3, *, d=4):
+    return a + b + c + d
+
+mx_r1 = mixed(1, 2)          # Call with defaults for c and d
+mx_h1 = mixed._last_hash
+mx_r2 = mixed(1, 2, 3, d=4)  # Call with explicit same values
+mx_h2 = mixed._last_hash
+mx_r3 = mixed(1, 2, d=5)     # Call with different d
+mx_h3 = mixed._last_hash
+mx_hits = mixed.hits
+
+# Test 4: *args and **kwargs
+@mo.cache
+def varargs(a, *args, b=10, **kwargs):
+    return a + sum(args) + b + sum(kwargs.values())
+
+va_r1 = varargs(1, 2, 3)         # Call with default b
+va_h1 = varargs._last_hash
+va_r2 = varargs(1, 2, 3, b=10)   # Call with explicit same b
+va_h2 = varargs._last_hash
+va_r3 = varargs(1, 2, 3, b=20)   # Call with different b
+va_h3 = varargs._last_hash
+va_r4 = varargs(1, 2, 3, x=100)  # Call with kwargs
+va_h4 = varargs._last_hash
+va_hits = varargs.hits
+            """,
+                )
+            ]
+        )
+        assert not k.stderr.messages, k.stderr
+
+        # Test 1: Keyword-only assertions
+        assert k.globals["kw_r1"] == 11
+        assert k.globals["kw_r2"] == 11
+        assert k.globals["kw_r3"] == 12
+        assert k.globals["kw_h1"] == k.globals["kw_h2"], (
+            "kwonly: explicit same value should hit cache"
+        )
+        assert k.globals["kw_h1"] != k.globals["kw_h3"], (
+            "kwonly: different value should miss cache"
+        )
+        assert k.globals["kw_hits"] == 1, (
+            f"Expected 1 hit, got {k.globals['kw_hits']}"
+        )
+
+        # Test 2: Positional-only assertions
+        assert k.globals["po_r1"] == 15
+        assert k.globals["po_r2"] == 15
+        assert k.globals["po_r3"] == 17
+        assert k.globals["po_h1"] == k.globals["po_h2"], (
+            "posonly: explicit same value should hit cache"
+        )
+        assert k.globals["po_h1"] != k.globals["po_h3"], (
+            "posonly: different value should miss cache"
+        )
+        assert k.globals["po_hits"] == 1, (
+            f"Expected 1 hit, got {k.globals['po_hits']}"
+        )
+
+        # Test 3: Mixed assertions
+        assert k.globals["mx_r1"] == 10  # 1+2+3+4
+        assert k.globals["mx_r2"] == 10
+        assert k.globals["mx_r3"] == 11  # 1+2+3+5
+        assert k.globals["mx_h1"] == k.globals["mx_h2"], (
+            "mixed: explicit same values should hit cache"
+        )
+        assert k.globals["mx_h1"] != k.globals["mx_h3"], (
+            "mixed: different d should miss cache"
+        )
+        assert k.globals["mx_hits"] == 1, (
+            f"Expected 1 hit, got {k.globals['mx_hits']}"
+        )
+
+        # Test 4: Varargs assertions
+        assert k.globals["va_r1"] == 16  # 1+2+3+10
+        assert k.globals["va_r2"] == 16
+        assert k.globals["va_r3"] == 26  # 1+2+3+20
+        assert k.globals["va_r4"] == 116  # 1+2+3+10+100
+        assert k.globals["va_h1"] == k.globals["va_h2"], (
+            "varargs: explicit same b should hit cache"
+        )
+        assert k.globals["va_h1"] != k.globals["va_h3"], (
+            "varargs: different b should miss cache"
+        )
+        assert k.globals["va_h1"] != k.globals["va_h4"], (
+            "varargs: with kwargs should miss cache"
+        )
+        assert k.globals["va_hits"] == 1, (
+            f"Expected 1 hit, got {k.globals['va_hits']}"
+        )
+
+
+def _hash_fn(fn: object) -> bytes:
+    """Run the full get_hashable_ast -> compile -> hash pipeline."""
+    from marimo._ast.transformers import get_hashable_ast
+    from marimo._save.hash import hash_raw_module
+
+    assert callable(fn)
+    return hash_raw_module(get_hashable_ast(fn))
+
+
+class TestRemoveReturnsBytecode:
+    """Bytecode-level tests for RemoveReturns (regression #8364)."""
+
+    def test_different_name_exprs_different_hash(self) -> None:
+        """Changing the returned expression must change the hash."""
+
+        def fn_add(x: int, y: int) -> int:
+            return x + y
+
+        def fn_sub(x: int, y: int) -> int:
+            return x - y
+
+        assert _hash_fn(fn_add) != _hash_fn(fn_sub)
+
+    def test_different_constants_different_hash(self) -> None:
+        """Different numeric returns must hash differently."""
+
+        def fn_a() -> int:
+            return 11 + 19
+
+        def fn_b() -> int:
+            return 11 + 29
+
+        assert _hash_fn(fn_a) != _hash_fn(fn_b)
+
+    def test_different_single_constants_different_hash(self) -> None:
+        def fn_a() -> int:
+            return 42
+
+        def fn_b() -> int:
+            return 99
+
+        assert _hash_fn(fn_a) != _hash_fn(fn_b)
+
+    def test_different_pure_lambdas_different_hash(self) -> None:
+        """Pure lambdas with different bodies must hash differently."""
+
+        def fn_a() -> object:
+            return lambda: 1
+
+        def fn_b() -> object:
+            return lambda: 2
+
+        assert _hash_fn(fn_a) != _hash_fn(fn_b)
+
+
+def test_decorator_params_affect_hash() -> None:
+    """Verify that changing decorator parameters changes the function hash.
+
+    When using @mo.cache with nested decorators like:
+        @mo.cache
+        @spl(schema={"a": "int"})
+        def query(): ...
+
+    Changing the schema should invalidate the cache.
+    """
+    from marimo._ast.transformers import get_hashable_ast
+    from marimo._save.hash import hash_raw_module
+
+    def cache(fn):
+        return fn
+
+    def decorator_with_param(param: str):
+        del param
+
+        def wrapper(fn):
+            return fn
+
+        return wrapper
+
+    # Helper to hash with cache skipped (mimics mo.cache behavior)
+    def hash_fn(fn):
+        return hash_raw_module(get_hashable_ast(fn, skip_decorators={"cache"}))
+
+    # Test 1: Decorator AFTER @cache - param change should affect hash
+    @cache
+    @decorator_with_param(param="value1")
+    def fn():
+        return 42
+
+    hash1 = hash_fn(fn)
+
+    @cache
+    @decorator_with_param(param="value2")
+    def fn():
+        return 42
+
+    hash2 = hash_fn(fn)
+
+    assert hash1 != hash2, (
+        "Decorator param change AFTER @cache should invalidate hash"
+    )
+
+    # Test 2: Decorator BEFORE @cache - param change should NOT affect hash
+    @decorator_with_param(param="value1")
+    @cache
+    def fn():
+        return 42
+
+    hash3 = hash_fn(fn)
+
+    @decorator_with_param(param="value2")
+    @cache
+    def fn():
+        return 42
+
+    hash4 = hash_fn(fn)
+
+    assert hash3 == hash4, (
+        "Decorator param change BEFORE @cache should NOT affect hash"
+    )
+
+
+async def test_decorator_ref_tracking_e2e(
+    k: Kernel, exec_req: ExecReqProvider
+) -> None:
+    """End-to-end test that refs in decorator params affect cache behavior.
+
+    When a decorator parameter references a variable:
+        schema = {"a": "int"}
+        @mo.cache
+        @my_decorator(schema=schema)
+        def query(): ...
+
+    Changing the variable's value should produce different cache hashes.
+    """
+
+    cell_id = "test_cell"
+
+    # First execution with schema_config = "v1"
+    await k.run(
+        [
+            exec_req.get_with_id(
+                cell_id,
+                """
+import marimo as mo
+
+schema_config = "v1"
+
+def my_decorator(schema):
+    def wrapper(fn):
+        fn._schema = schema
+        return fn
+    return wrapper
+
+@mo.cache
+@my_decorator(schema=schema_config)
+def cached_query():
+    return "result"
+
+result = cached_query()
+hash_val = cached_query._last_hash
+            """,
+            )
+        ]
+    )
+
+    assert not k.stderr.messages, k.stderr
+    assert k.globals["result"] == "result"
+    first_hash = k.globals["hash_val"]
+
+    # Second execution with schema_config = "v2"
+    await k.run(
+        [
+            exec_req.get_with_id(
+                cell_id,
+                """
+import marimo as mo
+
+schema_config = "v2"
+
+def my_decorator(schema):
+    def wrapper(fn):
+        fn._schema = schema
+        return fn
+    return wrapper
+
+@mo.cache
+@my_decorator(schema=schema_config)
+def cached_query():
+    return "result"
+
+result = cached_query()
+hash_val = cached_query._last_hash
+            """,
+            )
+        ]
+    )
+
+    assert not k.stderr.messages, k.stderr
+    assert k.globals["result"] == "result"
+    second_hash = k.globals["hash_val"]
+
+    # The hashes should be different because the decorator param changed
+    assert first_hash != second_hash, (
+        f"Expected different hashes when decorator ref changes, "
+        f"got {first_hash} == {second_hash}"
+    )

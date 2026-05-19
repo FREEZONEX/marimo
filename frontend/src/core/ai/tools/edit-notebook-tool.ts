@@ -90,7 +90,7 @@ export class EditNotebookTool
     switch (edit.type) {
       case "update_cell": {
         const { position, code } = edit;
-        const cellId = position.cellId as CellId;
+        const cellId = position.cellId as CellId | undefined;
 
         if (!cellId) {
           throw new ToolExecutionError(
@@ -128,6 +128,11 @@ export class EditNotebookTool
         const previousCode =
           existingStagedCell?.previousCode ?? currentCellCode;
 
+        // Skip no-op edits where the code hasn't changed
+        if (code === previousCode) {
+          break;
+        }
+
         addStagedCell({
           cellId,
           edit: { type: "update_cell", previousCode: previousCode },
@@ -147,7 +152,7 @@ export class EditNotebookTool
 
         switch (position.type) {
           case "relative": {
-            const cellId = position.cellId as CellId;
+            const cellId = position.cellId as CellId | undefined;
             if (!cellId) {
               throw new ToolExecutionError(
                 "Cell ID is required for add_cell with relative position",
@@ -209,7 +214,7 @@ export class EditNotebookTool
       }
       case "delete_cell": {
         const { position } = edit;
-        const cellId = position.cellId as CellId;
+        const cellId = position.cellId as CellId | undefined;
 
         if (!cellId) {
           throw new ToolExecutionError(

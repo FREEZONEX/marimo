@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import TYPE_CHECKING, Optional
 from uuid import uuid4
 
 from starlette.authentication import requires
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from marimo import _loggers
 from marimo._messaging.notification import AlertNotification
@@ -25,15 +26,17 @@ from marimo._server.models.models import (
     ExecuteScratchpadRequest,
     InstantiateNotebookRequest,
     InvokeFunctionRequest,
+    ModelRequest,
     SuccessResponse,
     UpdateUIElementValuesRequest,
-    UpdateWidgetModelRequest,
 )
 from marimo._server.router import APIRouter
 from marimo._server.uvicorn_utils import close_uvicorn
 from marimo._types.ids import ConsumerId
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from starlette.requests import Request
 
 LOGGER = _loggers.marimo_logger()
@@ -98,7 +101,7 @@ async def set_model_values(
         content:
             application/json:
                 schema:
-                    $ref: "#/components/schemas/UpdateWidgetModelRequest"
+                    $ref: "#/components/schemas/ModelRequest"
     responses:
         200:
             description: Set model value
@@ -107,7 +110,7 @@ async def set_model_values(
                     schema:
                         $ref: "#/components/schemas/SuccessResponse"
     """
-    return await dispatch_control_request(request, UpdateWidgetModelRequest)
+    return await dispatch_control_request(request, ModelRequest)
 
 
 @router.post("/instantiate")
@@ -237,6 +240,81 @@ async def run_cell(
     )
 
     return SuccessResponse()
+
+
+@router.post("/execute", include_in_schema=False)
+@requires("edit")
+async def execute_code(
+    *,
+    request: Request,
+) -> StreamingResponse:
+    """
+    requestBody:
+        content:
+            application/json:
+                schema:
+                    $ref: "#/components/schemas/ExecuteScratchpadRequest"
+    responses:
+        200:
+            description: Execute code in the kernel, streaming results as SSE.
+            content:
+                text/event-stream:
+                    schema:
+                        type: string
+    """  # noqa: E501
+    from marimo._runtime.commands import ExecuteScratchpadCommand
+    from marimo._server.scratchpad import (
+        ScratchCellListener,
+        build_done_event,
+    )
+
+    app_state = AppState(request)
+    body = await parse_request(request, cls=ExecuteScratchpadRequest)
+    session = app_state.require_current_session()
+
+    # Auto-instantiate so headless /api/execute works without a prior
+    # /api/instantiate call. The kernel no-ops if already instantiated,
+    # and queue ordering guarantees it completes before the scratchpad runs.
+    session.instantiate(
+        InstantiateNotebookRequest(object_ids=[], values=[], auto_run=True),
+        http_request=HTTPRequest.from_request(request),
+    )
+
+    async def _watch_disconnect() -> None:
+        """Wait for client disconnect and interrupt the kernel."""
+        while True:
+            # request._receive is the ASGI `receive` callable. Although
+            # it's a private Starlette attribute, it's the standard way to
+            # detect disconnects and doesn't race with StreamingResponse
+            # (which only writes to the send channel, never reads receive).
+            message = await request._receive()
+            if message.get("type") == "http.disconnect":
+                session.try_interrupt()
+                return
+
+    async def sse_generator() -> AsyncGenerator[str, None]:
+        disconnect_task = asyncio.create_task(_watch_disconnect())
+        try:
+            listener = ScratchCellListener()
+            with session.scoped(listener):
+                async with session.scratchpad_lock:
+                    session.put_control_request(
+                        ExecuteScratchpadCommand(
+                            code=body.code,
+                            request=HTTPRequest.from_request(request),
+                        ),
+                        from_consumer_id=None,
+                    )
+                    async for event in listener.stream():
+                        yield event
+
+                yield build_done_event(session)
+        finally:
+            disconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await disconnect_task
+
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
 @router.post("/scratchpad/run")

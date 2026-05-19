@@ -86,8 +86,28 @@ def _get_data_table(value: object, variable_name: VariableName) -> Optional[Data
         return None
 
 
+_SKIP_TABLES = frozenset(
+    {"duckdb_functions()", "duckdb_types()", "duckdb_settings()"}
+)
+
+# duckdb > 1.4.0 added _STATEMENT suffix to the statement types
+_STATEMENT_TYPES = frozenset(
+    {
+        "ATTACH_STATEMENT",
+        "ATTACH",
+        "DETACH_STATEMENT",
+        "DETACH",
+        "ALTER_STATEMENT",
+        "ALTER",
+        # This may catch some false positives for other CREATE statements
+        "CREATE_STATEMENT",
+        "CREATE",
+    }
+)
+
+
 def has_updates_to_datasource(query: str) -> bool:
-    import duckdb  # type: ignore[import-not-found,import-untyped,unused-ignore] # noqa: E501
+    import duckdb
 
     try:
         statements = duckdb.extract_statements(query.strip())
@@ -95,14 +115,11 @@ def has_updates_to_datasource(query: str) -> bool:
         # May not be valid SQL
         return False
 
-    return any(
-        statement.type == duckdb.StatementType.ATTACH
-        or statement.type == duckdb.StatementType.DETACH
-        or statement.type == duckdb.StatementType.ALTER
-        # This may catch some false positives for other CREATE statements
-        or statement.type == duckdb.StatementType.CREATE
-        for statement in statements
-    )
+    for statement in statements:
+        statement_type = getattr(statement.type, "name", statement.type)
+        if str(statement_type) in _STATEMENT_TYPES:
+            return True
+    return False
 
 
 def _get_default_connection() -> "duckdb.DuckDBPyConnection":
@@ -204,8 +221,6 @@ def _get_databases_from_duckdb_internal(
     # databases_dict[database][schema] = [table1, table2, ...]
     databases_dict: dict[str, dict[str, list[DataTable]]] = {}
 
-    SKIP_TABLES = ["duckdb_functions()", "duckdb_types()", "duckdb_settings()"]
-
     # Bug with Iceberg catalog tables where there is a single column named "__"
     # https://github.com/marimo-team/marimo/issues/6688
     CATALOG_TABLE_COLUMN_NAME = "__"
@@ -218,7 +233,7 @@ def _get_databases_from_duckdb_internal(
         column_types,
         *_rest,
     ) in tables_result:
-        if name in SKIP_TABLES:
+        if name in _SKIP_TABLES:
             continue
 
         # ============ Tier0 Patch Start ============
@@ -239,7 +254,9 @@ def _get_databases_from_duckdb_internal(
             # ============ Tier0 Patch Start ============
             # Quote identifiers to handle numeric namespace IDs
             qualified_name = (
-                f"{database}.{_quote_identifier(schema)}.{_quote_identifier(name)}"
+                f"{_quote_identifier(database)}."
+                f"{_quote_identifier(schema)}."
+                f"{_quote_identifier(name)}"
             )
             # ============ Tier0 Patch End ============
             columns = get_table_columns(connection, qualified_name)
@@ -275,7 +292,9 @@ def _get_databases_from_duckdb_internal(
 
         databases_dict[database][schema].append(table)
 
-    return form_databases_from_dict(databases_dict, connection, engine_name)
+    return form_databases_from_dict(
+        databases_dict, connection, engine_name, backfill_empty_databases=True
+    )
 
 
 def get_table_columns(
@@ -317,6 +336,7 @@ def form_databases_from_dict(
     databases_dict: dict[str, dict[str, list[DataTable]]],
     connection: Optional[duckdb.DuckDBPyConnection],
     engine_name: Optional[VariableName],
+    backfill_empty_databases: bool,
 ) -> list[Database]:
     # Convert grouped data into Database objects
     databases: list[Database] = []
@@ -333,18 +353,19 @@ def form_databases_from_dict(
             )
         )
 
-    # There may be remaining databases not surfaced with SHOW ALL TABLES
-    # These db's likely have no tables
-    for database_name in _get_duckdb_database_names(connection):
-        if database_name not in databases_dict:
-            databases.append(
-                Database(
-                    name=database_name,
-                    dialect="duckdb",
-                    schemas=[],
-                    engine=engine_name,
+    if backfill_empty_databases:
+        # There may be remaining databases not surfaced with SHOW ALL TABLES
+        # These db's likely have no tables
+        for database_name in _get_duckdb_database_names(connection):
+            if database_name not in databases_dict:
+                databases.append(
+                    Database(
+                        name=database_name,
+                        dialect="duckdb",
+                        schemas=[],
+                        engine=engine_name,
+                    )
                 )
-            )
     return databases
 
 
@@ -438,7 +459,12 @@ def get_duckdb_databases_agg_query(
 
         databases_dict[database_name][schema_name].append(table)
 
-    return form_databases_from_dict(databases_dict, connection, engine_name)
+    return form_databases_from_dict(
+        databases_dict,
+        connection,
+        engine_name,
+        backfill_empty_databases=False,
+    )
 
 
 def _get_duckdb_database_names(
@@ -598,3 +624,16 @@ def _db_type_to_data_type(db_type: str) -> DataType:
 
     LOGGER.warning("Unknown DuckDB type: %s", db_type)
     return "unknown"
+
+
+def _quote_identifier(identifier: str) -> str:
+    """
+    Quote a DuckDB identifier with double quotes, escaping embedded double quotes.
+    This prevents errors when the identifier contains special characters which need to be escaped.
+    Eg. table.name -> "table.name"
+
+    https://duckdb.org/docs/stable/sql/dialect/keywords_and_identifiers
+    """
+    from marimo._sql.sql_quoting import quote_sql_identifier
+
+    return quote_sql_identifier(identifier, dialect="duckdb")

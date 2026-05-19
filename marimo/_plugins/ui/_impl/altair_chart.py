@@ -22,7 +22,7 @@ from narwhals.typing import IntoDataFrame, IntoLazyFrame
 from marimo import _loggers
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._messaging.mimetypes import KnownMimeType
-from marimo._output.hypertext import is_no_js
+from marimo._output.hypertext import is_non_interactive
 from marimo._output.rich_help import mddoc
 from marimo._plugins.ui._core.ui_element import UIElement
 from marimo._plugins.ui._impl.charts.altair_transformer import (
@@ -548,26 +548,13 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
                 f"Invalid type for chart: {type(chart)}; expected altair.Chart"
             )
 
-        # Make full-width if no width is specified
-        chart = maybe_make_full_width(chart)
-
         # Fix vegafusion background to be transparent
         chart = maybe_fix_vegafusion_background(chart)
-
-        # Fix the sizing for vconcat charts
-        if isinstance(chart, alt.VConcatChart) and _has_no_nested_hconcat(
-            chart
-        ):
-            chart = _update_vconcat_width(chart)
-
-            # without autosize, vconcat will overflow
-            if chart.autosize is alt.Undefined:
-                chart.autosize = "fit-x"
 
         try:
             vega_spec = _parse_spec(chart)
         except Exception:
-            # Sometimes the changes to width and autosize (above) can cause `.to_dict()` to throw an error
+            # Parsing the chart spec (via Altair's `.to_dict()`) can fail for some charts,
             # similarly to the issue described in https://github.com/marimo-team/marimo/issues/6244
             # so we fallback to the original chart.
             LOGGER.info("Failed to parse spec, using original chart")
@@ -657,7 +644,7 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
 
     # Override _mime_ to return an Altair spec in non-JS environments
     def _mime_(self) -> tuple[KnownMimeType, str]:
-        if is_no_js():
+        if is_non_interactive():
             return (
                 get_chart_mimetype(spec_format="vega"),
                 chart_to_json(self._chart, validate=False),
@@ -670,7 +657,7 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
 
     @staticmethod
     def _get_dataframe_from_chart(
-        chart: Union[altair.Chart, altair.LayerChart],
+        chart: AltairChartType,
     ) -> Optional[ChartDataType]:
         if not isinstance(chart.data, str):
             return cast(ChartDataType, chart.data)
@@ -844,31 +831,6 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
         raise RuntimeError("Setting the value of a UIElement is not allowed.")
 
 
-def maybe_make_full_width(chart: AltairChartType) -> AltairChartType:
-    import altair as alt
-
-    try:
-        if (
-            isinstance(chart, (alt.Chart, alt.LayerChart))
-            and chart.width is alt.Undefined
-        ):
-            # Don't make full width if chart has column encoding (faceted)
-            if (
-                hasattr(chart, "encoding")
-                and hasattr(chart.encoding, "column")
-                and chart.encoding.column is not alt.Undefined
-            ):
-                return chart
-            return chart.properties(width="container")
-        return chart
-    except Exception:
-        LOGGER.exception(
-            "Failed to set width to full container. "
-            "This is likely due to a missing dependency or an invalid chart."
-        )
-        return chart
-
-
 def maybe_fix_vegafusion_background(chart: AltairChartType) -> AltairChartType:
     """Fix vegafusion background to be transparent.
 
@@ -936,49 +898,6 @@ def _has_legend_param(chart: AltairChartType) -> bool:
     except Exception:
         pass
     return False
-
-
-def _update_vconcat_width(chart: AltairChartType) -> AltairChartType:
-    """Mutate the chart to set the width to the container."""
-
-    import altair as alt
-
-    if isinstance(chart, alt.VConcatChart):
-        chart.vconcat = [
-            _update_vconcat_width(subchart) for subchart in chart.vconcat
-        ]
-        return chart  # type: ignore[no-any-return]
-
-    if isinstance(chart, alt.LayerChart):
-        chart.layer = [_update_vconcat_width(layer) for layer in chart.layer]
-        return chart  # type: ignore[no-any-return]
-
-    if isinstance(chart, alt.HConcatChart):
-        chart.hconcat = [
-            _update_vconcat_width(subchart) for subchart in chart.hconcat
-        ]
-        return chart  # type: ignore[no-any-return]
-
-    if isinstance(chart, alt.Chart):
-        return maybe_make_full_width(chart)
-
-    # Not handled
-    return chart
-
-
-def _has_no_nested_hconcat(chart: AltairChartType) -> bool:
-    import altair as alt
-
-    if isinstance(chart, alt.HConcatChart):
-        return False
-    if isinstance(chart, alt.VConcatChart):
-        return all(
-            _has_no_nested_hconcat(subchart) for subchart in chart.vconcat
-        )
-    if isinstance(chart, alt.LayerChart):
-        return all(_has_no_nested_hconcat(layer) for layer in chart.layer)
-
-    return True
 
 
 def chart_to_json(

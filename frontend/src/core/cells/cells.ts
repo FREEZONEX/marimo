@@ -3,7 +3,7 @@
 import { historyField } from "@codemirror/commands";
 import { type Atom, atom, useAtom, useAtomValue } from "jotai";
 import { atomFamily, selectAtom, splitAtom } from "jotai/utils";
-import { isEqual, zip } from "lodash-es";
+import { isEqual } from "lodash-es";
 import { createRef, type ReducerWithoutAction } from "react";
 import type { CellHandle } from "@/components/editor/notebook-cell";
 import {
@@ -84,6 +84,7 @@ export interface NotebookState {
     column: CellColumnId;
     index: CellIndex;
     isSetupCell: boolean;
+    config: CellConfig;
   }[];
   /**
    * Key of cell to scroll to; typically set by actions that re-order the cell
@@ -590,17 +591,19 @@ const {
 
     // release the granular atom(s) created for this cell
     releaseCellAtoms(cellId);
+    const prevData = state.cellData[cellId];
     return {
       ...state,
       cellIds: state.cellIds.deleteById(cellId),
       history: [
         ...state.history,
         {
-          name: state.cellData[cellId].name,
+          name: prevData.name,
           serializedEditorState: serializedEditorState,
           column: column.id,
           index: cellIndex,
           isSetupCell: cellId === SETUP_CELL_ID,
+          config: prevData.config,
         },
       ],
       scrollKey: scrollKey,
@@ -619,6 +622,7 @@ const {
       column,
       index,
       isSetupCell,
+      config,
     } = mostRecentlyDeleted;
 
     const cellId = isSetupCell ? SETUP_CELL_ID : CellId.create();
@@ -628,6 +632,7 @@ const {
       code: serializedEditorState.doc,
       edited: serializedEditorState.doc.trim().length > 0,
       serializedEditorState,
+      config,
     });
 
     return {
@@ -750,7 +755,7 @@ const {
     });
   },
   handleCellMessage: (state, message: CellMessage) => {
-    const cellId = message.cell_id as CellId;
+    const cellId = message.cell_id;
     const nextState = updateCellRuntimeState({
       state,
       cellId,
@@ -796,7 +801,13 @@ const {
   },
   setCellCodes: (
     state,
-    action: { codes: string[]; ids: CellId[]; codeIsStale: boolean },
+    action: {
+      codes: string[];
+      ids: CellId[];
+      codeIsStale: boolean;
+      names?: string[];
+      configs?: CellConfig[];
+    },
   ) => {
     invariant(
       action.codes.length === action.ids.length,
@@ -809,15 +820,21 @@ const {
       cell,
       code,
       cellId,
+      name,
+      config,
     }: {
       cell: CellData | undefined;
       code: string;
       cellId: CellId;
+      name?: string;
+      config?: CellConfig;
     }) => {
       if (!cell) {
         return createCell({
           id: cellId,
           code,
+          name: name,
+          config: config,
           lastCodeRun: action.codeIsStale ? null : code,
           edited: action.codeIsStale && code.trim().length > 0,
         });
@@ -838,6 +855,8 @@ const {
           code: code,
           edited,
           lastCodeRun,
+          ...(name !== undefined && { name }),
+          ...(config !== undefined && { config }),
         };
       }
 
@@ -855,13 +874,19 @@ const {
         code: code,
         edited,
         lastCodeRun,
+        ...(name !== undefined && { name }),
+        ...(config !== undefined && { config }),
       };
     };
 
-    for (const [cellId, code] of zip(action.ids, action.codes)) {
+    for (let i = 0; i < action.ids.length; i++) {
+      const cellId = action.ids[i];
+      const code = action.codes[i];
       if (cellId === undefined || code === undefined) {
         continue;
       }
+      const name = action.names?.[i];
+      const config = action.configs?.[i];
       nextState = {
         ...nextState,
         cellData: {
@@ -870,6 +895,8 @@ const {
             cell: nextState.cellData[cellId],
             code,
             cellId,
+            name,
+            config,
           }),
         },
       };
@@ -1025,6 +1052,20 @@ const {
     if (state.untouchedNewCells.has(cellId)) {
       const nextUntouchedNewCells = new Set(state.untouchedNewCells);
       nextUntouchedNewCells.delete(cellId);
+      return {
+        ...state,
+        untouchedNewCells: nextUntouchedNewCells,
+      };
+    }
+
+    return state;
+  },
+  markUntouched: (state, action: { cellId: CellId }) => {
+    const { cellId } = action;
+
+    if (!state.untouchedNewCells.has(cellId)) {
+      const nextUntouchedNewCells = new Set(state.untouchedNewCells);
+      nextUntouchedNewCells.add(cellId);
       return {
         ...state,
         untouchedNewCells: nextUntouchedNewCells,
@@ -1599,6 +1640,12 @@ export const cellsRuntimeAtom = atom((get) => get(notebookAtom).cellRuntime);
 export const notebookIsRunningAtom = atom((get) =>
   notebookIsRunning(get(notebookAtom)),
 );
+export const onlyScratchpadIsRunningAtom = atom((get) => {
+  const { cellRuntime } = get(notebookAtom);
+  return Object.entries(cellRuntime).every(
+    ([id, rt]) => rt.status !== "running" || id === SCRATCH_CELL_ID,
+  );
+});
 export const notebookQueuedOrRunningCountAtom = atom((get) =>
   notebookQueueOrRunningCount(get(notebookAtom)),
 );

@@ -38,8 +38,11 @@ RUN pnpm turbo build --filter @marimo-team/frontend
 # ============================================================
 FROM python:3.13-slim AS base
 
+LABEL org.opencontainers.image.source="https://github.com/marimo-team/marimo"
+LABEL org.opencontainers.image.description="marimo reactive notebook"
+
 # 安装 uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.10.9 /uv /uvx /bin/
 
 # 创建非 root 用户
 RUN useradd -m appuser
@@ -63,16 +66,20 @@ RUN mkdir -p /app/data && chown -R appuser:appuser /app
 # 环境变量
 ENV MARIMO_SKIP_UPDATE_CHECK=1
 ENV UV_SYSTEM_PYTHON=1
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
 ENV PORT=8080
 ENV HOST=0.0.0.0
 EXPOSE $PORT
+
+STOPSIGNAL SIGTERM
 
 # ============================================================
 # slim - 精简版
 # ============================================================
 FROM base AS slim
 USER appuser
-CMD ["marimo", "edit", "--no-token", "-p", "8080", "--host", "0.0.0.0"]
+CMD ["sh", "-c", "exec marimo edit --no-token -p $PORT --host $HOST"]
 
 # ============================================================
 # data - 数据分析版
@@ -80,7 +87,7 @@ CMD ["marimo", "edit", "--no-token", "-p", "8080", "--host", "0.0.0.0"]
 FROM base AS data
 RUN uv pip install --system marimo[recommended,lsp] altair pandas numpy
 USER appuser
-CMD ["marimo", "edit", "--no-token", "-p", "8080", "--host", "0.0.0.0"]
+CMD ["sh", "-c", "exec marimo edit --no-token -p $PORT --host $HOST"]
 
 # ============================================================
 # sql - SQL 版
@@ -88,7 +95,7 @@ CMD ["marimo", "edit", "--no-token", "-p", "8080", "--host", "0.0.0.0"]
 FROM data AS sql
 RUN uv pip install --system marimo[recommended,lsp,sql]
 USER appuser
-CMD ["marimo", "edit", "--no-token", "-p", "8080", "--host", "0.0.0.0"]
+CMD ["sh", "-c", "exec marimo edit --no-token -p $PORT --host $HOST"]
 
 # ============================================================
 # tier0 - Tier0 专用（PostgreSQL 直连方案）

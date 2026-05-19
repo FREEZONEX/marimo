@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import re
@@ -31,6 +32,17 @@ if TYPE_CHECKING:
 
 # Note: We intentionally omit "version" as it would vary across environments
 # and break reproducibility. The marimo_version in metadata is sufficient.
+_MD_PREFIX_RE = re.compile(r'mo\.md\(([fFrR]*)(?:"""|\'\'\'|"|\')')
+
+
+def _extract_markdown_prefix(code: str) -> str:
+    """Extract the string prefix from a mo.md() call (e.g. '', 'r', 'f', 'fr')."""
+    m = _MD_PREFIX_RE.search(code)
+    if m:
+        return m.group(1).lower()
+    return ""
+
+
 DEFAULT_LANGUAGE_INFO = {
     "codemirror_mode": {"name": "ipython", "version": 3},
     "file_extension": ".py",
@@ -154,11 +166,16 @@ def _create_ipynb_cell(
     if cell is not None:
         markdown_string = get_markdown_from_cell(cell, code)
         if markdown_string is not None:
+            markdown_string = _convert_latex_delimiters_for_jupyter(
+                markdown_string
+            )
             node = cast(
                 nbformat.NotebookNode,
                 nbformat.v4.new_markdown_cell(markdown_string, id=cell_id),  # type: ignore[no-untyped-call]
             )
-            _add_marimo_metadata(node, name, config)
+            _add_marimo_metadata(
+                node, name, config, md_prefix=_extract_markdown_prefix(code)
+            )
             return node
 
     node = cast(
@@ -172,7 +189,10 @@ def _create_ipynb_cell(
 
 
 def _add_marimo_metadata(
-    node: NotebookNode, name: str, config: CellConfig
+    node: NotebookNode,
+    name: str,
+    config: CellConfig,
+    md_prefix: Optional[str] = None,
 ) -> None:
     """Add marimo-specific metadata to a notebook cell."""
     marimo_metadata: dict[str, Any] = {}
@@ -180,6 +200,10 @@ def _add_marimo_metadata(
         marimo_metadata["config"] = config.asdict_without_defaults()
     if not is_internal_cell_name(name):
         marimo_metadata["name"] = name
+    if md_prefix is not None:
+        # Always store prefix for markdown cells so importer knows the original
+        # prefix and can distinguish marimo-created cells from foreign ipynb cells
+        marimo_metadata["md_prefix"] = md_prefix
     if marimo_metadata:
         node["metadata"]["marimo"] = marimo_metadata
 
@@ -188,6 +212,10 @@ def _add_marimo_metadata(
 
 
 def _maybe_extract_dataurl(data: Any) -> Any:
+    if isinstance(data, str) and data.startswith("data:image/svg+xml;base64,"):
+        # Decode SVG from base64 to plain text XML
+        payload = data[len("data:image/svg+xml;base64,") :]
+        return base64.b64decode(payload).decode()
     if (
         isinstance(data, str)
         and data.startswith("data:")
@@ -269,6 +297,87 @@ def _get_error_info(
         return error_dict.get("type", "Error"), error.describe()
 
 
+def _convert_output_to_ipynb(
+    output: CellOutput,
+) -> Optional[NotebookNode]:
+    """Convert certain outputs (OUTPUT/MEDIA channel) to IPython notebook format.
+
+    Outputs like rich elements and LaTeX are converted to ensure they are compatible with IPython notebook format.
+
+    Returns None if the output should be skipped or produces no data.
+    """
+    import nbformat
+
+    if output.data is None:
+        return None
+
+    if output.channel not in (CellChannel.OUTPUT, CellChannel.MEDIA):
+        return None
+
+    if output.mimetype == "text/plain" and (
+        output.data == [] or output.data == ""
+    ):
+        return None
+
+    data: dict[str, Any] = {}
+    metadata: dict[str, Any] = {}
+
+    if output.mimetype == "application/vnd.marimo+error":
+        # Errors are handled separately via MARIMO_ERROR channel
+        return None
+    elif output.mimetype == "application/vnd.marimo+mimebundle":
+        if isinstance(output.data, dict):
+            mimebundle = output.data
+        elif isinstance(output.data, str):
+            mimebundle = json.loads(output.data)
+        else:
+            raise ValueError(f"Invalid data type: {type(output.data)}")
+
+        for mime, content in mimebundle.items():
+            if mime == METADATA_KEY and isinstance(content, dict):
+                metadata = content
+            elif mime == "text/html" and _is_marimo_component(content):
+                # Skip marimo components because they cannot be rendered
+                # in IPython notebook format
+                continue
+            else:
+                data[mime] = _maybe_extract_dataurl(content)
+    elif output.mimetype == "text/markdown" and isinstance(output.data, str):
+        data[output.mimetype] = _convert_marimo_tex_to_latex(output.data)
+    else:
+        data[output.mimetype] = _maybe_extract_dataurl(output.data)
+
+    if not data:
+        return None
+
+    return cast(
+        nbformat.NotebookNode,
+        nbformat.v4.new_output(  # type: ignore[no-untyped-call]
+            "display_data",
+            data=data,
+            metadata=metadata,
+        ),
+    )
+
+
+def _clean_ansi_for_export(text: Any) -> str:
+    """Clean ANSI escape codes for export, keeping color codes intact.
+
+    ANSI codes are terminal styling sequences (colors, bold, cursor movement)
+    used by logging libraries like rich, colorama, and marimo's own logger.
+
+    We keep standard color codes (like \\x1b[34m) so nbconvert's LaTeX template
+    can convert them to colors via its ansi2latex filter. However, we must strip
+    character set selection sequences (like \\x1b(B) which nbconvert doesn't
+    handle and cause LaTeX to fail with "invalid character" errors.
+    """
+    if not isinstance(text, str):
+        return str(text)
+    # Strip character set selection sequences: ESC ( <char> or ESC ) <char>
+    # These have no visual effect and cause LaTeX compilation to fail
+    return re.sub(r"\x1b[()][A-Z0-9]", "", text)
+
+
 def _convert_marimo_output_to_ipynb(
     cell_output: Optional[CellOutput], console_outputs: list[CellOutput]
 ) -> list[NotebookNode]:
@@ -277,7 +386,7 @@ def _convert_marimo_output_to_ipynb(
 
     ipynb_outputs: list[NotebookNode] = []
 
-    # Handle stdout/stderr
+    # Handle console outputs (stdout/stderr/media)
     for console_out in console_outputs:
         if console_out.channel == CellChannel.STDOUT:
             ipynb_outputs.append(
@@ -286,7 +395,8 @@ def _convert_marimo_output_to_ipynb(
                     nbformat.v4.new_output(  # type: ignore[no-untyped-call]
                         "stream",
                         name="stdout",
-                        text=console_out.data,
+                        # https://nbformat.readthedocs.io/en/latest/format_description.html#stream-output
+                        text=_clean_ansi_for_export(console_out.data),
                     ),
                 )
             )
@@ -300,10 +410,14 @@ def _convert_marimo_output_to_ipynb(
                     nbformat.v4.new_output(  # type: ignore[no-untyped-call]
                         "stream",
                         name="stderr",
-                        text=console_out.data,
+                        text=_clean_ansi_for_export(console_out.data),
                     ),
                 )
             )
+        elif console_out.channel in (CellChannel.OUTPUT, CellChannel.MEDIA):
+            ipynb_compatible_output = _convert_output_to_ipynb(console_out)
+            if ipynb_compatible_output is not None:
+                ipynb_outputs.append(ipynb_compatible_output)
 
     if not cell_output:
         return ipynb_outputs
@@ -331,50 +445,70 @@ def _convert_marimo_output_to_ipynb(
             )
         return ipynb_outputs
 
-    if cell_output.channel not in (CellChannel.OUTPUT, CellChannel.MEDIA):
-        return ipynb_outputs
-
-    if cell_output.mimetype == "text/plain" and (
-        cell_output.data == [] or cell_output.data == ""
-    ):
-        return ipynb_outputs
-
-    # Handle rich output
-    data: dict[str, Any] = {}
-    metadata: dict[str, Any] = {}
-
-    if cell_output.mimetype == "application/vnd.marimo+error":
-        # Already handled above via MARIMO_ERROR channel
-        return ipynb_outputs
-    elif cell_output.mimetype == "application/vnd.marimo+mimebundle":
-        if isinstance(cell_output.data, dict):
-            mimebundle = cell_output.data
-        elif isinstance(cell_output.data, str):
-            mimebundle = json.loads(cell_output.data)
-        else:
-            raise ValueError(f"Invalid data type: {type(cell_output.data)}")
-
-        for mime, content in mimebundle.items():
-            if mime == METADATA_KEY and isinstance(content, dict):
-                metadata = content
-            elif mime == "text/html" and _is_marimo_component(content):
-                # Skip marimo components because they cannot be rendered in IPython notebook format
-                continue
-            else:
-                data[mime] = _maybe_extract_dataurl(content)
-    else:
-        data[cell_output.mimetype] = _maybe_extract_dataurl(cell_output.data)
-
-    if data:
-        ipynb_outputs.append(
-            cast(
-                nbformat.NotebookNode,
-                nbformat.v4.new_output(  # type: ignore[no-untyped-call]
-                    "display_data",
-                    data=data,
-                    metadata=metadata,
-                ),
-            )
-        )
+    ipynb_compatible_output = _convert_output_to_ipynb(cell_output)
+    if ipynb_compatible_output is not None:
+        ipynb_outputs.append(ipynb_compatible_output)
 
     return ipynb_outputs
+
+
+def _convert_latex_delimiters_for_jupyter(markdown_string: str) -> str:
+    """Convert LaTeX delimiters that nbconvert can't handle. See https://github.com/jupyter/nbconvert/issues/477"""
+
+    # Convert display math \[...\] to $$...$$
+    # Preserve internal whitespace but trim the delimiter boundaries
+    def replace_display(match: re.Match[str]) -> str:
+        content = match.group(1)
+        return f"$${content.strip()}$$"
+
+    markdown_string = re.sub(
+        r"\\\[(.*?)\\\]", replace_display, markdown_string, flags=re.DOTALL
+    )
+
+    # Convert inline math \(...\) to $...$
+    # Remove spaces adjacent to delimiters
+    def replace_inline(match: re.Match[str]) -> str:
+        content = match.group(1)
+        return f"${content.strip()}$"
+
+    markdown_string = re.sub(
+        r"\\\((.*?)\\\)", replace_inline, markdown_string, flags=re.DOTALL
+    )
+
+    return markdown_string
+
+
+def _convert_marimo_tex_to_latex(html_string: str) -> str:
+    """Convert marimo-tex elements back to standard LaTeX delimiters.
+    Keep in sync with TexPlugin.tsx
+
+    Converts:
+    - <marimo-tex ...>||(content||)</marimo-tex> → $content$ (inline)
+    - <marimo-tex ...>||[content||]</marimo-tex> → $$content$$ (block)
+    - <marimo-tex ...>||(||(content||)||)</marimo-tex> → $$content$$ (nested display)
+    """
+
+    def replace_tex(match: re.Match[str]) -> str:
+        content = match.group(1)
+
+        # Handle nested display math: ||(||(content||)||)
+        # Must check this FIRST and be more specific
+        if content.startswith("||(||(") and content.endswith("||)||)"):
+            inner = content[6:-6]  # Strip ||(||( and ||)||)
+            return f"$${inner}$$"
+        # Handle block math: ||[content||]
+        elif content.startswith("||[") and content.endswith("||]"):
+            inner = content[3:-3]
+            return f"$${inner}$$"
+        # Handle inline math: ||(content||)
+        elif content.startswith("||(") and content.endswith("||)"):
+            inner = content[3:-3]
+            return f"${inner}$"  # Single $ for inline!
+        else:
+            return content
+
+    # Match <marimo-tex ...>content</marimo-tex>
+    # Use non-greedy matching and handle potential attributes
+    pattern = r"<marimo-tex[^>]*>(.*?)</marimo-tex>"
+
+    return re.sub(pattern, replace_tex, html_string, flags=re.DOTALL)

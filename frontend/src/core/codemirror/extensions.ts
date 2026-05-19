@@ -29,14 +29,9 @@ export function formatKeymapExtension(hotkeys: HotkeyProvider) {
       preventDefault: true,
       run: (ev) => {
         const currentLanguage = getCurrentLanguageAdapter(ev);
-        // Early return if not a supported language
-        if (currentLanguage !== "markdown" && currentLanguage !== "python") {
-          return false;
-        }
-
-        // Toggle between markdown and python
         const destinationLanguage =
-          currentLanguage === "python" ? "markdown" : "python";
+          currentLanguage === "markdown" ? "python" : "markdown";
+
         const response = toggleToLanguage(ev, destinationLanguage, {
           force: true,
         });
@@ -45,6 +40,26 @@ export function formatKeymapExtension(hotkeys: HotkeyProvider) {
         if (response === "markdown") {
           const actions = ev.state.facet(cellActionsState);
           actions.afterToggleMarkdown();
+        }
+
+        return response !== false;
+      },
+    },
+    {
+      key: hotkeys.getHotkey("cell.viewAsSQL").key,
+      preventDefault: true,
+      run: (ev) => {
+        const currentLanguage = getCurrentLanguageAdapter(ev);
+        const destinationLanguage =
+          currentLanguage === "sql" ? "python" : "sql";
+
+        const response = toggleToLanguage(ev, destinationLanguage, {
+          force: true,
+        });
+
+        if (response === "sql") {
+          const actions = ev.state.facet(cellActionsState);
+          actions.afterToggleSQL();
         }
 
         return response !== false;

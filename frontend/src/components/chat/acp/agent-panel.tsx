@@ -3,12 +3,8 @@
 import { useAtom, useAtomValue } from "jotai";
 import { capitalize } from "lodash-es";
 import {
-  AtSignIcon,
   BotMessageSquareIcon,
-  PaperclipIcon,
   RefreshCwIcon,
-  SendIcon,
-  SquareIcon,
   StopCircleIcon,
 } from "lucide-react";
 import React, { memo, useEffect, useMemo, useRef, useState } from "react";
@@ -25,8 +21,7 @@ import {
 import { PanelEmptyState } from "@/components/editor/chrome/panels/empty-state";
 import { Spinner } from "@/components/icons/spinner";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Tooltip, TooltipProvider } from "@/components/ui/tooltip";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/utils/cn";
 import { Logger } from "@/utils/Logger";
 import { AgentDocs } from "./agent-docs";
@@ -65,12 +60,18 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { DelayMount } from "@/components/utils/delay-mount";
 import { useRequestClient } from "@/core/network/requests";
-import { filenameAtom } from "@/core/saving/file-state";
+import { cwdAtom, filenameAtom } from "@/core/saving/file-state";
 import { store } from "@/core/state/jotai";
 import { ErrorBanner } from "@/plugins/impl/common/error-banner";
 import { Functions } from "@/utils/functions";
-import { Paths } from "@/utils/paths";
-import { FileAttachmentPill } from "../chat-components";
+import { PathBuilder, Paths } from "@/utils/paths";
+import {
+  AddContextButton,
+  AttachFileButton,
+  FileAttachmentPill,
+  SendButton,
+} from "../chat-components";
+import { useFileState } from "../chat-utils";
 import { ReadyToChatBlock } from "./blocks";
 import {
   convertFilesToResourceLinks,
@@ -88,9 +89,6 @@ import type {
 } from "./types";
 
 const logger = Logger.get("agents");
-
-// File attachment constants
-const SUPPORTED_ATTACHMENT_TYPES = ["image/*", "text/*"];
 
 interface AgentTitleProps {
   currentAgentId?: ExternalAgentId;
@@ -392,55 +390,21 @@ const PromptArea = memo<PromptAreaProps>(
               )}
             </div>
             <div className="flex flex-row">
-              <Tooltip content="Add context">
-                <Button
-                  variant="text"
-                  size="icon"
-                  onClick={handleAddContext}
-                  disabled={isLoading}
-                >
-                  <AtSignIcon className="h-3.5 w-3.5" />
-                </Button>
-              </Tooltip>
-              <Tooltip content="Attach a file">
-                <Button
-                  variant="text"
-                  size="icon"
-                  className="cursor-pointer"
-                  onClick={() => fileInputRef.current?.click()}
-                  title="Attach a file"
-                  disabled={isLoading}
-                >
-                  <PaperclipIcon className="h-3.5 w-3.5" />
-                </Button>
-              </Tooltip>
-              <Input
-                ref={fileInputRef}
-                type="file"
-                multiple={true}
-                hidden={true}
-                onChange={(event) => {
-                  if (event.target.files) {
-                    onAddFiles([...event.target.files]);
-                  }
-                }}
-                accept={SUPPORTED_ATTACHMENT_TYPES.join(",")}
+              <AddContextButton
+                handleAddContext={handleAddContext}
+                isLoading={isLoading}
               />
-              <Tooltip content={isLoading ? "Stop" : "Submit"}>
-                <Button
-                  variant="text"
-                  size="sm"
-                  className="h-6 w-6 p-0 hover:bg-muted/30 cursor-pointer"
-                  onClick={isLoading ? onStop : handleSendClick}
-                  disabled={isLoading ? false : !promptValue.trim()}
-                >
-                  {isLoading ? (
-                    <SquareIcon className="h-3 w-3 fill-current" />
-                  ) : (
-                    <SendIcon className="h-3 w-3" />
-                  )}
-                </Button>
-              </Tooltip>
+              <AttachFileButton
+                fileInputRef={fileInputRef}
+                isLoading={isLoading}
+                onAddFiles={onAddFiles}
+              />
+              <SendButton
+                isLoading={isLoading}
+                onStop={onStop}
+                onSendClick={handleSendClick}
+                isEmpty={!promptValue.trim()}
+              />
             </div>
           </div>
         </TooltipProvider>
@@ -650,7 +614,11 @@ ChatContent.displayName = "ChatContent";
 
 const NO_WS_SET = "_skip_auto_connect_";
 
-function getCwd() {
+function getCwd(): string {
+  const cwd = store.get(cwdAtom);
+  if (cwd) {
+    return cwd;
+  }
   const filename = store.get(filenameAtom);
   if (!filename) {
     throw new Error(
@@ -660,11 +628,26 @@ function getCwd() {
   return Paths.dirname(filename);
 }
 
+function getAbsoluteFilename(): string {
+  const filename = store.get(filenameAtom);
+  if (!filename) {
+    throw new Error(
+      "Please save the notebook and refresh the browser to use the agent",
+    );
+  }
+  const cwd = store.get(cwdAtom);
+  if (cwd) {
+    const builder = PathBuilder.guessDeliminator(cwd);
+    return builder.join(cwd, String(Paths.basename(filename)));
+  }
+  return filename;
+}
+
 const AgentPanel: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<Error | string | null>(null);
   const [promptValue, setPromptValue] = useState("");
-  const [files, setFiles] = useState<File[]>();
+  const { files, addFiles, clearFiles, removeFile } = useFileState();
   const [sessionModels, setSessionModels] = useState<SessionModelState | null>(
     null,
   );
@@ -891,15 +874,17 @@ const AgentPanel: React.FC = () => {
       });
       setIsLoading(true);
       setPromptValue("");
-      setFiles(undefined);
+      clearFiles();
 
       // Update session title with first message if it's still the default
       if (selectedTab?.title.startsWith("New ")) {
         setSessionState((prev) => updateSessionTitle(prev, prompt));
       }
 
-      const filename = store.get(filenameAtom);
-      if (!filename) {
+      let absoluteFilename: string;
+      try {
+        absoluteFilename = getAbsoluteFilename();
+      } catch {
         toast({
           title: "Notebook must be named",
           description: "Please name the notebook to use the agent",
@@ -930,16 +915,16 @@ const AgentPanel: React.FC = () => {
         promptBlocks.push(
           {
             type: "resource_link",
-            uri: filename,
+            uri: absoluteFilename,
             mimeType: "text/x-python",
-            name: filename,
+            name: absoluteFilename,
           },
           {
             type: "resource",
             resource: {
               uri: "marimo_rules.md",
               mimeType: "text/plain",
-              text: getAgentPrompt(filename),
+              text: getAgentPrompt(absoluteFilename),
             },
           },
         );
@@ -965,21 +950,6 @@ const AgentPanel: React.FC = () => {
     }
     await agent.cancel({ sessionId: activeSessionId });
     setIsLoading(false);
-  });
-
-  // Handler for adding files
-  const handleAddFiles = useEvent((newFiles: File[]) => {
-    if (newFiles.length === 0) {
-      return;
-    }
-    setFiles((prev) => [...(prev ?? []), ...newFiles]);
-  });
-
-  // Handler for removing files
-  const handleRemoveFile = useEvent((fileToRemove: File) => {
-    if (files) {
-      setFiles(files.filter((f) => f !== fileToRemove));
-    }
   });
 
   // Handler for manual connect
@@ -1148,7 +1118,7 @@ const AgentPanel: React.FC = () => {
               <FileAttachmentPill
                 file={file}
                 key={file.name}
-                onRemove={() => handleRemoveFile(file)}
+                onRemove={() => removeFile(file)}
               />
             ))}
           </div>
@@ -1160,7 +1130,7 @@ const AgentPanel: React.FC = () => {
           promptValue={promptValue}
           onPromptValueChange={setPromptValue}
           onPromptSubmit={handlePromptSubmit}
-          onAddFiles={handleAddFiles}
+          onAddFiles={addFiles}
           onStop={handleStop}
           fileInputRef={fileInputRef}
           commands={availableCommands}

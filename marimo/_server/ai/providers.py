@@ -25,6 +25,7 @@ from marimo._ai._pydantic_ai_utils import (
     generate_id,
 )
 from marimo._dependencies.dependencies import Dependency, DependencyManager
+from marimo._plugins.ui._impl.chat.chat import AI_SDK_VERSION
 from marimo._server.ai.config import AnyProviderConfig
 from marimo._server.ai.ids import AiModelId
 from marimo._server.ai.tools.tool_manager import get_tool_manager
@@ -95,7 +96,10 @@ class PydanticProvider(ABC, Generic[ProviderT]):
             deps: The dependencies to require.
         """
         DependencyManager.require_many(
-            "for AI assistance", DependencyManager.pydantic_ai, *(deps or [])
+            "for AI assistance",
+            DependencyManager.pydantic_ai,
+            *(deps or []),
+            source="server",
         )
 
         self.model = model
@@ -166,9 +170,17 @@ class PydanticProvider(ABC, Generic[ProviderT]):
         stream_options = stream_options or StreamOptions()
 
         vercel_adapter = self.get_vercel_adapter()
-        adapter = vercel_adapter(
-            agent=agent, run_input=run_input, accept=stream_options.accept
-        )
+        if DependencyManager.pydantic_ai.has_at_version(min_version="1.52.0"):
+            adapter = vercel_adapter(
+                agent=agent,
+                run_input=run_input,
+                accept=stream_options.accept,
+                sdk_version=AI_SDK_VERSION,
+            )
+        else:
+            adapter = vercel_adapter(
+                agent=agent, run_input=run_input, accept=stream_options.accept
+            )
         event_stream = adapter.run_stream()
         return adapter.streaming_response(event_stream)
 
@@ -193,7 +205,6 @@ class PydanticProvider(ABC, Generic[ProviderT]):
             message_history=vercel_adapter.load_messages(
                 self.convert_messages(messages)
             ),
-            instructions=system_prompt,
         ) as result:
             async for message in result.stream_text(delta=True):
                 yield message
@@ -216,7 +227,6 @@ class PydanticProvider(ABC, Generic[ProviderT]):
         result = await agent.run(
             user_prompt=None,
             message_history=VercelAIAdapter.load_messages(messages),
-            instructions=system_prompt,
         )
 
         return str(result.output)
@@ -252,7 +262,14 @@ class GoogleProvider(PydanticProvider["PydanticGoogle"]):
         )
         if use_vertex:
             project = os.getenv("GOOGLE_CLOUD_PROJECT")
-            location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+            # Upstream (pydantic-ai) defaults to us-central1 if not set
+            location = os.getenv("GOOGLE_CLOUD_LOCATION") or None
+            if location is None:
+                LOGGER.info(
+                    "GOOGLE_CLOUD_LOCATION is not set. "
+                    "The upstream provider will default to 'us-central1'. "
+                    "Set this env var if your project has region restrictions."
+                )
             # The type stubs don't have an overload that combines vertexai
             # with project/location, but the runtime supports it
             provider: PydanticGoogle = PydanticGoogle(  # type: ignore[call-overload]
@@ -675,8 +692,9 @@ class CustomProvider(OpenAIClientMixin, PydanticProvider["Provider[Any]"]):
                 provider_factory=lambda _: self.provider,
             )
         except UserError:
-            LOGGER.warning(
-                f"Model {self.model} not found. Falling back to OpenAIChatModel."
+            LOGGER.debug(
+                f"Model {self.model} not found in pydantic-ai's model registry. "
+                "Falling back to OpenAIChatModel."
             )
             model = self.create_model(max_tokens)
         except Exception as e:
@@ -792,8 +810,11 @@ class AnthropicProvider(PydanticProvider["PydanticAnthropic"]):
         from ThinkingPart to ReasoningEndChunk, which breaks Anthropic's extended thinking
         on follow-up messages (Anthropic requires signatures on thinking blocks).
 
-        TODO: Remove this once https://github.com/pydantic/pydantic-ai/pull/3754 is released
+        This is a patch for pydantic-ai <1.47.0, which doesn't include the signature in the ReasoningEndChunk.
         """
+        if DependencyManager.pydantic_ai.has_at_version(min_version="1.47.0"):
+            return super().get_vercel_adapter()
+
         from pydantic_ai import DeferredToolRequests
         from pydantic_ai.ui.vercel_ai import VercelAIAdapter
         from pydantic_ai.ui.vercel_ai._event_stream import VercelAIEventStream

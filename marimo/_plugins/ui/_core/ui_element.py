@@ -441,7 +441,6 @@ class UIElement(Html, Generic[S, T]):
         broadcast_notification(
             UIElementMessageNotification(
                 ui_element=self._id,
-                model_id=None,
                 message=message,
                 buffers=list(buffers or []),
             ),
@@ -530,6 +529,9 @@ class UIElement(Html, Generic[S, T]):
                     "functions": result._args.functions,
                 }
             )
+
+        # Use the newly constructed arguments, instead of the one in the naive deepcopy.
+        result._args = args
         result._initialize(args)
         return result
 

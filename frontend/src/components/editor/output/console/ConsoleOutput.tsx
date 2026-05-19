@@ -1,17 +1,28 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-import { ChevronRightIcon, WrapTextIcon } from "lucide-react";
-import React, { useLayoutEffect } from "react";
+import {
+  ChevronRightIcon,
+  ChevronsDownUpIcon,
+  ChevronsUpDownIcon,
+  WrapTextIcon,
+} from "lucide-react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ToggleButton } from "react-aria-components";
 import { DebuggerControls } from "@/components/debugger/debugger-code";
 import { CopyClipboardIcon } from "@/components/icons/copy-icon";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip } from "@/components/ui/tooltip";
 import type { CellId } from "@/core/cells/ids";
 import { isInternalCellName } from "@/core/cells/names";
+import { useExpandedConsoleOutput } from "@/core/cells/outputs";
 import type { WithResponse } from "@/core/cells/types";
 import type { OutputMessage } from "@/core/kernel/messages";
-import { useInputHistory } from "@/hooks/useInputHistory";
+import {
+  type UseInputHistoryReturn,
+  useInputHistory,
+} from "@/hooks/useInputHistory";
+import { useOverflowDetection } from "@/hooks/useOverflowDetection";
 import { useSelectAllContent } from "@/hooks/useSelectAllContent";
 import { cn } from "@/utils/cn";
 import { invariant } from "@/utils/invariant";
@@ -21,6 +32,52 @@ import { type OnRefactorWithAI, OutputRenderer } from "../../Output";
 import { useWrapText } from "../useWrapText";
 import { processOutput } from "./process-output";
 import { RenderTextWithLinks } from "./text-rendering";
+
+/**
+ * Delay in ms before clearing console outputs.
+ * This prevents flickering when a cell re-runs and outputs are briefly cleared
+ * before new outputs arrive (e.g., plt.show() with a slider).
+ */
+export const CONSOLE_CLEAR_DEBOUNCE_MS = 200;
+
+/**
+ * Debounces the clearing of console outputs.
+ * - Non-empty updates are applied immediately.
+ * - Transitions to empty are delayed by CONSOLE_CLEAR_DEBOUNCE_MS,
+ *   giving new outputs a chance to arrive and replace the old ones
+ *   without a visible flicker.
+ */
+function useDebouncedConsoleOutputs<T>(outputs: T[]): T[] {
+  const [debouncedOutputs, setDebouncedOutputs] = useState(outputs);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Non-empty outputs: apply immediately and cancel any pending clear
+  if (outputs.length > 0 && debouncedOutputs !== outputs) {
+    if (timerRef.current !== null) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    setDebouncedOutputs(outputs);
+  }
+
+  // Empty outputs: delay the clear so new outputs can arrive first
+  useEffect(() => {
+    if (outputs.length === 0 && timerRef.current === null) {
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null;
+        setDebouncedOutputs([]);
+      }, CONSOLE_CLEAR_DEBOUNCE_MS);
+    }
+    return () => {
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [outputs]);
+
+  return debouncedOutputs;
+}
 
 interface Props {
   cellId: CellId;
@@ -45,8 +102,14 @@ export const ConsoleOutput = (props: Props) => {
 const ConsoleOutputInternal = (props: Props): React.ReactNode => {
   const ref = React.useRef<HTMLDivElement>(null);
   const { wrapText, setWrapText } = useWrapText();
+  const [isExpanded, setIsExpanded] = useExpandedConsoleOutput(props.cellId);
+  const [stdinValue, setStdinValue] = React.useState("");
+  const inputHistory = useInputHistory({
+    value: stdinValue,
+    setValue: setStdinValue,
+  });
   const {
-    consoleOutputs,
+    consoleOutputs: rawConsoleOutputs,
     stale,
     cellName,
     cellId,
@@ -55,6 +118,9 @@ const ConsoleOutputInternal = (props: Props): React.ReactNode => {
     onRefactorWithAI,
     className,
   } = props;
+
+  // Debounce clearing to prevent flickering when cells re-run
+  const consoleOutputs = useDebouncedConsoleOutputs(rawConsoleOutputs);
 
   /* The debugger UI needs some work. For now just use the regular
   /* console output. */
@@ -71,6 +137,9 @@ const ConsoleOutputInternal = (props: Props): React.ReactNode => {
 
   // Enable Ctrl/Cmd-A to select all content within the console output
   const selectAllProps = useSelectAllContent(hasOutputs);
+
+  // Detect overflow on resize
+  const isOverflowing = useOverflowDetection(ref, hasOutputs);
 
   // Keep scroll at the bottom if it is within 120px of the bottom,
   // so when we add new content, it will lock to the bottom
@@ -121,7 +190,7 @@ const ConsoleOutputInternal = (props: Props): React.ReactNode => {
   return (
     <div className="relative group">
       {hasOutputs && (
-        <div className="absolute top-1 right-5 z-10 opacity-0 group-hover:opacity-100 flex gap-1">
+        <div className="absolute top-1 right-4 z-10 opacity-0 group-hover:opacity-100 flex items-center gap-1 print:hidden">
           <CopyClipboardIcon
             tooltip="Copy console output"
             value={getOutputString}
@@ -139,6 +208,25 @@ const ConsoleOutputInternal = (props: Props): React.ReactNode => {
               </ToggleButton>
             </span>
           </Tooltip>
+          {(isOverflowing || isExpanded) && (
+            <Button
+              aria-label={isExpanded ? "Collapse output" : "Expand output"}
+              className="p-0 mb-px"
+              onClick={() => setIsExpanded(!isExpanded)}
+              size="xs"
+              variant={null}
+            >
+              {isExpanded ? (
+                <Tooltip content="Collapse output">
+                  <ChevronsDownUpIcon className="h-4 w-4" />
+                </Tooltip>
+              ) : (
+                <Tooltip content="Expand output">
+                  <ChevronsUpDownIcon className="h-4 w-4 " />
+                </Tooltip>
+              )}
+            </Button>
+          )}
         </div>
       )}
       <div
@@ -154,6 +242,7 @@ const ConsoleOutputInternal = (props: Props): React.ReactNode => {
           hasOutputs ? "p-5" : "p-3",
           className,
         )}
+        style={isExpanded ? { maxHeight: "none" } : undefined}
       >
         {reversedOutputs.map((output, idx) => {
           if (output.channel === "pdb") {
@@ -167,6 +256,7 @@ const ConsoleOutputInternal = (props: Props): React.ReactNode => {
             );
 
             const originalIdx = consoleOutputs.length - idx - 1;
+            const isPassword = output.mimetype === "text/password";
 
             if (output.response == null && lastStdInputIdx === idx) {
               return (
@@ -174,8 +264,12 @@ const ConsoleOutputInternal = (props: Props): React.ReactNode => {
                   key={idx}
                   output={output.data}
                   isPdb={isPdb}
+                  isPassword={isPassword}
                   onSubmit={(text) => onSubmitDebugger(text, originalIdx)}
                   onClear={onClear}
+                  value={stdinValue}
+                  setValue={setStdinValue}
+                  inputHistory={inputHistory}
                 />
               );
             }
@@ -185,6 +279,7 @@ const ConsoleOutputInternal = (props: Props): React.ReactNode => {
                 key={idx}
                 output={output.data}
                 response={output.response}
+                isPassword={isPassword}
               />
             );
           }
@@ -214,24 +309,32 @@ const StdInput = (props: {
   onSubmit: (text: string) => void;
   onClear?: () => void;
   output: string;
-  response?: string;
   isPdb: boolean;
+  isPassword?: boolean;
+  value: string;
+  setValue: (value: string) => void;
+  inputHistory: UseInputHistoryReturn;
 }) => {
-  const [value, setValue] = React.useState("");
-
-  const { navigateUp, navigateDown, addToHistory } = useInputHistory({
+  const {
     value,
     setValue,
-  });
+    inputHistory,
+    output,
+    isPassword,
+    isPdb,
+    onSubmit,
+    onClear,
+  } = props;
+  const { navigateUp, navigateDown, addToHistory } = inputHistory;
 
   return (
     <div className="flex gap-2 items-center pt-2">
-      {renderText(props.output)}
+      {renderText(output)}
       <Input
         data-testid="console-input"
         // This is used in <StdinBlockingAlert> to find the input
         data-stdin-blocking={true}
-        type="text"
+        type={isPassword ? "password" : "text"}
         autoComplete="off"
         autoFocus={true}
         value={value}
@@ -256,7 +359,7 @@ const StdInput = (props: {
           if (e.key === "Enter" && !e.shiftKey) {
             if (value) {
               addToHistory(value);
-              props.onSubmit(value);
+              onSubmit(value);
               setValue("");
             }
             e.preventDefault();
@@ -270,18 +373,22 @@ const StdInput = (props: {
           }
         }}
       />
-      {props.isPdb && (
-        <DebuggerControls onSubmit={props.onSubmit} onClear={props.onClear} />
-      )}
+      {isPdb && <DebuggerControls onSubmit={onSubmit} onClear={onClear} />}
     </div>
   );
 };
 
-const StdInputWithResponse = (props: { output: string; response?: string }) => {
+const StdInputWithResponse = (props: {
+  output: string;
+  response?: string;
+  isPassword?: boolean;
+}) => {
   return (
     <div className="flex gap-2 items-center">
       {renderText(props.output)}
-      <span className="text-(--sky-11)">{props.response}</span>
+      {!props.isPassword && (
+        <span className="text-(--sky-11)">{props.response}</span>
+      )}
     </div>
   );
 };

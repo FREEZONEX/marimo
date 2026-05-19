@@ -7,14 +7,14 @@ import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { DefaultChatTransport, type FileUIPart, type TextUIPart } from "ai";
 import { useAtom, useAtomValue, useSetAtom, useStore } from "jotai";
 import {
-  AtSignIcon,
   BotMessageSquareIcon,
+  HatGlasses,
   Loader2,
-  PaperclipIcon,
+  type LucideIcon,
+  MessageCircleIcon,
+  NotebookText,
   PlusIcon,
-  SendIcon,
   SettingsIcon,
-  SquareIcon,
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import useEvent from "react-use-event-hook";
@@ -29,7 +29,7 @@ import {
 } from "@/components/ui/select";
 import { replaceMessagesInChat } from "@/core/ai/chat-utils";
 import { useModelChange } from "@/core/ai/config";
-import { AiModelId, type ProviderId } from "@/core/ai/ids/ids";
+import { AiModelId } from "@/core/ai/ids/ids";
 import { useStagedAICellsActions } from "@/core/ai/staged-cells";
 import {
   activeChatAtom,
@@ -45,7 +45,6 @@ import {
 import { useCellActions } from "@/core/cells/cells";
 import { aiAtom, aiEnabledAtom } from "@/core/config/config";
 import { DEFAULT_AI_MODEL } from "@/core/config/config-schema";
-import { FeatureFlagged } from "@/core/config/feature-flag";
 import { useRequestClient } from "@/core/network/requests";
 import { useRuntimeManager } from "@/core/runtime/config";
 import { ErrorBanner } from "@/plugins/impl/common/error-banner";
@@ -54,12 +53,6 @@ import { Logger } from "@/utils/Logger";
 import { AIModelDropdown } from "../ai/ai-model-dropdown";
 import { useOpenSettingsToTab } from "../app-config/state";
 import { UserConfigForm } from "../app-config/user-config-form";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "../ui/dialog";
 import { PromptInput } from "../editor/ai/add-cell-with-ai";
 import {
   addContextCompletion,
@@ -67,10 +60,15 @@ import {
 } from "../editor/ai/completion-utils";
 import { PanelEmptyState } from "../editor/chrome/panels/empty-state";
 import { CopyClipboardIcon } from "../icons/copy-icon";
-import { Input } from "../ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../ui/dialog";
 import { Tooltip, TooltipProvider } from "../ui/tooltip";
-import { toast } from "../ui/use-toast";
-import { AttachmentRenderer, FileAttachmentPill } from "./chat-components";
+import {
+  AddContextButton,
+  AttachFileButton,
+  AttachmentRenderer,
+  FileAttachmentPill,
+  SendButton,
+} from "./chat-components";
 import { renderUIMessage } from "./chat-display";
 import { ChatHistoryPopover } from "./chat-history-popover";
 import {
@@ -80,20 +78,12 @@ import {
   handleToolCall,
   hasPendingToolCalls,
   isLastMessageReasoning,
+  PROVIDERS_THAT_SUPPORT_ATTACHMENTS,
+  useFileState,
 } from "./chat-utils";
 
 // Default mode for the AI
 const DEFAULT_MODE = "manual";
-
-// We need to modify the backend to support attachments for other providers
-// And other types
-const PROVIDERS_THAT_SUPPORT_ATTACHMENTS = new Set<ProviderId>([
-  "openai",
-  "google",
-  "anthropic",
-]);
-const SUPPORTED_ATTACHMENT_TYPES = ["image/*", "text/*"];
-const MAX_ATTACHMENT_SIZE = 1024 * 1024 * 50; // 50MB
 
 interface ChatHeaderProps {
   onNewChat: () => void;
@@ -118,9 +108,9 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
       <div className="flex items-center gap-2">
         <Tooltip content="AI Settings">
           <Button
+            aria-label="AI Settings"
             variant="text"
-            size="xs"
-            className="hover:bg-foreground/10 py-2"
+            size="icon"
             onClick={() => setSettingsOpen(true)}
           >
             <SettingsIcon className="h-4 w-4" />
@@ -254,58 +244,72 @@ const ChatInputFooter: React.FC<ChatInputFooterProps> = memo(
       value: CopilotMode;
       label: string;
       subtitle: string;
+      Icon: LucideIcon;
     }[] = [
+      {
+        value: "manual",
+        label: "Manual",
+        subtitle: "Pure chat, no tool usage",
+        Icon: MessageCircleIcon,
+      },
       {
         value: "ask",
         label: "Ask",
         subtitle:
           "Use AI with access to read-only tools like documentation search",
-      },
-      {
-        value: "manual",
-        label: "Manual",
-        subtitle: "Pure chat, no tool usage",
+        Icon: NotebookText,
       },
       {
         value: "agent",
         label: "Agent (beta)",
         subtitle: "Use AI with access to read and write tools",
+        Icon: HatGlasses,
       },
     ];
 
     const isAttachmentSupported =
       PROVIDERS_THAT_SUPPORT_ATTACHMENTS.has(currentProvider);
 
+    const CurrentModeIcon = modeOptions.find(
+      (o) => o.value === currentMode,
+    )?.Icon;
+
     return (
       <TooltipProvider>
         <div className="px-3 py-2 border-t border-border/20 flex flex-row flex-wrap items-center justify-between gap-1">
           <div className="flex items-center gap-2">
-            <FeatureFlagged feature="chat_modes">
-              <Select value={currentMode} onValueChange={saveModeChange}>
-                <SelectTrigger className="h-6 text-xs border-border shadow-none! ring-0! bg-muted hover:bg-muted/30 py-0 px-2 gap-1 capitalize">
-                  {currentMode}
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectLabel>AI Mode</SelectLabel>
-                    {modeOptions.map((option) => (
-                      <SelectItem
-                        key={option.value}
-                        value={option.value}
-                        className="text-xs"
-                      >
-                        <div className="flex flex-col">
-                          {option.label}
-                          <div className="text-muted-foreground text-xs pt-1 block">
+            <Select value={currentMode} onValueChange={saveModeChange}>
+              <SelectTrigger className="h-6 text-xs border-border shadow-none! ring-0! bg-muted hover:bg-muted/30 py-0 px-2 gap-1.5">
+                {CurrentModeIcon && <CurrentModeIcon className="h-3 w-3" />}
+                <span className="capitalize">{currentMode}</span>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectLabel className="text-xs uppercase tracking-wider text-muted-foreground/70 font-medium">
+                    AI Mode
+                  </SelectLabel>
+                  {modeOptions.map((option) => (
+                    <SelectItem
+                      key={option.value}
+                      value={option.value}
+                      className="text-xs py-1"
+                    >
+                      <div className="flex items-start gap-2.5">
+                        <span className="mt-1 text-muted-foreground">
+                          <option.Icon className="h-3 w-3" />
+                        </span>
+                        <div className="flex flex-col gap-0.5">
+                          <span className="font-semibold">{option.label}</span>
+                          <span className="text-muted-foreground">
                             {option.subtitle}
-                          </div>
+                          </span>
                         </div>
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </FeatureFlagged>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
             <AIModelDropdown
               placeholder="Model"
               triggerClassName="h-6 text-xs shadow-none! ring-0! bg-muted hover:bg-muted/30 rounded-sm"
@@ -315,60 +319,23 @@ const ChatInputFooter: React.FC<ChatInputFooterProps> = memo(
             />
           </div>
           <div className="flex flex-row">
-            <Tooltip content="Add context">
-              <Button
-                variant="text"
-                size="icon"
-                onClick={onAddContext}
-                disabled={isLoading}
-              >
-                <AtSignIcon className="h-3.5 w-3.5" />
-              </Button>
-            </Tooltip>
+            <AddContextButton
+              handleAddContext={onAddContext}
+              isLoading={isLoading}
+            />
             {isAttachmentSupported && (
-              <>
-                <Tooltip content="Attach a file">
-                  <Button
-                    variant="text"
-                    size="icon"
-                    className="cursor-pointer"
-                    onClick={() => fileInputRef.current?.click()}
-                    title="Attach a file"
-                    disabled={isLoading}
-                  >
-                    <PaperclipIcon className="h-3.5 w-3.5" />
-                  </Button>
-                </Tooltip>
-                <Input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple={true}
-                  hidden={true}
-                  onChange={(event) => {
-                    if (event.target.files) {
-                      onAddFiles([...event.target.files]);
-                    }
-                  }}
-                  accept={SUPPORTED_ATTACHMENT_TYPES.join(",")}
-                />
-              </>
+              <AttachFileButton
+                fileInputRef={fileInputRef}
+                isLoading={isLoading}
+                onAddFiles={onAddFiles}
+              />
             )}
-
-            <Tooltip content={isLoading ? "Stop" : "Submit"}>
-              <Button
-                variant="text"
-                size="sm"
-                className="h-6 w-6 p-0 hover:bg-muted/30 cursor-pointer"
-                onClick={isLoading ? onStop : onSendClick}
-                disabled={isLoading ? false : isEmpty}
-              >
-                {isLoading ? (
-                  <SquareIcon className="h-3 w-3 fill-current" />
-                ) : (
-                  <SendIcon className="h-3 w-3" />
-                )}
-              </Button>
-            </Tooltip>
+            <SendButton
+              isLoading={isLoading}
+              onStop={onStop}
+              onSendClick={onSendClick}
+              isEmpty={isEmpty}
+            />
           </div>
         </div>
       </TooltipProvider>
@@ -489,7 +456,7 @@ const ChatPanelBody = () => {
   const [activeChat, setActiveChat] = useAtom(activeChatAtom);
   const [input, setInput] = useState("");
   const [newThreadInput, setNewThreadInput] = useState("");
-  const [files, setFiles] = useState<File[]>();
+  const { files, addFiles, clearFiles, removeFile } = useFileState();
   const newThreadInputRef = useRef<ReactCodeMirrorRef>(null);
   const newMessageInputRef = useRef<ReactCodeMirrorRef>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -578,33 +545,6 @@ const ChatPanelBody = () => {
     },
   });
 
-  const onAddFiles = useEvent((files: File[]) => {
-    if (files.length === 0) {
-      return;
-    }
-
-    let fileSize = 0;
-    for (const file of files) {
-      fileSize += file.size;
-    }
-
-    if (fileSize > MAX_ATTACHMENT_SIZE) {
-      toast({
-        title: "File size exceeds 50MB limit",
-        description: "Please remove some files and try again.",
-      });
-      return;
-    }
-
-    setFiles((prev) => [...(prev ?? []), ...files]);
-  });
-
-  const removeFile = useEvent((file: File) => {
-    if (files) {
-      setFiles(files.filter((f) => f !== file));
-    }
-  });
-
   const isLoading = status === "submitted" || status === "streaming";
 
   // Check if we're currently streaming reasoning in the latest message
@@ -664,7 +604,7 @@ const ChatPanelBody = () => {
         ...(fileParts ?? []),
       ],
     });
-    setFiles(undefined);
+    clearFiles();
     setInput("");
   };
 
@@ -672,7 +612,7 @@ const ChatPanelBody = () => {
     setActiveChat(null);
     setInput("");
     setNewThreadInput("");
-    setFiles(undefined);
+    clearFiles();
   });
 
   const handleMessageEdit = useEvent((index: number, newValue: string) => {
@@ -703,7 +643,7 @@ const ChatPanelBody = () => {
         files: fileParts,
       });
       setInput("");
-      setFiles(undefined);
+      clearFiles();
     },
   );
 
@@ -736,7 +676,7 @@ const ChatPanelBody = () => {
       isLoading={isLoading}
       onStop={stop}
       fileInputRef={fileInputRef}
-      onAddFiles={onAddFiles}
+      onAddFiles={addFiles}
       onClose={handleOnCloseThread}
     />
   ) : (
@@ -749,7 +689,7 @@ const ChatPanelBody = () => {
       onStop={stop}
       onClose={() => newMessageInputRef.current?.editor?.blur()}
       fileInputRef={fileInputRef}
-      onAddFiles={onAddFiles}
+      onAddFiles={addFiles}
     />
   );
 
@@ -810,7 +750,7 @@ const ChatPanelBody = () => {
 
         {error && (
           <div className="flex items-center justify-center space-x-2 mb-4">
-            <ErrorBanner error={error} />
+            <ErrorBanner error={error || new Error("Unknown error")} />
             <Button variant="outline" size="sm" onClick={handleReload}>
               Retry
             </Button>

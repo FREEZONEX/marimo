@@ -1094,6 +1094,12 @@ class TestTableGetValueCounts:
         assert value_counts == [ValueCount(value="1", count=2)]
 
 
+def test_table_download_file_name() -> None:
+    my_data = {"a": [1, 2, 3]}
+    t = ui.table(my_data)
+    assert t._component_args["download-file-name"] == "my_data"
+
+
 def test_table_with_frozen_columns() -> None:
     data = {
         "a": list(range(20)),
@@ -1582,7 +1588,9 @@ def test_column_clamping_with_dataframes(df: Any):
     assert table._component_args["max-columns"] == DEFAULT_MAX_COLUMNS
     json_data = json.loads(table._component_args["data"])
     headers = json_data[0].keys()
-    assert len(headers) == DEFAULT_MAX_COLUMNS  # 50 columns
+    assert (
+        len(headers) == DEFAULT_MAX_COLUMNS + 1
+    )  # 50 columns + _marimo_row_id
     # Field types are not clamped
     assert len(table._component_args["field-types"]) == 60
 
@@ -1594,7 +1602,7 @@ def test_column_clamping_with_dataframes(df: Any):
     assert table._component_args["max-columns"] == 40
     json_data = json.loads(table._component_args["data"])
     headers = json_data[0].keys()
-    assert len(headers) == 40  # 40 columns
+    assert len(headers) == 41  # 40 columns + _marimo_row_id
     # Field types aren't clamped
     assert len(table._component_args["field-types"]) == 60
 
@@ -1609,6 +1617,57 @@ def test_column_clamping_with_dataframes(df: Any):
 
     assert len(headers) == 61  # 60 columns + 1 selection column
     assert len(table._component_args["field-types"]) == 60
+
+
+@pytest.mark.parametrize(
+    "df",
+    create_dataframes(
+        {
+            "person": ["Alice", "Bob", "Charlie"],
+            "age": [20, 30, 40],
+            **{f"col{i}": [1, 2, 3] for i in range(49)},
+        },
+        exclude=NON_EAGER_LIBS,
+    ),
+)
+def test_selection_with_clamped_columns_and_filter(df: Any):
+    """Regression test for #8029: selection returns wrong row when table
+    has more columns than max_columns and is filtered."""
+    import narwhals as nw
+
+    table = ui.table(df, max_columns=50)
+
+    # The data sent to frontend should include _marimo_row_id
+    # even when columns are clamped
+    json_data = json.loads(table._component_args["data"])
+    assert INDEX_COLUMN_NAME in json_data[0]
+
+    # Apply a filter to show only rows where age >= 30
+    # (should return Bob and Charlie, with _marimo_row_id 1 and 2)
+    search_args = SearchTableArgs(
+        page_size=10,
+        page_number=0,
+        filters=[Condition(column_id="age", operator=">=", value=30)],
+    )
+    response = table._search(search_args)
+    result_data = json.loads(response.data)
+
+    # Filtered data should still include _marimo_row_id
+    assert INDEX_COLUMN_NAME in result_data[0]
+    assert len(result_data) == 2  # Bob and Charlie
+
+    # Select row with _marimo_row_id=2 (Charlie)
+    value = table._convert_value(["2"])
+    assert not isinstance(value, nw.DataFrame)
+    nw_value = nw.from_native(value)
+    assert nw_value["person"][0] == "Charlie"
+    assert nw_value["age"][0] == 40
+
+    # Select row with _marimo_row_id=1 (Bob)
+    value = table._convert_value(["1"])
+    nw_value = nw.from_native(value)
+    assert nw_value["person"][0] == "Bob"
+    assert nw_value["age"][0] == 30
 
 
 @pytest.mark.skipif(
@@ -2551,3 +2610,84 @@ def test_polars_enums_in_list():
         response_next_page.data
         == '[{"value":["C"]},{"value":["D"]},{"value":["A"]},{"value":["B"]},{"value":["C"]}]'
     )
+
+
+def test_search_returns_raw_data_with_format_mapping() -> None:
+    data = {"a": [1, 2, 3], "b": [4, 5, 6]}
+    table = ui.table(
+        data,  # pyright: ignore[reportArgumentType]
+        format_mapping={"a": lambda x: f"formatted_{x}"},
+    )
+
+    result = table._search(SearchTableArgs(page_size=10, page_number=0))
+
+    assert json.loads(result.data) == [
+        {"a": "formatted_1", "b": 4},
+        {"a": "formatted_2", "b": 5},
+        {"a": "formatted_3", "b": 6},
+    ]
+
+    assert result.raw_data is not None
+    assert json.loads(result.raw_data) == [
+        {"a": 1, "b": 4},
+        {"a": 2, "b": 5},
+        {"a": 3, "b": 6},
+    ]
+
+
+def test_search_returns_no_raw_data_without_format_mapping() -> None:
+    data = {"a": [1, 2, 3]}
+    table = ui.table(data)  # pyright: ignore[reportArgumentType]
+
+    result = table._search(SearchTableArgs(page_size=10, page_number=0))
+
+    assert result.raw_data is None
+
+
+def test_initial_args_include_raw_data_with_format_mapping() -> None:
+    data = {"a": [10, 20], "b": ["x", "y"]}
+    table = ui.table(
+        data,
+        format_mapping={"a": lambda x: x * 10},
+    )
+
+    raw_data = table._component_args["raw-data"]
+    assert isinstance(raw_data, str)
+    assert json.loads(raw_data) == [
+        {"a": 10, "b": "x"},
+        {"a": 20, "b": "y"},
+    ]
+    formatted_data = table._component_args["data"]
+    assert isinstance(formatted_data, str)
+    assert json.loads(formatted_data) == [
+        {"a": 100, "b": "x"},
+        {"a": 200, "b": "y"},
+    ]
+
+
+def test_initial_args_no_raw_data_without_format_mapping() -> None:
+    data = {"a": [1, 2]}
+    table = ui.table(data)  # pyright: ignore[reportArgumentType]
+
+    assert table._component_args["raw-data"] is None
+
+
+def test_search_raw_data_with_query_and_format_mapping() -> None:
+    data = {"name": ["alice", "bob", "charlie"], "score": [10, 20, 30]}
+    table = ui.table(
+        data,
+        format_mapping={"score": lambda x: f"{x}%"},
+    )
+
+    result = table._search(
+        SearchTableArgs(query="bob", page_size=10, page_number=0)
+    )
+
+    assert json.loads(result.data) == [
+        {"name": "bob", "score": "20%"},
+    ]
+
+    assert result.raw_data is not None
+    assert json.loads(result.raw_data) == [
+        {"name": "bob", "score": 20},
+    ]

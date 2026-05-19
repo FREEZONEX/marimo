@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 from starlette.authentication import requires
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -90,6 +90,42 @@ async def status(request: Request) -> JSONResponse:
             "lsp_running": app_state.session_manager.lsp_server.is_running(),
         }
     )
+
+
+class SessionInfo(TypedDict):
+    filename: str | None
+    path: str | None
+
+
+@router.get("/api/sessions", include_in_schema=False)
+@requires("edit")
+async def list_sessions(request: Request) -> JSONResponse:
+    """List active session IDs and their notebook paths.
+
+    Only available when the server was started without an auth token
+    (``--no-token``) and without skew protection
+    (``--no-skew-protection``).
+    """
+
+    state = AppState(request)
+
+    if state.enable_auth or state.skew_protection:
+        return JSONResponse(
+            {
+                "error": "Session listing requires --no-token and "
+                "--no-skew-protection"
+            },
+            status_code=403,
+        )
+
+    sessions = {
+        session_id: SessionInfo(
+            filename=session.app_file_manager.filename,
+            path=session.app_file_manager.path,
+        )
+        for session_id, session in state.session_manager.sessions.items()
+    }
+    return JSONResponse(sessions)
 
 
 @router.get("/api/version")
@@ -221,31 +257,36 @@ async def usage(request: Request) -> JSONResponse:
         # subsequent calls return delta since last call
         cpu = psutil.cpu_percent(interval=None)
 
-    # Server memory (and children)
-    main_process = psutil.Process()
-    server_memory = main_process.memory_info().rss
-    children = main_process.children(recursive=True)
-    for child in children:
-        try:
-            server_memory += child.memory_info().rss
-        except psutil.NoSuchProcess:
-            pass
-
-    # Kernel memory
+    # Collect kernel PIDs first so we can exclude them from server memory
     kernel_memory: Optional[int] = None
+    kernel_pids: set[int] = set()
     session = AppState(request).get_current_session()
     try:
         if session and (pid := session.kernel_pid()) is not None:
             kernel_process = psutil.Process(pid)
+            kernel_pids.add(kernel_process.pid)
             kernel_memory = kernel_process.memory_info().rss
             kernel_children = kernel_process.children(recursive=True)
             for child in kernel_children:
+                kernel_pids.add(child.pid)
                 try:
                     kernel_memory += child.memory_info().rss
                 except psutil.NoSuchProcess:
                     pass
     except psutil.ZombieProcess:
         LOGGER.warning("Kernel process is a zombie")
+
+    # Server memory (excluding kernel processes to avoid double-counting)
+    main_process = psutil.Process()
+    server_memory = main_process.memory_info().rss
+    children = main_process.children(recursive=True)
+    for child in children:
+        if child.pid in kernel_pids:
+            continue
+        try:
+            server_memory += child.memory_info().rss
+        except psutil.NoSuchProcess:
+            pass
 
     # GPU stats
     gpu_stats: list[dict[str, Any]] = []

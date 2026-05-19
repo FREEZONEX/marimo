@@ -20,7 +20,11 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Concatenate,
+    Generic,
     Optional,
+    ParamSpec,
+    TypeVar,
     Union,
     cast,
     overload,
@@ -31,7 +35,7 @@ from marimo._ast.load import find_cell
 from marimo._ast.transformers import (
     ARG_PREFIX,
     CacheExtractWithBlock,
-    strip_function,
+    get_hashable_ast,
 )
 from marimo._ast.variables import is_mangled_local, unmangle_local
 from marimo._messaging.tracebacks import write_traceback
@@ -64,13 +68,21 @@ from marimo._types.ids import CellId_t
 from marimo._utils.with_skip import SkipContext
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
     from types import FrameType, TracebackType
+
+    from typing_extensions import Self
 
     from marimo._runtime.dataflow import DirectedGraph
     from marimo._save.stores import Store
 
+P = ParamSpec("P")
+R = TypeVar("R")
+Q = ParamSpec("Q")
+S = TypeVar("S")
 
-class _cache_call(CacheContext):
+
+class _cache_call(CacheContext, Generic[P, R]):
     """Like functools.cache but notebook-aware. See `cache` docstring"""
 
     __slots__ = (
@@ -80,6 +92,8 @@ class _cache_call(CacheContext):
         "pin_modules",
         "hash_type",
         "_args",
+        "_kwonly_args",
+        "_defaults",
         "_var_arg",
         "_var_kwarg",
         "_misses",
@@ -98,6 +112,8 @@ class _cache_call(CacheContext):
     pin_modules: bool
     hash_type: str
     _args: list[str]
+    _kwonly_args: list[str]
+    _defaults: dict[str, Any]
     _var_arg: Optional[str]
     _var_kwarg: Optional[str]
     _misses: int
@@ -127,6 +143,9 @@ class _cache_call(CacheContext):
         self._frame_offset = frame_offset
         self._loader_partial = loader_partial
         self._last_hash = None
+        self._args: list[str] = []
+        self._kwonly_args: list[str] = []
+        self._defaults: dict[str, Any] = {}
         self._var_arg = None
         self._var_kwarg = None
         self._misses = 0
@@ -161,31 +180,28 @@ class _cache_call(CacheContext):
 
         self.__wrapped__ = fn
         sig = inspect.signature(fn)
-        self._args = [
-            param.name
-            for param in sig.parameters.values()
-            if param.kind
-            in (
+
+        self._args = []
+        self._kwonly_args = []
+        self._defaults = {}
+        self._var_arg = None
+        self._var_kwarg = None
+
+        for param in sig.parameters.values():
+            if param.kind in (
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 inspect.Parameter.POSITIONAL_ONLY,
-            )
-        ]
-        self._var_arg = next(
-            (
-                param.name
-                for param in sig.parameters.values()
-                if param.kind == inspect.Parameter.VAR_POSITIONAL
-            ),
-            None,
-        )
-        self._var_kwarg = next(
-            (
-                param.name
-                for param in sig.parameters.values()
-                if param.kind == inspect.Parameter.VAR_KEYWORD
-            ),
-            None,
-        )
+            ):
+                self._args.append(param.name)
+            elif param.kind == inspect.Parameter.KEYWORD_ONLY:
+                self._kwonly_args.append(param.name)
+            elif param.kind == inspect.Parameter.VAR_POSITIONAL:
+                self._var_arg = param.name
+            elif param.kind == inspect.Parameter.VAR_KEYWORD:
+                self._var_kwarg = param.name
+
+            if param.default is not inspect.Parameter.empty:
+                self._defaults[param.name] = param.default
 
         # Retrieving frame from the stack: frame is
         #
@@ -207,8 +223,10 @@ class _cache_call(CacheContext):
         # Scoped refs are references particular to this block, that may not be
         # defined out of the context of the block, or the cell.
         # For instance, the args of the invoked function are restricted to the
-        # block.
-        self.scoped_refs = set([f"{ARG_PREFIX}{k}" for k in self._args])
+        # block. Include both positional and keyword-only args.
+        self.scoped_refs = {
+            f"{ARG_PREFIX}{k}" for k in self._args + self._kwonly_args
+        }
         # As are the "locals" not in globals
         self.scoped_refs |= set(f_locals.keys()) - set(glbls.keys())
         # Defined in the cell, and currently available in scope
@@ -239,7 +257,9 @@ class _cache_call(CacheContext):
     def _build_base_block(
         self, fn: Callable[..., Any], graph: DirectedGraph, cell_id: CellId_t
     ) -> BlockHasher:
-        module = strip_function(fn)
+        module = get_hashable_ast(
+            fn, skip_decorators={"cache", "persistent_cache"}
+        )
 
         return BlockHasher(
             module=module,
@@ -273,12 +293,25 @@ class _cache_call(CacheContext):
         # Rewrite scoped args to prevent shadowed variables
         arg_dict = {f"{ARG_PREFIX}{k}": v for (k, v) in zip(self._args, args)}
         kwargs_copy = {f"{ARG_PREFIX}{k}": v for (k, v) in kwargs.items()}
+        # Fill in default values for arguments not explicitly provided
+        # This ensures cache hashes are based on resolved argument values
+        for arg_name, default_value in self._defaults.items():
+            prefixed_name = f"{ARG_PREFIX}{arg_name}"
+            if (
+                prefixed_name not in arg_dict
+                and prefixed_name not in kwargs_copy
+            ):
+                arg_dict[prefixed_name] = default_value
         # If the function has varargs, we need to capture them as well.
         if self._var_arg is not None:
             arg_dict[f"{ARG_PREFIX}{self._var_arg}"] = args[len(self._args) :]
         if self._var_kwarg is not None:
             # NB: kwargs are always a dict, so we can just copy them.
-            arg_dict[f"{ARG_PREFIX}{self._var_kwarg}"] = kwargs.copy()
+            # Filter out keyword-only args since they're handled separately
+            filtered_kwargs = {
+                k: v for k, v in kwargs.items() if k not in self._kwonly_args
+            }
+            arg_dict[f"{ARG_PREFIX}{self._var_kwarg}"] = filtered_kwargs
 
         # Capture the call case
         ctx = safe_get_context()
@@ -309,7 +342,9 @@ class _cache_call(CacheContext):
             scope,
             self.loader,
             scoped_refs=self.scoped_refs,
-            required_refs=set([f"{ARG_PREFIX}{k}" for k in self._args]),
+            required_refs={
+                f"{ARG_PREFIX}{k}" for k in self._args + self._kwonly_args
+            },
             as_fn=True,
         )
 
@@ -347,9 +382,19 @@ class _cache_call(CacheContext):
         """Return the last computed hash for this cache call."""
         return self._last_hash
 
+    @overload
     def __get__(
-        self, instance: Any, _owner: Optional[type] = None
-    ) -> _cache_call:
+        self, instance: None, owner: Optional[type] = None
+    ) -> Self: ...
+
+    @overload
+    def __get__(
+        self: _cache_call[Concatenate[Any, Q], R],
+        instance: Any,
+        owner: Optional[type] = None,
+    ) -> _cache_call[Q, R]: ...
+
+    def __get__(self, instance: Any, _owner: Optional[type] = None) -> Any:  # type: ignore[misc]
         """Enable @cache as a method decorator.
 
         __get__ is invoked on instance access;
@@ -391,7 +436,23 @@ class _cache_call(CacheContext):
             return copy
         return self
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    @overload
+    def __call__(
+        self, fn: Callable[Q, Coroutine[Any, Any, S]]
+    ) -> _cache_call_async[Q, S]: ...
+
+    @overload
+    def __call__(
+        self,
+        fn: Callable[Q, S],
+    ) -> _cache_call[Q, S]: ...
+
+    @overload
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...
+
+    def __call__(
+        self, *args: Any, **kwargs: Any
+    ) -> _cache_call[Any, Any] | _cache_call_async[Any, Any] | R:
         # Capture the deferred call case
         if self.__wrapped__ is None:
             if len(args) != 1:
@@ -399,8 +460,9 @@ class _cache_call(CacheContext):
                     "cache() takes at most 1 argument (expecting function)"
                 )
             # Check if the function is async - if so, create async variant
-            if inspect.iscoroutinefunction(args[0]):
-                async_copy = _cache_call_async(
+            fn = cast(Callable[..., Any], args[0])
+            if inspect.iscoroutinefunction(fn):
+                async_copy: _cache_call_async[P, R] = _cache_call_async(
                     None,
                     self._loader_partial,
                     pin_modules=self.pin_modules,
@@ -408,13 +470,13 @@ class _cache_call(CacheContext):
                 )
                 async_copy._frame_offset = self._frame_offset
                 async_copy._frame_offset -= 4
-                async_copy._set_context(args[0])
-                return async_copy
+                async_copy._set_context(fn)
+                return async_copy  # type: ignore[return-value]
             # Remove the additional frames from singledispatch, because invoking
             # the function directly.
             self._frame_offset -= 4
-            self._set_context(args[0])
-            return self
+            self._set_context(fn)
+            return self  # type: ignore[return-value]
 
         # Prepare execution context
         scope, ctx, attempt = self._prepare_call_execution(args, kwargs)
@@ -424,7 +486,7 @@ class _cache_call(CacheContext):
         try:
             if attempt.hit:
                 attempt.restore(scope)
-                return attempt.meta.get("return")
+                return cast(R, attempt.meta.get("return"))
 
             start_time = time.time()
             response = self.__wrapped__(*args, **kwargs)
@@ -439,10 +501,10 @@ class _cache_call(CacheContext):
             if ctx and not failed:
                 ctx.cell_lifecycle_registry.add(SideEffect(attempt.hash))
         self._misses += 1
-        return response
+        return cast(R, response)
 
 
-class _cache_call_async(_cache_call):
+class _cache_call_async(_cache_call[P, R]):
     """Async variant of _cache_call for async/await functions.
 
     Inherits all caching logic from _cache_call but provides an async
@@ -457,23 +519,28 @@ class _cache_call_async(_cache_call):
     # WeakKeyDictionary ensures instances are cleaned up when garbage collected
     # Key: cache instance, Value: dict of {cache_key: Task}
     _pending_executions: weakref.WeakKeyDictionary[
-        _cache_call_async, dict[str, asyncio.Task[Any]]
+        _cache_call_async[Any, Any], dict[str, asyncio.Task[Any]]
     ] = weakref.WeakKeyDictionary()
     _pending_lock = threading.Lock()
 
-    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        # Capture the deferred call case
-        if self.__wrapped__ is None:
-            if len(args) != 1:
-                raise TypeError(
-                    "cache() takes at most 1 argument (expecting function)"
-                )
-            # Remove the additional frames from singledispatch, because invoking
-            # the function directly.
-            self._frame_offset -= 4
-            self._set_context(args[0])
-            return self
+    @overload
+    def __get__(
+        self, instance: None, owner: Optional[type] = None
+    ) -> Self: ...
 
+    @overload
+    def __get__(
+        self: _cache_call_async[Concatenate[Any, Q], R],
+        instance: Any,
+        owner: Optional[type] = None,
+    ) -> _cache_call_async[Q, R]: ...
+
+    def __get__(self, instance: Any, _owner: Optional[type] = None) -> Any:  # type: ignore[misc]
+        return super().__get__(instance, _owner)
+
+    async def __call__(  # type: ignore[override]
+        self, *args: P.args, **kwargs: P.kwargs
+    ) -> R:
         # Prepare execution context to get cache key
         scope, ctx, attempt = self._prepare_call_execution(args, kwargs)
         cache_key = attempt.hash
@@ -491,7 +558,7 @@ class _cache_call_async(_cache_call):
 
         # Await the existing task AFTER releasing the lock to avoid deadlock
         if existing_task is not None:
-            return await existing_task
+            return cast(R, await existing_task)
 
         # No pending execution - create a new task
         task = asyncio.create_task(
@@ -512,7 +579,7 @@ class _cache_call_async(_cache_call):
                 if not pending and self in self._pending_executions:
                     del self._pending_executions[self]
 
-        return result
+        return cast(R, result)
 
     async def _execute_cached(
         self,
@@ -767,7 +834,7 @@ def _cache_invocation(
     *args: Any,
     frame_offset: int = 1,
     **kwargs: Any,
-) -> Union[_cache_call, _cache_context]:
+) -> Union[_cache_call[Any, Any], _cache_context]:
     del loader, args, kwargs, frame_offset
     raise TypeError(f"Invalid type for cache: {type(arg)}")
 
@@ -778,7 +845,7 @@ def _invoke_call(
     *args: Any,
     frame_offset: int = 1,
     **kwargs: Any,
-) -> Union[_cache_call, _cache_call_async]:
+) -> Union[_cache_call[Any, Any], _cache_call_async[Any, Any]]:
     if isinstance(loader, Loader):
         raise TypeError(
             "A loader instance cannot be passed to cache directly. "
@@ -817,7 +884,7 @@ def _invoke_call_none(
     *args: Any,
     frame_offset: int = 1,
     **kwargs: Any,
-) -> _cache_call:
+) -> _cache_call[Any, Any]:
     return _invoke_call(
         _fn, loader, *args, frame_offset=frame_offset + 1, **kwargs
     )
@@ -831,7 +898,7 @@ def _invoke_call_fn(
     *args: Any,
     frame_offset: int = 1,
     **kwargs: Any,
-) -> Union[_cache_call, _cache_call_async]:
+) -> Union[_cache_call[Any, Any], _cache_call_async[Any, Any]]:
     return _invoke_call(
         _fn, loader, *args, frame_offset=frame_offset + 1, **kwargs
     )
@@ -865,10 +932,26 @@ def _invoke_context(
 
 @overload
 def cache(
-    fn: Optional[Callable[..., Any]] = None,
+    fn: Callable[P, Coroutine[Any, Any, R]],
     pin_modules: bool = False,
     loader: LoaderPartial | LoaderType = MemoryLoader,
-) -> _cache_call: ...
+) -> _cache_call_async[P, R]: ...
+
+
+@overload
+def cache(
+    fn: Callable[P, R],
+    pin_modules: bool = False,
+    loader: LoaderPartial | LoaderType = MemoryLoader,
+) -> _cache_call[P, R]: ...
+
+
+@overload
+def cache(
+    fn: None = None,
+    pin_modules: bool = False,
+    loader: LoaderPartial | LoaderType = MemoryLoader,
+) -> _cache_call[Any, Any]: ...
 
 
 @overload
@@ -887,7 +970,7 @@ def cache(  # type: ignore[misc]
     _frame_offset: int = 1,
     _internal_interface_not_for_external_use: None = None,
     **kwargs: Any,
-) -> Union[_cache_call, _cache_context]:
+) -> Union[_cache_call[Any, Any], _cache_call_async[Any, Any], _cache_context]:
     """## Cache the value of a function based on args and closed-over variables.
 
     Decorating a function with `@mo.cache` will cache its value based on
@@ -974,10 +1057,26 @@ def cache(  # type: ignore[misc]
 
 @overload
 def lru_cache(
-    fn: Optional[Callable[..., Any]] = None,
+    fn: Callable[P, Coroutine[Any, Any, R]],
     maxsize: int = 128,
     pin_modules: bool = False,
-) -> _cache_call: ...
+) -> _cache_call_async[P, R]: ...
+
+
+@overload
+def lru_cache(
+    fn: Callable[P, R],
+    maxsize: int = 128,
+    pin_modules: bool = False,
+) -> _cache_call[P, R]: ...
+
+
+@overload
+def lru_cache(
+    fn: None = None,
+    maxsize: int = 128,
+    pin_modules: bool = False,
+) -> _cache_call[Any, Any]: ...
 
 
 @overload
@@ -985,7 +1084,7 @@ def lru_cache(
     name: str,
     maxsize: int = 128,
     pin_modules: bool = False,
-) -> _cache_call: ...
+) -> _cache_context: ...
 
 
 def lru_cache(  # type: ignore[misc]
@@ -995,7 +1094,7 @@ def lru_cache(  # type: ignore[misc]
     pin_modules: bool = False,
     _internal_interface_not_for_external_use: None = None,
     **kwargs: Any,
-) -> Union[_cache_call, _cache_context]:
+) -> Union[_cache_call[Any, Any], _cache_call_async[Any, Any], _cache_context]:
     """Decorator for LRU caching the return value of a function.
 
     `mo.lru_cache` is a version of `mo.cache` with a bounded cache size. As an
@@ -1040,7 +1139,9 @@ def lru_cache(  # type: ignore[misc]
         )
 
     return cast(
-        Union[_cache_call, _cache_context],
+        Union[
+            _cache_call[Any, Any], _cache_call_async[Any, Any], _cache_context
+        ],
         cache(  # type: ignore[call-overload]
             arg,
             *args,
@@ -1054,20 +1155,38 @@ def lru_cache(  # type: ignore[misc]
 
 @overload
 def persistent_cache(
+    fn: Callable[P, Coroutine[Any, Any, R]],
+    save_path: str | None = None,
+    method: LoaderKey = "pickle",
+    pin_modules: bool = False,
+) -> _cache_call_async[P, R]: ...
+
+
+@overload
+def persistent_cache(
+    fn: Callable[P, R],
+    save_path: str | None = None,
+    method: LoaderKey = "pickle",
+    pin_modules: bool = False,
+) -> _cache_call[P, R]: ...
+
+
+@overload
+def persistent_cache(
+    fn: None = None,
+    save_path: str | None = None,
+    method: LoaderKey = "pickle",
+    pin_modules: bool = False,
+) -> _cache_call[Any, Any]: ...
+
+
+@overload
+def persistent_cache(
     name: str,
     save_path: str | None = None,
     method: LoaderKey = "pickle",
     pin_modules: bool = False,
 ) -> _cache_context: ...
-
-
-@overload
-def persistent_cache(
-    fn: Optional[Callable[..., Any]] = None,
-    save_path: str | None = None,
-    method: LoaderKey = "pickle",
-    pin_modules: bool = False,
-) -> _cache_call: ...
 
 
 def persistent_cache(  # type: ignore[misc]
@@ -1080,7 +1199,7 @@ def persistent_cache(  # type: ignore[misc]
     pin_modules: bool = False,
     _internal_interface_not_for_external_use: None = None,
     **kwargs: Any,
-) -> Union[_cache_call, _cache_context]:
+) -> Union[_cache_call[Any, Any], _cache_call_async[Any, Any], _cache_context]:
     """## Context manager to save variables to disk and restore them thereafter.
 
     The `mo.persistent_cache` context manager lets you delimit a block of code
@@ -1189,7 +1308,9 @@ def persistent_cache(  # type: ignore[misc]
         raise TypeError("Do not use fn directly, use positional arguments.")
 
     return cast(
-        Union[_cache_call, _cache_context],
+        Union[
+            _cache_call[Any, Any], _cache_call_async[Any, Any], _cache_context
+        ],
         cache(  # type: ignore[call-overload]
             arg,
             *args,

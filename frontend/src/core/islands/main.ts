@@ -13,6 +13,10 @@ import "iconify-icon";
 
 import { toast } from "@/components/ui/use-toast";
 import { renderHTML } from "@/plugins/core/RenderHTML";
+import {
+  handleWidgetMessage,
+  MODEL_MANAGER,
+} from "@/plugins/impl/anywidget/model";
 import { initializePlugins } from "@/plugins/plugins";
 import { logNever } from "@/utils/assertNever";
 import { Functions } from "@/utils/functions";
@@ -24,7 +28,6 @@ import {
   notebookAtom,
   notebookReducer,
 } from "../cells/cells";
-import type { UIElementId } from "../cells/ids";
 import { defineCustomElement } from "../dom/defineCustomElement";
 import { MarimoValueInputEvent } from "../dom/events";
 import { UI_ELEMENT_REGISTRY } from "../dom/uiregistry";
@@ -37,7 +40,6 @@ import {
 import { queryParamHandlers } from "../kernel/queryParamHandlers";
 import { RuntimeState } from "../kernel/RuntimeState";
 import { initialModeAtom } from "../mode";
-import type { RequestId } from "../network/DeferredRequestRegistry";
 import { requestClientAtom } from "../network/requests";
 import { store } from "../state/jotai";
 import { IslandsPyodideBridge } from "./bridge";
@@ -122,6 +124,9 @@ export async function initialize() {
       case "datasets":
       case "data-source-connections":
       case "validate-sql-result":
+      case "storage-namespaces":
+      case "storage-entries":
+      case "storage-download-ready":
       case "secret-keys-result":
       case "startup-logs":
         // Unsupported
@@ -146,7 +151,7 @@ export async function initialize() {
         return;
       case "send-ui-element-message":
         UI_ELEMENT_REGISTRY.broadcastMessage(
-          msg.data.ui_element as UIElementId,
+          msg.data.ui_element,
           msg.data.message,
           safeExtractSetUIElementMessageBuffers(msg.data),
         );
@@ -156,10 +161,7 @@ export async function initialize() {
         handleRemoveUIElements(msg.data);
         return;
       case "function-call-result":
-        FUNCTIONS_REGISTRY.resolve(
-          msg.data.function_call_id as RequestId,
-          msg.data,
-        );
+        FUNCTIONS_REGISTRY.resolve(msg.data.function_call_id, msg.data);
         return;
       case "cell-op":
         handleCellNotificationeration(msg.data, actions.handleCellMessage);
@@ -193,6 +195,9 @@ export async function initialize() {
       case "cache-info":
         return;
       case "kernel-startup-error":
+        return;
+      case "model-lifecycle":
+        handleWidgetMessage(MODEL_MANAGER, msg.data);
         return;
       default:
         logNever(msg.data);

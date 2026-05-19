@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from marimo._ast.names import SETUP_CELL_NAME
@@ -25,6 +26,7 @@ from marimo._runtime.executor import (
 )
 from marimo._runtime.patches import (
     create_main_module,
+    extract_docstring_from_header,
     patch_main_module_context,
 )
 from marimo._types.ids import CellId_t
@@ -44,6 +46,7 @@ class AppScriptRunner:
     ) -> None:
         self.app = app
         self.filename = filename
+        self._docstring = extract_docstring_from_header(app._app._header)
         self.cells_cancelled: set[CellId_t] = set()
         self._glbls = glbls if glbls else {}
 
@@ -56,12 +59,12 @@ class AppScriptRunner:
             excluded=CellId_t(SETUP_CELL_NAME),
         )
 
-        self.cells_to_run = [
+        self.cells_to_run: deque[CellId_t] = deque(
             cid
             for cid in pruned_execution_order
             if app.cell_manager.cell_data_at(cid).cell is not None
             and not self.app.graph.is_disabled(cid)
-        ]
+        )
         self._executor = get_executor(ExecutionConfig())
 
     def _cancel(self, cell_id: CellId_t) -> None:
@@ -82,7 +85,10 @@ class AppScriptRunner:
     ) -> RunOutput:
         with patch_main_module_context(
             create_main_module(
-                file=self.filename, input_override=None, print_override=None
+                file=self.filename,
+                input_override=None,
+                print_override=None,
+                doc=self._docstring,
             )
         ) as module:
             glbls = module.__dict__
@@ -90,7 +96,7 @@ class AppScriptRunner:
 
             outputs: dict[CellId_t, Any] = {}
             while self.cells_to_run:
-                cid = self.cells_to_run.pop(0)
+                cid = self.cells_to_run.popleft()
                 if cid in self.cells_cancelled:
                     continue
                 # Set up has already run in this case.
@@ -124,7 +130,10 @@ class AppScriptRunner:
     ) -> RunOutput:
         with patch_main_module_context(
             create_main_module(
-                file=self.filename, input_override=None, print_override=None
+                file=self.filename,
+                input_override=None,
+                print_override=None,
+                doc=self._docstring,
             )
         ) as module:
             glbls = module.__dict__
@@ -133,7 +142,7 @@ class AppScriptRunner:
             outputs: dict[CellId_t, Any] = {}
 
             while self.cells_to_run:
-                cid = self.cells_to_run.pop(0)
+                cid = self.cells_to_run.popleft()
                 if cid in self.cells_cancelled:
                     continue
 
