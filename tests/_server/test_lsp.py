@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Union, cast
+import signal
+from typing import TYPE_CHECKING, Literal, cast
 from unittest import mock
 
 import pytest
@@ -27,6 +28,7 @@ from marimo._server.lsp import (
     TyServer,
     any_lsp_server_running,
 )
+from marimo._utils.platform import is_windows
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -55,7 +57,7 @@ def mock_which():
 class MockLspServer(BaseLspServer):
     id = "mock"
 
-    def validate_requirements(self) -> Union[str, Literal[True]]:
+    def validate_requirements(self) -> str | Literal[True]:
         return True
 
     def get_command(self) -> list[str]:
@@ -92,11 +94,21 @@ async def test_base_lsp_server_start_stop(
         server.is_running() is True
     )  # Process exists and is running (returncode is None)
 
-    # Test stop
-    server.stop()
-    mock_process.terminate.assert_called_once()
+    # Test stop - on Unix, should kill the process group
+    if is_windows():
+        server.stop()
+        mock_process.terminate.assert_called_once()
+    else:
+        mock_process.pid = 12345
+        with (
+            mock.patch("os.getpgid", return_value=12345) as mock_getpgid,
+            mock.patch("os.killpg") as mock_killpg,
+        ):
+            server.stop()
+            mock_getpgid.assert_called_once_with(12345)
+            mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
     # Verify wait was called with timeout for graceful shutdown
-    mock_process.wait.assert_called_once_with(timeout=5)
+    mock_process.wait.assert_called_once_with(timeout=2)
     assert server.process is None
 
 
@@ -118,17 +130,51 @@ async def test_base_lsp_server_stop_force_kill_on_timeout(
 
     # Make wait() raise TimeoutExpired to simulate hung process
     mock_process.wait.side_effect = [
-        subprocess.TimeoutExpired("cmd", 5),  # First wait (terminate)
+        subprocess.TimeoutExpired("cmd", 2),  # First wait (terminate)
         None,  # Second wait (after kill)
     ]
 
-    # Test stop with force kill
-    server.stop()
+    if is_windows():
+        server.stop()
+        mock_process.terminate.assert_called_once()
+        mock_process.kill.assert_called_once()
+    else:
+        mock_process.pid = 12345
+        with (
+            mock.patch("os.getpgid", return_value=12345),
+            mock.patch("os.killpg") as mock_killpg,
+        ):
+            server.stop()
+            # Should have been called twice: SIGTERM then SIGKILL
+            assert mock_killpg.call_count == 2
+            mock_killpg.assert_any_call(12345, signal.SIGTERM)
+            mock_killpg.assert_any_call(12345, signal.SIGKILL)
 
-    mock_process.terminate.assert_called_once()
-    mock_process.kill.assert_called_once()
     # wait should be called twice: once after terminate, once after kill
     assert mock_process.wait.call_count == 2
+    assert server.process is None
+
+
+@pytest.mark.skipif(is_windows(), reason="Unix-only process group test")
+async def test_base_lsp_server_stop_noop_on_process_lookup_error(
+    mock_popen: mock.MagicMock,
+    mock_process: mock.MagicMock,
+):
+    """Test that stop() treats ProcessLookupError as a no-op (already exited)."""
+    del mock_popen
+
+    server = MockLspServer(port=8000)
+    server.validate_requirements = mock.MagicMock(return_value=True)
+
+    with mock.patch.object(server, "_wait_until_ready", return_value=True):
+        await server.start()
+
+    mock_process.pid = 12345
+    with mock.patch("os.getpgid", side_effect=ProcessLookupError):
+        server.stop()
+        # ProcessLookupError means process already exited; should not
+        # fall back to terminate/kill.
+        mock_process.terminate.assert_not_called()
     assert server.process is None
 
 

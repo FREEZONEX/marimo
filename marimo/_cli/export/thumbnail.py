@@ -5,7 +5,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -199,7 +199,7 @@ async def _generate_thumbnails(
     height: int,
     scale: int,
     timeout_ms: int,
-    output: Optional[Path],
+    output: Path | None,
     overwrite: bool,
     include_code: bool,
     execute: bool,
@@ -208,7 +208,7 @@ async def _generate_thumbnails(
     sandbox_mode: SandboxMode | None,
 ) -> None:
     from marimo._cli.sandbox import SandboxMode
-    from marimo._metadata.opengraph import default_opengraph_image
+    from marimo._metadata.opengraph import default_opengraph_image_abs
 
     failures: list[tuple[MarimoPath, Exception]] = []
 
@@ -255,12 +255,12 @@ async def _generate_thumbnails(
 
                 for index, notebook in enumerate(notebooks):
                     try:
-                        notebook_dir = notebook.path.parent
                         out_path = (
                             output
                             if output is not None
-                            else notebook_dir
-                            / default_opengraph_image(str(notebook.path))
+                            else default_opengraph_image_abs(
+                                str(notebook.path)
+                            )
                         )
                         if out_path.exists() and not overwrite:
                             echo(
@@ -431,11 +431,11 @@ def thumbnail(
     height: int,
     scale: int,
     timeout_ms: int,
-    output: Optional[Path],
+    output: Path | None,
     overwrite: bool,
     include_code: bool,
     execute: bool,
-    sandbox: Optional[bool],
+    sandbox: bool | None,
     continue_on_error: bool,
     args: tuple[str, ...],
 ) -> None:

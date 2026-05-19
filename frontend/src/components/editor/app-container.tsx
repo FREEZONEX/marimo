@@ -15,6 +15,7 @@ interface Props {
   connection: ConnectionStatus;
   isRunning: boolean;
   width: AppConfig["width"];
+  onReconnect?: () => void;
 }
 
 export const AppContainer: React.FC<PropsWithChildren<Props>> = ({
@@ -22,16 +23,21 @@ export const AppContainer: React.FC<PropsWithChildren<Props>> = ({
   connection,
   isRunning,
   children,
+  onReconnect,
 }) => {
   const connectionState = connection.state;
 
   return (
     <>
       <DynamicFavicon isRunning={isRunning} />
-      <StatusOverlay connection={connection} isRunning={isRunning} />
+      <StatusOverlay
+        connection={connection}
+        isRunning={isRunning}
+        onReconnect={onReconnect}
+      />
       <PyodideLoader>
         <WrappedWithSidebar>
-          {/** biome-ignore lint/correctness/useUniqueElementIds: ID is used by other components to grab the DOM element */}
+          {/** oxlint-ignore-next-line -- ID is used by other components to grab the DOM element */}
           <div
             id="App"
             data-config-width={width}

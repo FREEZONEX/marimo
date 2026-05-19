@@ -1,17 +1,14 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Any,
-    Callable,
     Final,
     Literal,
-    Optional,
     TypedDict,
-    Union,
 )
 
 from marimo import _loggers
@@ -20,7 +17,7 @@ from marimo._plugins.ui._core.ui_element import UIElement
 from marimo._plugins.validators import validate_one_of
 from marimo._runtime.functions import Function
 from marimo._utils.files import natural_sort
-from marimo._utils.paths import normalize_path
+from marimo._utils.paths import is_cloudpath, normalize_path
 
 LOGGER = _loggers.marimo_logger()
 
@@ -141,17 +138,16 @@ class file_browser(
 
     def __init__(
         self,
-        initial_path: Union[str, Path] = "",
-        filetypes: Optional[Sequence[str]] = None,
+        initial_path: str | Path = "",
+        filetypes: Sequence[str] | None = None,
         selection_mode: Literal["file", "directory"] = "file",
         multiple: bool = True,
         restrict_navigation: bool = False,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         label: str = "",
-        on_change: Optional[
-            Callable[[Sequence[FileBrowserFileInfo]], None]
-        ] = None,
+        on_change: Callable[[Sequence[FileBrowserFileInfo]], None]
+        | None = None,
         ignore_empty_dirs: bool = False,
     ) -> None:
         validate_one_of(selection_mode, ["file", "directory"])
@@ -198,8 +194,7 @@ class file_browser(
 
         # Smart default limit based on path type
         if limit is None:
-            # Check if it's a cloud path
-            if self._path_cls.__module__.startswith("cloudpathlib"):
+            if is_cloudpath(self._initial_path):
                 limit = 50  # Conservative for cloud storage
             else:
                 limit = 10000  # High limit for local filesystems
@@ -298,16 +293,22 @@ class file_browser(
         # such as CloudPath
         path = self._create_path(args.path)
 
-        if self._restrict_navigation and path in self._initial_path.parents:
-            raise RuntimeError(
-                "Navigation is restricted; navigating to a parent of initial path is not allowed."
-            )
+        if self._restrict_navigation:
+            try:
+                path.resolve(strict=True).relative_to(
+                    self._initial_path.resolve()
+                )
+            # NB. RuntimeError vs OSError depends on the version of python.
+            except (ValueError, RuntimeError, OSError):
+                raise RuntimeError(
+                    "Navigation is restricted; navigating outside the initial path is not allowed."
+                ) from None
         folders: list[TypedFileBrowserFileInfo] = []
         files: list[TypedFileBrowserFileInfo] = []
 
         # Sort based on natural sort (alpha, then num)
         all_file_paths = sorted(
-            list(path.iterdir()), key=lambda f: natural_sort(f.name)
+            path.iterdir(), key=lambda f: natural_sort(f.name)
         )
         is_truncated = False
 
@@ -368,7 +369,7 @@ class file_browser(
             for file in value
         )
 
-    def name(self, index: int = 0) -> Optional[str]:
+    def name(self, index: int = 0) -> str | None:
         """Get file name at index.
 
         Args:
@@ -384,7 +385,7 @@ class file_browser(
         else:
             return self.value[index].name
 
-    def path(self, index: int = 0) -> Optional[Path]:
+    def path(self, index: int = 0) -> Path | None:
         """Get file path at index.
 
         Args:

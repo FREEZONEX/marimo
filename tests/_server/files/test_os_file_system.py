@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Literal
 
 import pytest
 
-from marimo._server.files.os_file_system import OSFileSystem
+from marimo._server.files.os_file_system import (
+    OSFileSystem,
+    UploadTooLargeError,
+    _claim_unique_path,
+    _generate_unique_path,
+    _is_allowed_paths,
+)
 from marimo._server.models.files import FileDetailsResponse
 from marimo._utils.files import natural_sort
 
@@ -107,6 +114,177 @@ def test_create_with_disallowed_name(test_dir: Path, fs: OSFileSystem) -> None:
         fs.create_file_or_directory(str(test_dir), "file", ".", None)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../escaped.txt",
+        "../../escaped.txt",
+        "subdir/nested.txt",
+        "..",
+        ".",
+        "with\\backslash.txt",
+        "embed\x00null.txt",
+    ],
+)
+def test_create_rejects_path_traversal(
+    test_dir: Path, fs: OSFileSystem, name: str
+) -> None:
+    with pytest.raises(ValueError):
+        fs.create_file_or_directory(str(test_dir), "file", name, b"data")
+    # No file should have been written anywhere in or above test_dir
+    assert not (test_dir.parent / "escaped.txt").exists()
+
+
+class _ChunkedSource:
+    """Async byte source emitting predetermined chunks; optionally raises
+    after `fail_after` reads to simulate mid-stream failures."""
+
+    def __init__(
+        self, chunks: list[bytes], *, fail_after: int | None = None
+    ) -> None:
+        self._chunks = list(chunks)
+        self._fail_after = fail_after
+        self._reads = 0
+
+    async def read(self, size: int = -1, /) -> bytes:
+        if self._fail_after is not None and self._reads >= self._fail_after:
+            raise RuntimeError("stream failed")
+        if not self._chunks:
+            return b""
+        chunk = self._chunks[0]
+        if size < 0 or len(chunk) <= size:
+            out = self._chunks.pop(0)
+        else:
+            out, self._chunks[0] = chunk[:size], chunk[size:]
+        self._reads += 1
+        return out
+
+
+def _part_files(directory: Path) -> list[Path]:
+    return list(directory.glob("*.part"))
+
+
+async def test_stream_create_file_writes_chunks(
+    test_dir: Path, fs: OSFileSystem
+) -> None:
+    source = _ChunkedSource([b"hello ", b"streamed ", b"world"])
+    info = await fs.stream_create_file(str(test_dir), "out.bin", source)
+    out_path = test_dir / "out.bin"
+    assert out_path.read_bytes() == b"hello streamed world"
+    assert info.path == str(out_path)
+    assert _part_files(test_dir) == []
+
+
+async def test_stream_create_file_writes_empty_file(
+    test_dir: Path, fs: OSFileSystem
+) -> None:
+    info = await fs.stream_create_file(
+        str(test_dir), "empty.bin", _ChunkedSource([])
+    )
+    out_path = test_dir / "empty.bin"
+    assert out_path.exists()
+    assert out_path.read_bytes() == b""
+    assert info.path == str(out_path)
+    assert _part_files(test_dir) == []
+
+
+async def test_stream_create_file_generates_unique_path(
+    test_dir: Path, fs: OSFileSystem
+) -> None:
+    (test_dir / "dup.bin").write_bytes(b"existing")
+    info = await fs.stream_create_file(
+        str(test_dir), "dup.bin", _ChunkedSource([b"new"])
+    )
+    assert info.path == str(test_dir / "dup_1.bin")
+    assert (test_dir / "dup.bin").read_bytes() == b"existing"
+    assert (test_dir / "dup_1.bin").read_bytes() == b"new"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../escape.bin",
+        "../../escape.bin",
+        "subdir/nested.bin",
+        "..",
+        ".",
+        "with\\backslash.bin",
+        "embed\x00null.bin",
+        "",
+        "   ",
+    ],
+)
+async def test_stream_create_file_rejects_traversal(
+    test_dir: Path, fs: OSFileSystem, name: str
+) -> None:
+    with pytest.raises(ValueError):
+        await fs.stream_create_file(
+            str(test_dir), name, _ChunkedSource([b"x"])
+        )
+    assert not (test_dir.parent / "escape.bin").exists()
+    assert _part_files(test_dir) == []
+
+
+async def test_stream_create_file_cleans_up_on_immediate_failure(
+    test_dir: Path, fs: OSFileSystem
+) -> None:
+    source = _ChunkedSource([], fail_after=0)
+    with pytest.raises(RuntimeError):
+        await fs.stream_create_file(str(test_dir), "no_file.bin", source)
+    assert not (test_dir / "no_file.bin").exists()
+    assert _part_files(test_dir) == []
+
+
+async def test_stream_create_file_cleans_up_on_mid_stream_failure(
+    test_dir: Path, fs: OSFileSystem
+) -> None:
+    # Source fails after writes have already landed in the .part file.
+    source = _ChunkedSource([b"first ", b"second ", b"third"], fail_after=2)
+    with pytest.raises(RuntimeError):
+        await fs.stream_create_file(str(test_dir), "partial.bin", source)
+    assert not (test_dir / "partial.bin").exists()
+    assert _part_files(test_dir) == []
+
+
+async def test_stream_create_file_enforces_size_cap(
+    test_dir: Path, fs: OSFileSystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Shrink the cap so the test is fast; the production value is 1 GiB.
+    monkeypatch.setattr(
+        "marimo._server.files.os_file_system.MAX_UPLOAD_BYTES", 8
+    )
+    source = _ChunkedSource([b"aaaa", b"bbbb", b"too much"])
+    with pytest.raises(UploadTooLargeError, match="exceeds maximum size"):
+        await fs.stream_create_file(str(test_dir), "big.bin", source)
+    assert not (test_dir / "big.bin").exists()
+    assert _part_files(test_dir) == []
+
+
+async def test_stream_create_file_claims_path_atomically(
+    test_dir: Path, fs: OSFileSystem
+) -> None:
+    # Concurrent file at the target name must not be clobbered by the
+    # streaming write — the atomic claim should bump to a new suffix.
+    (test_dir / "race.bin").write_bytes(b"existing")
+    info = await fs.stream_create_file(
+        str(test_dir), "race.bin", _ChunkedSource([b"new"])
+    )
+    assert info.path == str(test_dir / "race_1.bin")
+    assert (test_dir / "race.bin").read_bytes() == b"existing"
+    assert (test_dir / "race_1.bin").read_bytes() == b"new"
+
+
+def test_claim_unique_path_atomic_reservation(test_dir: Path) -> None:
+    claimed_a = _claim_unique_path(test_dir / "claim.bin")
+    assert claimed_a == test_dir / "claim.bin"
+    assert claimed_a.exists()
+    # An existing (even empty) reservation forces the next caller off the
+    # base name — this is what closes the TOCTOU window.
+    claimed_b = _claim_unique_path(test_dir / "claim.bin")
+    assert claimed_b == test_dir / "claim_1.bin"
+    assert claimed_b.exists()
+
+
 def test_list_files(test_dir: Path, fs: OSFileSystem) -> None:
     test_create_file(test_dir, fs)
     test_create_directory(test_dir, fs)
@@ -176,8 +354,18 @@ def test_open_file(test_dir: Path, fs: OSFileSystem) -> None:
     test_content = "Hello, World!"
     file_path = test_dir / test_file_name
     file_path.write_text(test_content)
-    content = fs.open_file(str(file_path))
-    assert content == test_content
+    result = fs.open_file(str(file_path))
+    assert result == test_content
+    assert isinstance(result, str)
+
+
+def test_open_file_binary(test_dir: Path, fs: OSFileSystem) -> None:
+    file_path = test_dir / "binary.bin"
+    raw_bytes = b"\xff\xfe\xfd"
+    file_path.write_bytes(raw_bytes)
+    result = fs.open_file(str(file_path))
+    assert result == raw_bytes
+    assert isinstance(result, bytes)
 
 
 def test_delete_file(test_dir: Path, fs: OSFileSystem) -> None:
@@ -273,10 +461,29 @@ def test_get_details_nonexistent_file(fs: OSFileSystem) -> None:
 
 def test_get_details_binary_file(test_dir: Path, fs: OSFileSystem) -> None:
     file_path = test_dir / "binfile.bin"
+    # These bytes are valid UTF-8, so no base64 encoding needed
     file_path.write_bytes(b"\x00\x01\x02\x03")
     result = fs.get_details(str(file_path))
 
     assert result.contents == "\x00\x01\x02\x03"
+    assert result.is_base64 is False
+
+
+def test_get_details_non_utf8_binary_file(
+    test_dir: Path, fs: OSFileSystem
+) -> None:
+    """Binary files that can't be read as UTF-8 are base64-encoded."""
+    import base64
+
+    file_path = test_dir / "data.prof"
+    raw_bytes = b"\xff\xfe\xfd\x00\x01\x80\x81"
+    file_path.write_bytes(raw_bytes)
+    result = fs.get_details(str(file_path))
+
+    assert result.is_base64 is True
+    assert result.contents == base64.b64encode(raw_bytes).decode("utf-8")
+    # Verify round-trip: decoding base64 gives back original bytes
+    assert base64.b64decode(result.contents) == raw_bytes
 
 
 def test_get_details_empty_string_contents(
@@ -318,13 +525,16 @@ def test_get_details_non_utf8_encoding_and_contents(
     file_path.write_bytes(content)
     result = fs.get_details(str(file_path), encoding="latin-1")
     assert result.contents == "café"
+    assert result.is_base64 is False
     base64_content = __import__("base64").b64encode(content).decode("utf-8")
     result_utf8 = fs.get_details(str(file_path), encoding="utf-8")
     assert result_utf8.contents == base64_content
+    assert result_utf8.is_base64 is True
     result2 = fs.get_details(
         str(file_path), encoding="utf-8", contents="override"
     )
     assert result2.contents == "override"
+    assert result2.is_base64 is False
 
 
 class TestIsMarimoFile:
@@ -649,3 +859,46 @@ def test_search_includes_file_metadata(
     assert file_info.is_directory is False
     assert file_info.is_marimo_file is False
     assert file_info.last_modified is not None
+
+
+def test_generate_unique_path_new_path(tmp_path: Path) -> None:
+    base_path = tmp_path / "file.txt"
+    unique_path = _generate_unique_path(base_path)
+    assert unique_path == base_path
+
+
+def test_generate_unique_path_existing_path(tmp_path: Path) -> None:
+    base_path = tmp_path / "file.txt"
+    base_path.touch()
+    existing_path = tmp_path / "file_1.txt"
+    existing_path.touch()
+
+    unique_path = _generate_unique_path(base_path)
+    assert not unique_path.exists()
+    assert unique_path.name == "file_2.txt"
+
+
+@pytest.mark.parametrize("new_path", [".", "..", ""])
+def test_is_allowed_paths_disallowed_names(new_path: str) -> None:
+    assert not _is_allowed_paths("path/to/file.txt", f"path/to/{new_path}")
+
+
+def test_is_allowed_paths_subdirectory(tmp_path: Path) -> None:
+    base_path = tmp_path / "subdir"
+    base_path.mkdir()
+    assert not _is_allowed_paths(tmp_path, base_path)
+    assert not _is_allowed_paths(base_path, base_path)
+    assert not _is_allowed_paths(base_path, base_path / "../subdir/subsubdir")
+    assert _is_allowed_paths(base_path, base_path / "../subdir2")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Symlinks on Windows require Admin privileges",
+)
+def test_is_allowed_paths_recursive_symlink(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    dst_link = tmp_path / "link_to_src"
+    dst_link.symlink_to(src)
+    assert not _is_allowed_paths(src, dst_link / "child")

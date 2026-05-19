@@ -8,16 +8,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from marimo import _loggers
 from marimo._config.manager import MarimoConfigManager
+from marimo._messaging.notebook.changes import DeleteCell, Transaction
 from marimo._messaging.notification import (
+    NotebookDocumentTransactionNotification,
     ReloadNotification,
-    UpdateCellCodesNotification,
-    UpdateCellIdsNotification,
 )
-from marimo._runtime.commands import DeleteCellCommand, SyncGraphCommand
+from marimo._runtime.commands import SyncGraphCommand
 from marimo._session.model import SessionMode
 from marimo._types.ids import CellId_t
 from marimo._utils import async_path
@@ -35,20 +35,27 @@ class FileChangeResult:
     """Result of handling a file change."""
 
     handled: bool
-    error: Optional[str] = None
-    changed_cell_ids: Optional[set[CellId_t]] = None
+    error: str | None = None
+    changed_cell_ids: set[CellId_t] | None = None
 
 
 class ReloadStrategy(Protocol):
     """Protocol for file reload strategies."""
 
     def handle_reload(
-        self, session: Session, *, changed_cell_ids: set[CellId_t]
+        self,
+        session: Session,
+        *,
+        transaction: Transaction,
+        changed_cell_ids: set[CellId_t],
     ) -> None:
         """Handle reloading after file change.
 
         Args:
             session: The session to reload
+            transaction: Pre-built diff from the pre-reload document to the
+                post-reload state. Strategies that broadcast cell-level
+                changes use this; full-reload strategies can ignore it.
             changed_cell_ids: Set of cell IDs that changed
         """
         ...
@@ -65,15 +72,16 @@ class EditModeReloadStrategy(ReloadStrategy):
         self._config_manager = config_manager
 
     def handle_reload(
-        self, session: Session, *, changed_cell_ids: set[CellId_t]
+        self,
+        session: Session,
+        *,
+        transaction: Transaction,
+        changed_cell_ids: set[CellId_t],
     ) -> None:
         """Handle reload in edit mode with optional auto-run."""
-        # Get the latest codes, cell IDs, names, and configs
         cell_manager = session.app_file_manager.app.cell_manager
-        codes = list(cell_manager.codes())
         cell_ids = list(cell_manager.cell_ids())
-        names = list(cell_manager.names())
-        configs = list(cell_manager.configs())
+        codes = list(cell_manager.codes())
 
         LOGGER.info(
             f"File changed: {session.app_file_manager.path}. "
@@ -81,81 +89,62 @@ class EditModeReloadStrategy(ReloadStrategy):
             f"changed_cell_ids: {changed_cell_ids}"
         )
 
-        # Send the updated cell IDs to the frontend
-        session.notify(
-            UpdateCellIdsNotification(cell_ids=cell_ids),
-            from_consumer_id=None,
-        )
-
-        # Check if we should auto-run cells based on config
-        watcher_on_save = self._config_manager.get_config()["runtime"][
-            "watcher_on_save"
-        ]
-        should_autorun = watcher_on_save == "autorun"
-
-        # Determine deleted cells
         deleted = {
-            cell_id for cell_id in changed_cell_ids if cell_id not in cell_ids
+            change.cell_id
+            for change in transaction.changes
+            if isinstance(change, DeleteCell)
         }
 
-        # Auto-run cells if configured
-        if should_autorun:
-            changed_cell_ids_list = list(changed_cell_ids - deleted)
-            cells = dict(zip(cell_ids, codes))
-
-            # Send names and configs to the frontend (SyncGraphCommand
-            # doesn't carry them)
-            if cell_ids:
-                session.notify(
-                    UpdateCellCodesNotification(
-                        cell_ids=cell_ids,
-                        codes=codes,
-                        code_is_stale=False,
-                        names=names,
-                        configs=configs,
-                    ),
-                    from_consumer_id=None,
-                )
-
-            session.put_control_request(
-                SyncGraphCommand(
-                    cells=cells,
-                    run_ids=changed_cell_ids_list,
-                    delete_ids=list(deleted),
+        if transaction.changes:
+            session.notify(
+                NotebookDocumentTransactionNotification(
+                    transaction=transaction
                 ),
                 from_consumer_id=None,
             )
-        else:
-            # Just send deletes and code updates
-            for to_delete in deleted:
-                session.put_control_request(
-                    DeleteCellCommand(cell_id=to_delete),
-                    from_consumer_id=None,
-                )
-            if cell_ids:
-                session.notify(
-                    UpdateCellCodesNotification(
-                        cell_ids=cell_ids,
-                        codes=codes,
-                        code_is_stale=True,
-                        names=names,
-                        configs=configs,
-                    ),
-                    from_consumer_id=None,
-                )
+
+        # Auto-run changed cells if configured.
+        watcher_on_save = self._config_manager.get_config()["runtime"][
+            "watcher_on_save"
+        ]
+        if watcher_on_save == "autorun":
+            changed_not_deleted = list(changed_cell_ids - deleted)
+            session.put_control_request(
+                SyncGraphCommand(
+                    cells=dict(zip(cell_ids, codes, strict=False)),
+                    run_ids=changed_not_deleted,
+                    delete_ids=sorted(deleted),
+                ),
+                from_consumer_id=None,
+            )
+        elif deleted:
+            # Even in lazy mode, sync deletions to the kernel so removed
+            # cells are cleaned up from the dependency graph.
+            session.put_control_request(
+                SyncGraphCommand(
+                    cells=dict(zip(cell_ids, codes, strict=False)),
+                    run_ids=[],
+                    delete_ids=sorted(deleted),
+                ),
+                from_consumer_id=None,
+            )
 
 
-class RunModeReloadStrategy:
+class RunModeReloadStrategy(ReloadStrategy):
     """Reload strategy for run mode.
 
     In run mode, we simply send a reload operation to the frontend.
     """
 
     def handle_reload(
-        self, session: Session, *, changed_cell_ids: set[CellId_t]
+        self,
+        session: Session,
+        *,
+        transaction: Transaction,
+        changed_cell_ids: set[CellId_t],
     ) -> None:
         """Handle reload in run mode by sending Reload operation."""
-        del changed_cell_ids
+        del transaction, changed_cell_ids
         session.notify(ReloadNotification(), from_consumer_id=None)
 
 
@@ -232,18 +221,21 @@ class FileChangeCoordinator:
             )
             return FileChangeResult(handled=False)
 
-        # Reload the file manager to get the latest code
+        # Reload the file manager to get the latest code. ``reload``
+        # mutates the existing document in place via ``apply()`` and
+        # returns the stamped transaction, so we just relay it.
         try:
-            changed_cell_ids = session.app_file_manager.reload()
+            transaction, changed_cell_ids = session.app_file_manager.reload()
         except Exception as e:
             # If there are syntax errors, we just skip
             # and don't send the changes
             LOGGER.error(f"Error loading file: {e}")
             return FileChangeResult(handled=False, error=str(e))
 
-        # Delegate to the reload strategy
         self._reload_strategy.handle_reload(
-            session, changed_cell_ids=changed_cell_ids
+            session,
+            transaction=transaction,
+            changed_cell_ids=changed_cell_ids,
         )
         return FileChangeResult(
             handled=True, changed_cell_ids=changed_cell_ids

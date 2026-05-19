@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 import ipaddress
 import socket
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from marimo import _loggers
 from marimo._server.ai.mcp.config import is_mcp_config_empty
@@ -13,7 +13,6 @@ from marimo._server.ai.tools.tool_manager import setup_tool_manager
 from marimo._server.api.deps import AppState, AppStateBase
 from marimo._server.api.interrupt import InterruptHandler
 from marimo._server.api.utils import open_url_in_browser
-from marimo._server.file_router import AppFileRouter
 from marimo._server.lsp import any_lsp_server_running
 from marimo._server.print import (
     print_experimental_features,
@@ -26,7 +25,10 @@ from marimo._server.session_manager import SessionManager
 from marimo._server.tokens import AuthToken
 from marimo._server.utils import initialize_mimetypes
 from marimo._server.uvicorn_utils import close_uvicorn
+from marimo._server.workspace import NewFileKey
 from marimo._session.model import SessionMode
+from marimo._utils.asyncio_utils import cancel_and_wait, supervised_task
+from marimo._utils.subprocess import cancel_pending_reaps
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -56,18 +58,15 @@ async def lsp(app: Starlette) -> AsyncIterator[None]:
 
     LOGGER.debug("Language Servers are enabled")
     # Start LSP server in background to avoid blocking server startup
-    task = asyncio.create_task(session_mgr.start_lsp_server())
-    background_tasks.add(task)  # Keep a reference to prevent GC
-    task.add_done_callback(background_tasks.discard)  # Clean up when done
+    task = supervised_task(
+        session_mgr.start_lsp_server(),
+        name="lsp.start",
+        registry=background_tasks,
+    )
 
     yield
 
-    # Shutdown
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    await cancel_and_wait(task)
 
 
 @contextlib.asynccontextmanager
@@ -102,7 +101,7 @@ async def mcp(app: Starlette) -> AsyncIterator[None]:
         yield
         return
 
-    async def background_connect_mcp_servers() -> Optional[MCPClient]:
+    async def background_connect_mcp_servers() -> MCPClient | None:
         try:
             from marimo._server.ai.mcp import get_mcp_client
 
@@ -118,24 +117,30 @@ async def mcp(app: Starlette) -> AsyncIterator[None]:
             LOGGER.warning(f"Failed to connect MCP servers: {e}")
             return None
 
-    task = asyncio.create_task(background_connect_mcp_servers())
-    background_tasks.add(task)  # Keep a reference to prevent GC
-    task.add_done_callback(background_tasks.discard)  # Clean up when done
+    # Awaited below — opt out of supervisor logging to avoid duplicate logs.
+    task = supervised_task(
+        background_connect_mcp_servers(),
+        name="mcp.connect",
+        registry=background_tasks,
+        on_exception=lambda _exc: None,
+    )
 
     yield
 
-    # Shutdown
-    task.cancel()
+    await cancel_and_wait(task)
+    if task.cancelled():
+        return
+
+    mcp_client = task.result()
+    if not mcp_client:
+        return
+
     try:
-        mcp_client = await task
-        if mcp_client:
-            LOGGER.info("Disconnecting from all MCP servers")
-            await mcp_client.disconnect_from_all_servers()
-            LOGGER.info("Successfully disconnected from all MCP servers")
-    except asyncio.CancelledError:
-        pass
+        LOGGER.info("Disconnecting from all MCP servers")
+        await mcp_client.disconnect_from_all_servers()
+        LOGGER.info("Successfully disconnected from all MCP servers")
     except Exception as e:
-        LOGGER.error(f"Error during MCP cleanup: {e}")
+        LOGGER.error(f"Error during MCP disconnect: {e}")
 
 
 @contextlib.asynccontextmanager
@@ -158,19 +163,20 @@ async def logging(app: Starlette) -> AsyncIterator[None]:
     state = AppState.from_app(app)
     manager: SessionManager = state.session_manager
     quiet = state.quiet
-    file_router = manager.file_router
+    workspace = manager.workspace
     mcp_server_enabled = state.mcp_server_enabled
     skew_protection_enabled = state.skew_protection
 
     # Startup message
     if not quiet:
-        file = file_router.maybe_get_single_file()
+        file = workspace.single_file()
         print_startup(
             file_name=file.name if file else None,
             url=_startup_url(state),
             run=manager.mode == SessionMode.RUN,
-            new=file_router.get_unique_file_key() == AppFileRouter.NEW_FILE,
+            new=isinstance(workspace.get_unique_file_key(), NewFileKey),
             network=state.host == "0.0.0.0",
+            startup_tip=state.startup_tip,
         )
 
         print_experimental_features(state.config_manager.get_config())
@@ -212,9 +218,8 @@ async def server_registry(app: Starlette) -> AsyncIterator[None]:
     """Register this server in the local registry for discovery.
 
     Only servers started **without** an auth token (``--no-token``)
-    **and** without skew protection (``--no-skew-protection``) are
-    registered.  This ensures only servers that have explicitly opted
-    into relaxed local access are discoverable.
+    are registered.  This ensures only servers that have explicitly
+    opted into relaxed local access are discoverable.
     """
     from marimo._server.server_registry import (
         ServerRegistryEntry,
@@ -224,12 +229,13 @@ async def server_registry(app: Starlette) -> AsyncIterator[None]:
     state = AppState.from_app(app)
 
     # Guard: only register when the user has opted into relaxed local
-    # access (no auth token, no skew protection).
-    if state.enable_auth or state.skew_protection:
+    # access (no auth token).  Skew protection is irrelevant here —
+    # it guards against frontend/server version mismatch and should
+    # not prevent agent-oriented discovery.
+    if state.enable_auth:
         LOGGER.debug(
-            "Skipping server registry: auth=%s, skew_protection=%s",
+            "Skipping server registry: auth=%s",
             state.enable_auth,
-            state.skew_protection,
         )
         yield
         return
@@ -256,6 +262,13 @@ async def etc(app: Starlette) -> AsyncIterator[None]:
     # Mimetypes
     initialize_mimetypes()
     yield
+
+
+@contextlib.asynccontextmanager
+async def reap_subprocesses(app: Starlette) -> AsyncIterator[None]:
+    del app
+    yield
+    await cancel_pending_reaps()
 
 
 def _pretty_host(host: str, port: int) -> str:
@@ -308,7 +321,7 @@ def _startup_url(state: AppStateBase) -> str:
 
     if AuthToken.is_empty(state.session_manager.auth_token):
         return url
-    return f"{url}?access_token={str(state.session_manager.auth_token)}"
+    return f"{url}?access_token={state.session_manager.auth_token!s}"
 
 
 def _mcp_startup_url(state: AppStateBase) -> str:
@@ -337,4 +350,4 @@ def _mcp_startup_url(state: AppStateBase) -> str:
     # Add access token if not empty
     if AuthToken.is_empty(state.session_manager.auth_token):
         return url
-    return f"{url}?access_token={str(state.session_manager.auth_token)}"
+    return f"{url}?access_token={state.session_manager.auth_token!s}"

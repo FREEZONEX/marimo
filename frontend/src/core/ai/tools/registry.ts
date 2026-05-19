@@ -14,7 +14,7 @@ import { formatToolDescription } from "./utils";
 
 export type AnyZodObject = ZodObject<z.ZodRawShape>;
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+// oxlint-disable-next-line typescript/no-explicit-any
 type StoredTool = AiTool<any, any>;
 
 interface InvokeResult<TName> {
@@ -52,11 +52,15 @@ export class FrontendToolRegistry {
     return tool;
   }
 
-  async invoke<TName extends string>(
-    toolName: TName,
-    rawArgs: unknown,
-    toolContext: ToolNotebookContext,
-  ): Promise<InvokeResult<TName>> {
+  async invoke<TName extends string>({
+    toolName,
+    rawArgs,
+    toolContext,
+  }: {
+    toolName: TName;
+    rawArgs: unknown;
+    toolContext: ToolNotebookContext;
+  }): Promise<InvokeResult<TName>> {
     const tool = this.getToolOrThrow(toolName);
     const handler = tool.handler;
     const inputSchema = tool.schema;

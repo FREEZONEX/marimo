@@ -9,10 +9,11 @@ from pathlib import Path
 import pytest
 
 from marimo import __version__
-from marimo._ast.cell import CellConfig
+from marimo._ast.cell import CellConfig, RuntimeStateType
 from marimo._ast.cell_manager import CellManager
 from marimo._messaging.cell_output import CellChannel, CellOutput
 from marimo._messaging.errors import MarimoExceptionRaisedError, UnknownError
+from marimo._messaging.notebook.document import NotebookCell, NotebookDocument
 from marimo._messaging.notification import CellNotification
 from marimo._runtime.commands import ExecuteCellsCommand
 from marimo._schemas.session import NotebookSessionV1
@@ -21,6 +22,7 @@ from marimo._session.state.serialize import (
     SessionCacheManager,
     SessionCacheWriter,
     _hash_code,
+    _references_virtual_file,
     deserialize_session,
     get_session_cache_file,
     serialize_notebook,
@@ -31,6 +33,36 @@ from marimo._types.ids import CellId_t
 from tests.mocks import snapshotter
 
 snapshot = snapshotter(__file__)
+
+CELL1 = CellId_t("cell1")
+CELL2 = CellId_t("cell2")
+
+
+def _make_document(*cell_ids: CellId_t) -> NotebookDocument:
+    """Create a NotebookDocument with the given cell IDs."""
+    return NotebookDocument(
+        [
+            NotebookCell(id=cid, code="", name="__", config=CellConfig())
+            for cid in cell_ids
+        ]
+    )
+
+
+def _make_cell_notification(
+    cell_id: CellId_t,
+    *,
+    output: CellOutput | None = None,
+    status: RuntimeStateType = "idle",
+    console: list[CellOutput] | None = None,
+) -> CellNotification:
+    """Create a CellNotification with sensible defaults."""
+    return CellNotification(
+        cell_id=cell_id,
+        status=status,
+        output=output,
+        console=console or [],
+        timestamp=0,
+    )
 
 
 def _build_code_hash_to_cell_id_mapping(
@@ -47,52 +79,48 @@ def _build_code_hash_to_cell_id_mapping(
 def test_serialize_basic_session(session_view: SessionView):
     """Test serialization of a basic session with a single cell with data output"""
     view = session_view
-    view.cell_notifications[CellId_t("cell1")] = CellNotification(
-        cell_id=CellId_t("cell1"),
-        status="idle",
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         output=CellOutput(
             channel=CellChannel.OUTPUT,
             mimetype="text/plain",
             data="Hello, world!",
         ),
-        console=[],
-        timestamp=0,
     )
-    view.last_executed_code[CellId_t("cell1")] = "print('Hello, world!')"
+    view.last_executed_code[CELL1] = "print('Hello, world!')"
 
-    result = serialize_session_view(view)
+    result = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=False
+    )
     snapshot("basic_session.json", json.dumps(result, indent=2))
 
 
 def test_serialize_session_with_error(session_view: SessionView):
     """Test serialization of a session with an error output"""
     view = session_view
-    view.cell_notifications[CellId_t("cell1")] = CellNotification(
-        cell_id=CellId_t("cell1"),
-        status="idle",
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         output=CellOutput(
             channel=CellChannel.MARIMO_ERROR,
             mimetype="application/vnd.marimo+error",
             data=[UnknownError(msg="Something went wrong")],
         ),
-        console=[],
-        timestamp=0,
     )
-    view.last_executed_code[CellId_t("cell1")] = (
+    view.last_executed_code[CELL1] = (
         "raise RuntimeError('Something went wrong')"
     )
 
-    result = serialize_session_view(view)
+    result = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=False
+    )
     snapshot("error_session.json", json.dumps(result, indent=2))
 
 
 def test_serialize_session_with_console(session_view: SessionView):
     """Test serialization of a session with console output"""
     view = session_view
-    view.cell_notifications["cell1"] = CellNotification(
-        cell_id="cell1",
-        status="idle",
-        output=None,
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         console=[
             CellOutput(
                 channel=CellChannel.STDOUT,
@@ -105,20 +133,20 @@ def test_serialize_session_with_console(session_view: SessionView):
                 data="stderr message",
             ),
         ],
-        timestamp=0,
     )
-    view.last_executed_code["cell1"] = "print('test')"
+    view.last_executed_code[CELL1] = "print('test')"
 
-    result = serialize_session_view(view)
+    result = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=False
+    )
     snapshot("console_session.json", json.dumps(result, indent=2))
 
 
 def test_serialize_session_with_mime_bundle(session_view: SessionView):
     """Test serialization of a session with a mime bundle output"""
     view = session_view
-    view.cell_notifications["cell1"] = CellNotification(
-        cell_id="cell1",
-        status="idle",
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         output=CellOutput(
             channel=CellChannel.OUTPUT,
             mimetype="application/vnd.marimo+mimebundle",
@@ -127,12 +155,12 @@ def test_serialize_session_with_mime_bundle(session_view: SessionView):
                 "text/html": "<b>Hello</b>",
             },
         ),
-        console=[],
-        timestamp=0,
     )
-    view.last_executed_code["cell1"] = "HTML('Hello')"
+    view.last_executed_code[CELL1] = "HTML('Hello')"
 
-    result = serialize_session_view(view)
+    result = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=False
+    )
     snapshot("mime_bundle_session.json", json.dumps(result, indent=2))
 
 
@@ -141,28 +169,22 @@ def test_serialize_notebook_basic(session_view: SessionView):
     view = session_view
     cell_manager = CellManager()
 
-    # Register cell with cell manager
-    cell_id = CellId_t("cell1")
     cell_manager.register_cell(
-        cell_id=cell_id,
+        cell_id=CELL1,
         code="print('Hello, world!')",
         name="my_cell",
         config=CellConfig(column=1, disabled=False, hide_code=True),
     )
 
-    # Add to session view
-    view.cell_notifications[cell_id] = CellNotification(
-        cell_id=cell_id,
-        status="idle",
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         output=CellOutput(
             channel=CellChannel.OUTPUT,
             mimetype="text/plain",
             data="Hello, world!",
         ),
-        console=[],
-        timestamp=0,
     )
-    view.last_executed_code[cell_id] = "print('Hello, world!')"
+    view.last_executed_code[CELL1] = "print('Hello, world!')"
 
     result = serialize_notebook(view, cell_manager)
 
@@ -184,47 +206,32 @@ def test_serialize_notebook_multiple_cells(session_view: SessionView):
     view = session_view
     cell_manager = CellManager()
 
-    # Register first cell
-    cell_id1 = CellId_t("cell1")
     cell_manager.register_cell(
-        cell_id=cell_id1,
+        cell_id=CELL1,
         code="x = 1",
         name="setup",
         config=CellConfig(column=0, disabled=False),
     )
 
-    # Register second cell
-    cell_id2 = CellId_t("cell2")
     cell_manager.register_cell(
-        cell_id=cell_id2,
+        cell_id=CELL2,
         code="print(x + 1)",
         name="output",
         config=CellConfig(column=1, hide_code=True),
     )
 
-    # Add first cell to session view
-    view.cell_notifications[cell_id1] = CellNotification(
-        cell_id=cell_id1,
-        status="idle",
-        output=None,
-        console=[],
-        timestamp=0,
-    )
-    view.last_executed_code[cell_id1] = "x = 1"
+    view.cell_notifications[CELL1] = _make_cell_notification(CELL1)
+    view.last_executed_code[CELL1] = "x = 1"
 
-    # Add second cell to session view
-    view.cell_notifications[cell_id2] = CellNotification(
-        cell_id=cell_id2,
-        status="idle",
+    view.cell_notifications[CELL2] = _make_cell_notification(
+        CELL2,
         output=CellOutput(
             channel=CellChannel.OUTPUT,
             mimetype="text/plain",
             data="2",
         ),
-        console=[],
-        timestamp=0,
     )
-    view.last_executed_code[cell_id2] = "print(x + 1)"
+    view.last_executed_code[CELL2] = "print(x + 1)"
 
     result = serialize_notebook(view, cell_manager)
 
@@ -258,44 +265,32 @@ def test_serialize_notebook_multiple_cells_not_top_down(
     view = session_view
     cell_manager = CellManager()
 
-    cell_id1 = CellId_t("cell1")
     cell_manager.register_cell(
-        cell_id=cell_id1,
+        cell_id=CELL1,
         code="print(x + 1)",
         name="output",
         config=CellConfig(column=1, hide_code=True),
     )
 
-    cell_id2 = CellId_t("cell2")
     cell_manager.register_cell(
-        cell_id=cell_id2,
+        cell_id=CELL2,
         code="x = 2",
         name="setup",
         config=CellConfig(column=0, disabled=False),
     )
 
-    view.cell_notifications[cell_id2] = CellNotification(
-        cell_id=cell_id2,
-        status="idle",
-        output=None,
-        console=[],
-        timestamp=0,
-    )
-    view.last_executed_code[cell_id2] = "x = 1"
+    view.cell_notifications[CELL2] = _make_cell_notification(CELL2)
+    view.last_executed_code[CELL2] = "x = 1"
 
-    # Add second cell to session view
-    view.cell_notifications[cell_id1] = CellNotification(
-        cell_id=cell_id1,
-        status="idle",
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         output=CellOutput(
             channel=CellChannel.OUTPUT,
             mimetype="text/plain",
             data="2",
         ),
-        console=[],
-        timestamp=0,
     )
-    view.last_executed_code[cell_id1] = "print(x + 1)"
+    view.last_executed_code[CELL1] = "print(x + 1)"
 
     result = serialize_notebook(view, cell_manager)
 
@@ -321,23 +316,15 @@ def test_serialize_notebook_empty_code(session_view: SessionView):
     view = session_view
     cell_manager = CellManager()
 
-    # Register cell with cell manager but with different code
-    cell_id = CellId_t("cell1")
     cell_manager.register_cell(
-        cell_id=cell_id,
+        cell_id=CELL1,
         code="# Original code",
         name="empty_cell",
         config=CellConfig(),
     )
 
     # Add to session view but without executed code
-    view.cell_notifications[cell_id] = CellNotification(
-        cell_id=cell_id,
-        status="idle",
-        output=None,
-        console=[],
-        timestamp=0,
-    )
+    view.cell_notifications[CELL1] = _make_cell_notification(CELL1)
     # No entry in last_executed_code
 
     result = serialize_notebook(view, cell_manager)
@@ -382,16 +369,13 @@ def test_serialize_notebook_missing_cell_data(session_view: SessionView):
 
     # Add cell to session view but don't register it with cell manager
     cell_id = CellId_t("orphan_cell")
-    view.cell_notifications[cell_id] = CellNotification(
-        cell_id=cell_id,
-        status="idle",
+    view.cell_notifications[cell_id] = _make_cell_notification(
+        cell_id,
         output=CellOutput(
             channel=CellChannel.OUTPUT,
             mimetype="text/plain",
             data="orphan output",
         ),
-        console=[],
-        timestamp=0,
     )
     view.last_executed_code[cell_id] = "print('orphan')"
 
@@ -405,6 +389,143 @@ def test_serialize_notebook_missing_cell_data(session_view: SessionView):
     assert cell["config"]["column"] is None
     assert cell["config"]["disabled"] is None
     assert cell["config"]["hide_code"] is None
+
+
+def test_session_round_trip_drops_dangling_virtual_file_urls(
+    session_view: SessionView,
+):
+    # Regression: https://github.com/marimo-team/marimo/issues/9273.
+    # A `./@file/...` URL in cached HTML output points at a per-process
+    # buffer that won't exist on the next kernel; the URL must not
+    # survive the on-disk cache round-trip.
+    html = (
+        '<marimo-anywidget data-name="Counter">'
+        '<img src="./@file/4-abcd1234.png">'
+        "</marimo-anywidget>"
+    )
+    view = session_view
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
+        output=CellOutput(
+            channel=CellChannel.OUTPUT,
+            mimetype="text/html",
+            data=html,
+        ),
+    )
+    view.last_executed_code[CELL1] = "widget"
+
+    serialized = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=True
+    )
+    code_hash_to_cell_id = _build_code_hash_to_cell_id_mapping(serialized)
+    restored = deserialize_session(serialized, code_hash_to_cell_id)
+
+    assert restored.cell_notifications[CELL1].output is None
+
+
+def test_session_round_trip_drops_nested_virtual_file_urls(
+    session_view: SessionView,
+):
+    # `_references_virtual_file` recurses through dicts and lists — a mime
+    # bundle where only one alternative carries the `./@file/` URL must
+    # still trigger the drop.
+    view = session_view
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
+        output=CellOutput(
+            channel=CellChannel.OUTPUT,
+            mimetype="application/vnd.marimo+mimebundle",
+            data={
+                "text/plain": "widget",
+                "text/html": '<img src="./@file/4-abcd1234.png">',
+            },
+        ),
+    )
+    view.last_executed_code[CELL1] = "widget"
+
+    serialized = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=True
+    )
+    code_hash_to_cell_id = _build_code_hash_to_cell_id_mapping(serialized)
+    restored = deserialize_session(serialized, code_hash_to_cell_id)
+
+    assert restored.cell_notifications[CELL1].output is None
+
+
+def test_drop_virtual_file_outputs_ignores_literal_prefix_in_text(
+    session_view: SessionView,
+):
+    # The check is anchored to the full URL shape (`./@file/<digits>-`),
+    # so plain text that happens to mention the prefix must not trigger
+    # the drop.
+    view = session_view
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
+        output=CellOutput(
+            channel=CellChannel.OUTPUT,
+            mimetype="text/plain",
+            data="marimo stores virtual files under ./@file/ on the server",
+        ),
+    )
+    view.last_executed_code[CELL1] = "print('docs')"
+
+    serialized = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=True
+    )
+    code_hash_to_cell_id = _build_code_hash_to_cell_id_mapping(serialized)
+    restored = deserialize_session(serialized, code_hash_to_cell_id)
+
+    restored_output = restored.cell_notifications[CELL1].output
+    assert restored_output is not None
+    assert restored_output.data == (
+        "marimo stores virtual files under ./@file/ on the server"
+    )
+
+
+def test_references_virtual_file_handles_cyclic_data():
+    # A self-referencing dict or list must return False cleanly rather
+    # than raising RecursionError — the check is purely defensive, but
+    # a serializer that blows the stack is a poor failure mode for code
+    # that just decides whether to drop URLs.
+    cyclic_dict: dict[str, object] = {}
+    cyclic_dict["self"] = cyclic_dict
+    assert _references_virtual_file(cyclic_dict) is False
+
+    cyclic_list: list[object] = []
+    cyclic_list.append(cyclic_list)
+    assert _references_virtual_file(cyclic_list) is False
+
+    # Cycle through a nested structure still detects the URL when present.
+    leaf: dict[str, object] = {"html": '<img src="./@file/4-abcd1234.png">'}
+    leaf["self"] = leaf
+    assert _references_virtual_file(leaf) is True
+
+
+def test_drop_virtual_file_outputs_preserves_unrelated_outputs(
+    session_view: SessionView,
+):
+    # The drop is targeted: outputs without a virtual-file URL must pass
+    # through even when `drop_virtual_file_outputs=True`.
+    view = session_view
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
+        output=CellOutput(
+            channel=CellChannel.OUTPUT,
+            mimetype="text/html",
+            data="<b>Hello</b>",
+        ),
+    )
+    view.last_executed_code[CELL1] = "HTML('Hello')"
+
+    serialized = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=True
+    )
+    code_hash_to_cell_id = _build_code_hash_to_cell_id_mapping(serialized)
+    restored = deserialize_session(serialized, code_hash_to_cell_id)
+
+    restored_output = restored.cell_notifications[CELL1].output
+    assert restored_output is not None
+    assert restored_output.data == "<b>Hello</b>"
 
 
 def test_deserialize_basic_session():
@@ -516,21 +637,19 @@ def test_deserialize_session_with_console():
 async def test_session_cache_writer(session_view: SessionView):
     """Test AsyncWriter writes session data periodically"""
     view = session_view
-    view.cell_notifications["cell1"] = CellNotification(
-        cell_id="cell1",
-        status="idle",
+    doc = _make_document(CELL1)
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         output=CellOutput(
             channel=CellChannel.OUTPUT,
             mimetype="text/plain",
             data="test data",
         ),
-        console=[],
-        timestamp=0,
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "session.json"
-        writer = SessionCacheWriter(view, path, interval=0.1)
+        writer = SessionCacheWriter(view, doc, path, interval=0.1)
 
         # Start writer and wait for first write
         writer.start()
@@ -549,10 +668,11 @@ async def test_session_cache_writer(session_view: SessionView):
 async def test_session_cache_writer_no_writes(session_view: SessionView):
     """Test AsyncWriter does not write when no changes"""
     view = session_view
+    doc = _make_document()
     view.mark_auto_export_session()
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "session.json"
-        writer = SessionCacheWriter(view, path, interval=0.1)
+        writer = SessionCacheWriter(view, doc, path, interval=0.1)
         writer.start()
         await asyncio.sleep(0.2)
         assert not path.exists()
@@ -580,6 +700,24 @@ def test_get_session_cache_file():
         assert cache_file == Path(
             "C:\\path\\to\\__marimo__\\session\\notebook.py.json"
         )
+
+
+def test_get_session_cache_file_with_pycache_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    prefix = tmp_path / "prefix"
+    monkeypatch.setattr("sys.pycache_prefix", str(prefix))
+
+    path = tmp_path / "app" / "notebooks" / "notebook.py"
+    cache_file = get_session_cache_file(path)
+    relative_parent = Path(*path.parent.parts[1:])  # strip root
+    assert cache_file == (
+        prefix
+        / relative_parent
+        / "__marimo__"
+        / "session"
+        / "notebook.py.json"
+    )
 
 
 def test_hash_code():
@@ -756,9 +894,8 @@ def test_deserialize_session_with_console_mimetype():
 def test_serialize_session_with_dict_error():
     """Test serialization of a session with a dictionary error"""
     view = SessionView()
-    view.cell_notifications["cell1"] = CellNotification(
-        cell_id="cell1",
-        status="idle",
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         output=CellOutput(
             channel=CellChannel.MARIMO_ERROR,
             mimetype="application/vnd.marimo+error",
@@ -766,14 +903,14 @@ def test_serialize_session_with_dict_error():
                 {"type": "unknown", "msg": "Something went wrong"}
             ],  # Dictionary instead of Error object
         ),
-        console=[],
-        timestamp=0,
     )
-    view.last_executed_code["cell1"] = (
+    view.last_executed_code[CELL1] = (
         "raise RuntimeError('Something went wrong')"
     )
 
-    result = serialize_session_view(view)
+    result = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=False
+    )
     assert len(result["cells"]) == 1
     assert len(result["cells"][0]["outputs"]) == 1
     assert result["cells"][0]["outputs"][0]["type"] == "error"
@@ -793,39 +930,37 @@ def test_serialize_session_with_mixed_error_formats(session_view: SessionView):
             "exception_type": "ValueError",
             "msg": "Invalid value",
             "raising_cell": "cell1",
+            "traceback": None,
         },
         # Object format error
         UnknownError(msg="Runtime error occurred", error_type="RuntimeError"),
     ]
 
-    view.cell_notifications[CellId_t("cell1")] = CellNotification(
-        cell_id=CellId_t("cell1"),
-        status="idle",
+    view.cell_notifications[CELL1] = _make_cell_notification(
+        CELL1,
         output=CellOutput(
             channel=CellChannel.MARIMO_ERROR,
             mimetype="application/vnd.marimo+error",
             data=mixed_errors,
         ),
-        console=[],
-        timestamp=0,
     )
-    view.last_executed_code[CellId_t("cell1")] = (
-        "# code that causes mixed errors"
-    )
+    view.last_executed_code[CELL1] = "# code that causes mixed errors"
 
-    result = serialize_session_view(view)
+    result = serialize_session_view(
+        view, cell_ids=[CELL1], drop_virtual_file_outputs=False
+    )
 
     # Verify the error normalization worked correctly
     assert len(result["cells"]) == 1
     cell = result["cells"][0]
     assert len(cell["outputs"]) == 2
 
-    # Check first error (dictionary with traceback)
+    # Check first error (dictionary with explicit no traceback)
     error1 = cell["outputs"][0]
     assert error1["type"] == "error"
     assert error1["ename"] == "exception"
     assert error1["evalue"] == "Invalid value"
-    assert error1["traceback"] == []
+    assert error1["traceback"] is None
 
     # Check second error (object format)
     error2 = cell["outputs"][1]
@@ -845,18 +980,20 @@ class TestSessionCacheManager:
     def test_init_without_path(self, session_view: SessionView):
         """Test initialization without path"""
         view = session_view
-        manager = SessionCacheManager(view, None, 0.1)
+        doc = _make_document()
+        manager = SessionCacheManager(view, doc, None, 0.1)
         manager.start()
         assert manager.session_cache_writer is None
 
     async def test_rename_path(self, session_view: SessionView):
         """Test renaming path updates writer"""
         view = session_view
+        doc = _make_document()
         with tempfile.TemporaryDirectory() as tmpdir:
             old_path = Path(tmpdir) / "old.py"
             new_path = Path(tmpdir) / "new.py"
 
-            manager = SessionCacheManager(view, old_path, 0.1)
+            manager = SessionCacheManager(view, doc, old_path, 0.1)
             manager.start()
             assert manager.session_cache_writer is not None
             old_writer = manager.session_cache_writer
@@ -869,12 +1006,11 @@ class TestSessionCacheManager:
     def test_read_session_view_no_path(self, session_view: SessionView):
         """Test reading session view without path"""
         view = session_view
-        manager = SessionCacheManager(view, None, 0.1)
+        doc = _make_document()
+        manager = SessionCacheManager(view, doc, None, 0.1)
         assert (
             manager.read_session_view(
-                SessionCacheKey(
-                    codes=tuple(), marimo_version="-1", cell_ids=tuple()
-                )
+                SessionCacheKey(codes=(), marimo_version="-1", cell_ids=())
             )
             == view
         )
@@ -882,14 +1018,13 @@ class TestSessionCacheManager:
     def test_read_session_view_no_cache(self, session_view: SessionView):
         """Test reading session view with no cache file"""
         view = session_view
+        doc = _make_document()
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "notebook.py"
-            manager = SessionCacheManager(view, path, 0.1)
+            manager = SessionCacheManager(view, doc, path, 0.1)
             assert (
                 manager.read_session_view(
-                    SessionCacheKey(
-                        codes=tuple(), marimo_version="-1", cell_ids=tuple()
-                    )
+                    SessionCacheKey(codes=(), marimo_version="-1", cell_ids=())
                 )
                 == view
             )
@@ -899,16 +1034,14 @@ class TestSessionCacheManager:
     ):
         """Test reading session view from cache file"""
         view = session_view
-        view.cell_notifications["cell1"] = CellNotification(
-            cell_id="cell1",
-            status="idle",
+        doc = _make_document(CELL1)
+        view.cell_notifications[CELL1] = _make_cell_notification(
+            CELL1,
             output=CellOutput(
                 channel=CellChannel.OUTPUT,
                 mimetype="text/plain",
                 data="test data",
             ),
-            console=[],
-            timestamp=0,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -917,16 +1050,18 @@ class TestSessionCacheManager:
             cache_file.parent.mkdir(parents=True)
 
             # Write cache file
-            data = serialize_session_view(view)
+            data = serialize_session_view(
+                view, cell_ids=[CELL1], drop_virtual_file_outputs=False
+            )
             cache_file.write_text(json.dumps(data))
 
             # Read back
-            manager = SessionCacheManager(SessionView(), path, 0.1)
+            manager = SessionCacheManager(SessionView(), doc, path, 0.1)
             loaded_view = manager.read_session_view(
                 SessionCacheKey(
                     codes=(None,),
                     marimo_version=__version__,
-                    cell_ids=("cell1",),
+                    cell_ids=(CELL1,),
                 )
             )
             assert loaded_view.cell_notifications is not None
@@ -936,19 +1071,17 @@ class TestSessionCacheManager:
     ):
         """Test reading session view from cache file"""
         view = session_view
-        view.cell_notifications["cell1"] = CellNotification(
-            cell_id="cell1",
-            status="idle",
+        doc = _make_document(CELL1)
+        view.cell_notifications[CELL1] = _make_cell_notification(
+            CELL1,
             output=CellOutput(
                 channel=CellChannel.OUTPUT,
                 mimetype="text/plain",
                 data="test data",
             ),
-            console=[],
-            timestamp=0,
         )
         view.add_control_request(
-            ExecuteCellsCommand(cell_ids=["cell1"], codes=["a"])
+            ExecuteCellsCommand(cell_ids=[CELL1], codes=["a"])
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -957,17 +1090,19 @@ class TestSessionCacheManager:
             cache_file.parent.mkdir(parents=True)
 
             # Write cache file
-            data = serialize_session_view(view)
+            data = serialize_session_view(
+                view, cell_ids=[CELL1], drop_virtual_file_outputs=False
+            )
             cache_file.write_text(json.dumps(data))
 
             # Read back
-            manager = SessionCacheManager(SessionView(), path, 0.1)
+            manager = SessionCacheManager(SessionView(), doc, path, 0.1)
             loaded_view = manager.read_session_view(
                 # foo != a, cache miss
                 SessionCacheKey(
                     codes=("foo",),
                     marimo_version=__version__,
-                    cell_ids=("cell1",),
+                    cell_ids=(CELL1,),
                 )
             )
             assert not loaded_view.cell_notifications
@@ -977,8 +1112,10 @@ class TestSessionCacheManager:
     ):
         """Test reading session view from cache file"""
         view = session_view
+        id1, id2 = CellId_t("1"), CellId_t("2")
+        doc = _make_document(id1, id2)
         view.add_control_request(
-            ExecuteCellsCommand(cell_ids=["1", "2"], codes=["a", "b"])
+            ExecuteCellsCommand(cell_ids=[id1, id2], codes=["a", "b"])
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -987,11 +1124,13 @@ class TestSessionCacheManager:
             cache_file.parent.mkdir(parents=True)
 
             # Write cache file
-            data = serialize_session_view(view)
+            data = serialize_session_view(
+                view, cell_ids=[id1, id2], drop_virtual_file_outputs=False
+            )
             cache_file.write_text(json.dumps(data))
 
             # Read back
-            manager = SessionCacheManager(SessionView(), path, 0.1)
+            manager = SessionCacheManager(SessionView(), doc, path, 0.1)
             loaded_view = manager.read_session_view(
                 SessionCacheKey(
                     codes=(
@@ -999,7 +1138,7 @@ class TestSessionCacheManager:
                         "b",
                     ),
                     marimo_version="-1",
-                    cell_ids=("1", "2"),
+                    cell_ids=(id1, id2),
                 )
             )
             assert not loaded_view.cell_notifications
@@ -1009,8 +1148,10 @@ class TestSessionCacheManager:
     ):
         """Test reading session view from cache file."""
         view = session_view
+        id1, id2 = CellId_t("1"), CellId_t("2")
+        doc = _make_document(id1, id2)
         view.add_control_request(
-            ExecuteCellsCommand(cell_ids=["1", "2"], codes=["a", "b"])
+            ExecuteCellsCommand(cell_ids=[id1, id2], codes=["a", "b"])
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1018,10 +1159,15 @@ class TestSessionCacheManager:
             cache_file = get_session_cache_file(path)
             cache_file.parent.mkdir(parents=True)
 
-            data = serialize_session_view(view, script_metadata_hash="old")
+            data = serialize_session_view(
+                view,
+                cell_ids=[id1, id2],
+                script_metadata_hash="old",
+                drop_virtual_file_outputs=False,
+            )
             cache_file.write_text(json.dumps(data))
 
-            manager = SessionCacheManager(SessionView(), path, 0.1)
+            manager = SessionCacheManager(SessionView(), doc, path, 0.1)
             loaded_view = manager.read_session_view(
                 SessionCacheKey(
                     codes=(
@@ -1029,7 +1175,7 @@ class TestSessionCacheManager:
                         "b",
                     ),
                     marimo_version=__version__,
-                    cell_ids=("1", "2"),
+                    cell_ids=(id1, id2),
                     script_metadata_hash="new",
                 )
             )
@@ -1040,31 +1186,21 @@ class TestSessionCacheManager:
     ):
         """Test reading session view from cache file"""
         view = session_view
-        view.cell_notifications["cell1"] = CellNotification(
-            cell_id="cell1",
-            status="idle",
-            output=CellOutput(
-                channel=CellChannel.OUTPUT,
-                mimetype="text/plain",
-                data="test data",
-            ),
-            console=[],
-            timestamp=0,
+        doc = _make_document(CELL1, CELL2)
+        test_output = CellOutput(
+            channel=CellChannel.OUTPUT,
+            mimetype="text/plain",
+            data="test data",
         )
-        view.cell_notifications["cell2"] = CellNotification(
-            cell_id="cell2",
-            status="idle",
-            output=CellOutput(
-                channel=CellChannel.OUTPUT,
-                mimetype="text/plain",
-                data="test data",
-            ),
-            console=[],
-            timestamp=0,
+        view.cell_notifications[CELL1] = _make_cell_notification(
+            CELL1, output=test_output
+        )
+        view.cell_notifications[CELL2] = _make_cell_notification(
+            CELL2, output=test_output
         )
 
         view.add_control_request(
-            ExecuteCellsCommand(cell_ids=["cell1", "cell2"], codes=["a", "b"])
+            ExecuteCellsCommand(cell_ids=[CELL1, CELL2], codes=["a", "b"])
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1073,11 +1209,13 @@ class TestSessionCacheManager:
             cache_file.parent.mkdir(parents=True)
 
             # Write cache file
-            data = serialize_session_view(view)
+            data = serialize_session_view(
+                view, cell_ids=[CELL1, CELL2], drop_virtual_file_outputs=False
+            )
             cache_file.write_text(json.dumps(data))
 
             # Read back
-            manager = SessionCacheManager(SessionView(), path, 0.1)
+            manager = SessionCacheManager(SessionView(), doc, path, 0.1)
             loaded_view = manager.read_session_view(
                 SessionCacheKey(
                     codes=(
@@ -1085,7 +1223,7 @@ class TestSessionCacheManager:
                         "b",
                     ),
                     marimo_version=__version__,
-                    cell_ids=("cell1", "cell2"),
+                    cell_ids=(CELL1, CELL2),
                 )
             )
             # cache hit: codes and version match

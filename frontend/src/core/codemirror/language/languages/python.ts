@@ -36,7 +36,7 @@ import { FederatedLanguageServerClient } from "../../lsp/federated-lsp";
 import { NotebookLanguageServerClient } from "../../lsp/notebook-lsp";
 import { createTransport } from "../../lsp/transports";
 import { CellDocumentUri, type ILanguageServerClient } from "../../lsp/types";
-import { getLSPDocumentRootUri } from "../../lsp/utils";
+import { getLspRootUri, getLspWorkspaceFolders } from "../../lsp/utils";
 import {
   clickablePlaceholderExtension,
   smartPlaceholderExtension,
@@ -45,6 +45,7 @@ import type { LanguageAdapter } from "../types";
 
 const pylspClient = once((lspConfig: LSPConfig) => {
   // Create a mutable reference for the resync callback
+  // oxlint-disable-next-line prefer-const -- reassigned after closure capture
   let resyncCallback: (() => Promise<void>) | undefined;
 
   const transport = createTransport("pylsp", async () => {
@@ -53,8 +54,8 @@ const pylspClient = once((lspConfig: LSPConfig) => {
 
   const lspClientOpts = {
     transport,
-    rootUri: getLSPDocumentRootUri(),
-    workspaceFolders: [],
+    rootUri: getLspRootUri(),
+    workspaceFolders: getLspWorkspaceFolders(),
   };
   const config = lspConfig?.pylsp;
 
@@ -151,6 +152,7 @@ const pylspClient = once((lspConfig: LSPConfig) => {
 });
 
 const tyLspClient = once((_: LSPConfig) => {
+  // oxlint-disable-next-line prefer-const -- reassigned after closure capture
   let resyncCallback: (() => Promise<void>) | undefined;
 
   const transport = createTransport("ty", async () => {
@@ -159,8 +161,8 @@ const tyLspClient = once((_: LSPConfig) => {
 
   const lspClientOpts = {
     transport,
-    rootUri: getLSPDocumentRootUri(),
-    workspaceFolders: [],
+    rootUri: getLspRootUri(),
+    workspaceFolders: getLspWorkspaceFolders(),
   };
 
   // We wrap the client in a NotebookLanguageServerClient to add some
@@ -181,6 +183,7 @@ const tyLspClient = once((_: LSPConfig) => {
 
 const pyreflyClient = once(
   (lspConfig: LSPConfig & { diagnostics: DiagnosticsConfig }) => {
+    // oxlint-disable-next-line prefer-const -- reassigned after closure capture
     let resyncCallback: (() => Promise<void>) | undefined;
 
     const transport = createTransport("pyrefly", async () => {
@@ -189,8 +192,8 @@ const pyreflyClient = once(
 
     const lspClientOpts = {
       transport,
-      rootUri: getLSPDocumentRootUri(),
-      workspaceFolders: [],
+      rootUri: getLspRootUri(),
+      workspaceFolders: getLspWorkspaceFolders(),
     };
 
     // We wrap the client in a NotebookLanguageServerClient to add some
@@ -218,6 +221,7 @@ const pyreflyClient = once(
 );
 
 const pyrightClient = once((_: LSPConfig) => {
+  // oxlint-disable-next-line prefer-const -- reassigned after closure capture
   let resyncCallback: (() => Promise<void>) | undefined;
 
   const transport = createTransport("basedpyright", async () => {
@@ -226,8 +230,8 @@ const pyrightClient = once((_: LSPConfig) => {
 
   const lspClientOpts = {
     transport,
-    rootUri: getLSPDocumentRootUri(),
-    workspaceFolders: [],
+    rootUri: getLspRootUri(),
+    workspaceFolders: getLspWorkspaceFolders(),
   };
 
   // We wrap the client in a NotebookLanguageServerClient to add some

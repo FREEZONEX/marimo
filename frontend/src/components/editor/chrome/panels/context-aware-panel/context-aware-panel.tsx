@@ -21,7 +21,12 @@ import {
   isPinnedAtom,
 } from "./atoms";
 
-export type PanelType = "row-viewer" | "column-explorer";
+export const PANEL_TYPES = {
+  ROW_VIEWER: "row-viewer",
+  COLUMN_EXPLORER: "column-explorer",
+} as const;
+
+export type PanelType = (typeof PANEL_TYPES)[keyof typeof PANEL_TYPES];
 
 export const ContextAwarePanel: React.FC = () => {
   const [owner, setOwner] = useAtom(contextAwarePanelOwner);
@@ -51,7 +56,7 @@ export const ContextAwarePanel: React.FC = () => {
             aria-label={isPinned ? "Unpin panel" : "Pin panel"}
           >
             {isPinned ? (
-              <PinIcon className="w-4 h-4" />
+              <PinIcon className="w-4 h-4 text-primary" />
             ) : (
               <PinOffIcon className="w-4 h-4" />
             )}
@@ -95,16 +100,18 @@ export const ContextAwarePanel: React.FC = () => {
 
   const renderBody = () => {
     return (
-      <div className="mt-2 pb-7 mb-4 h-full overflow-auto">
-        <div className="flex flex-row justify-between items-center mx-2">
+      <div className="pb-7 mb-4 h-full overflow-auto">
+        <div className="px-3 py-2 border-b flex justify-between items-center">
           {renderModeToggle()}
+          <Slot name={SlotNames.CONTEXT_AWARE_PANEL_HEADER} />
           <Button
-            variant="linkDestructive"
-            size="icon"
+            variant="text"
+            size="xs"
+            className="m-0"
             onClick={closePanel}
             aria-label="Close selection panel"
           >
-            <XIcon className="w-4 h-4" />
+            <XIcon className="w-4 h-4 hover:text-destructive" />
           </Button>
         </div>
 
@@ -126,7 +133,12 @@ export const ContextAwarePanel: React.FC = () => {
         onDragging={handleDragging}
         className="resize-handle border-border z-20 print:hidden border-l"
       />
-      <Panel defaultSize={20} minSize={15} maxSize={80}>
+      <Panel
+        data-testid="chrome-context-aware-panel"
+        defaultSize={25}
+        minSize={25}
+        maxSize={80}
+      >
         {renderBody()}
       </Panel>
     </>
@@ -150,7 +162,7 @@ interface ResizableComponentProps {
 const ResizableComponent = ({ children }: ResizableComponentProps) => {
   const { resizableDivRef, handleRefs, style } = useResizeHandle({
     startingWidth: 400,
-    minWidth: 300,
+    minWidth: 400,
     maxWidth: 1500,
     onResize: () => {
       raf2(() => {
@@ -160,7 +172,10 @@ const ResizableComponent = ({ children }: ResizableComponentProps) => {
   });
 
   return (
-    <div className="absolute z-40 right-0 h-full bg-background flex flex-row">
+    <div
+      data-testid="chrome-context-aware-panel"
+      className="absolute z-40 right-0 h-full bg-background flex flex-row"
+    >
       <div
         ref={handleRefs.left}
         className="w-1 h-full cursor-col-resize border-l"

@@ -1,9 +1,9 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
 import type { Column } from "@tanstack/react-table";
-import { render } from "@testing-library/react";
+import { fireEvent, render } from "@testing-library/react";
 import { I18nProvider } from "react-aria";
-import { describe, expect, it, test } from "vitest";
+import { describe, expect, it, test, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { parseContent } from "@/utils/url-parser";
 import {
@@ -222,6 +222,75 @@ describe("generateColumns", () => {
     expect(columns[1].meta?.dataType).toBe("number");
   });
 
+  it("should auto right-align numeric columns", () => {
+    const columns = generateColumns({
+      rowHeaders: [],
+      selection: null,
+      fieldTypes,
+    });
+
+    // "age" is a number column — should auto right-align
+    // oxlint-disable-next-line typescript/no-explicit-any
+    const cell = (columns[1].cell as any)({
+      column: {
+        columnDef: columns[1],
+      },
+      renderValue: () => 25,
+      getValue: () => 25,
+    });
+    expect(cell?.props.className).toContain("text-right");
+
+    // "name" is a string column — should remain left-aligned
+    // oxlint-disable-next-line typescript/no-explicit-any
+    const nameCell = (columns[0].cell as any)({
+      column: {
+        columnDef: columns[0],
+      },
+      renderValue: () => "John",
+      getValue: () => "John",
+    });
+    expect(nameCell?.props.className).not.toContain("text-right");
+  });
+
+  it("should respect explicit textJustifyColumns over auto alignment", () => {
+    const columns = generateColumns({
+      rowHeaders: [],
+      selection: null,
+      fieldTypes,
+      textJustifyColumns: { age: "left" },
+    });
+
+    // "age" is numeric but explicitly set to left
+    // oxlint-disable-next-line typescript/no-explicit-any
+    const cell = (columns[1].cell as any)({
+      column: {
+        columnDef: columns[1],
+      },
+      renderValue: () => 25,
+      getValue: () => 25,
+    });
+    expect(cell?.props.className).not.toContain("text-right");
+  });
+
+  it("should set minFractionDigits from fractionDigitsByColumn", () => {
+    const numericFieldTypes: FieldTypesWithExternalType = [
+      ["price", ["number", "float64"]],
+      ["count", ["integer", "int64"]],
+    ];
+
+    const columns = generateColumns({
+      rowHeaders: [],
+      selection: null,
+      fieldTypes: numericFieldTypes,
+      fractionDigitsByColumn: { price: 2 },
+    });
+
+    // price has 2 fraction digits
+    expect(columns[0].meta?.minFractionDigits).toBe(2);
+    // count not in fractionDigitsByColumn
+    expect(columns[1].meta?.minFractionDigits).toBeUndefined();
+  });
+
   it("should handle text justification and wrapping", () => {
     const columns = generateColumns({
       rowHeaders: [],
@@ -232,7 +301,7 @@ describe("generateColumns", () => {
     });
 
     // Assuming getCellStyleClass is a function that returns a class name
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    // oxlint-disable-next-line typescript/no-explicit-any
     const cell = (columns[0].cell as any)({
       column: {
         columnDef: columns[0],
@@ -243,7 +312,7 @@ describe("generateColumns", () => {
     expect(cell?.props.className).toContain("center");
   });
 
-  it("should apply text justification to column header parents", () => {
+  it("should align column headers to match textJustifyColumns", () => {
     const columns = generateColumns({
       rowHeaders: [],
       selection: null,
@@ -261,33 +330,142 @@ describe("generateColumns", () => {
       columnDef: { meta: col.meta },
     });
 
-    // Right-justified: parent wrapper should have items-end, sort/filter icons should flip to the left
+    // Right-justified column: outer summary wrapper aligns to end, and the
+    // header row uses flex-row-reverse so the title sits at the right edge.
     const { container: rightContainer } = render(
       <TooltipProvider>
-        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+        {/* oxlint-disable-next-line typescript/no-explicit-any */}
         {(columns[0].header as any)({ column: mockColumn(columns[0]) })}
       </TooltipProvider>,
     );
-    const rightWrapper = rightContainer.firstElementChild;
-    expect(rightWrapper?.className).toContain("items-end");
-    const rightHeader = rightContainer.querySelector(
-      "[data-testid='data-table-sort-button']",
-    );
-    expect(rightHeader?.className).toContain("flex-row-reverse");
+    expect(
+      rightContainer.querySelector("[data-testid='data-table-sort-button']"),
+    ).toBeTruthy();
+    expect(
+      rightContainer.querySelector(
+        "[data-testid='data-table-column-menu-button']",
+      ),
+    ).toBeTruthy();
+    expect(rightContainer.firstElementChild?.className).toContain("items-end");
+    expect(rightContainer.querySelector(".flex-row-reverse")).toBeTruthy();
 
-    // Center-justified: parent wrapper should have items-center, no flex-row-reverse
+    // Center-justified column: outer summary wrapper centers; header row
+    // keeps natural order.
     const { container: centerContainer } = render(
       <TooltipProvider>
-        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+        {/* oxlint-disable-next-line typescript/no-explicit-any */}
         {(columns[1].header as any)({ column: mockColumn(columns[1]) })}
       </TooltipProvider>,
     );
-    const centerWrapper = centerContainer.firstElementChild;
-    expect(centerWrapper?.className).toContain("items-center");
-    const centerHeader = centerContainer.querySelector(
+    expect(
+      centerContainer.querySelector("[data-testid='data-table-sort-button']"),
+    ).toBeTruthy();
+    expect(
+      centerContainer.querySelector(
+        "[data-testid='data-table-column-menu-button']",
+      ),
+    ).toBeTruthy();
+    expect(centerContainer.firstElementChild?.className).toContain(
+      "items-center",
+    );
+    expect(centerContainer.querySelector(".flex-row-reverse")).toBeNull();
+  });
+
+  it("should not auto-align numeric column headers without explicit override", () => {
+    const columns = generateColumns({
+      rowHeaders: [],
+      selection: null,
+      fieldTypes,
+    });
+
+    const mockColumn = (col: (typeof columns)[number]) => ({
+      id: col.id,
+      getCanSort: () => true,
+      getCanFilter: () => false,
+      getIsSorted: () => false,
+      getSortIndex: () => -1,
+      getFilterValue: () => undefined,
+      columnDef: { meta: col.meta },
+    });
+
+    // "age" is numeric: cells auto right-align, but the header stays
+    // left-aligned unless the user explicitly opts in via text_justify_columns.
+    const { container } = render(
+      <TooltipProvider>
+        {/* oxlint-disable-next-line typescript/no-explicit-any */}
+        {(columns[1].header as any)({ column: mockColumn(columns[1]) })}
+      </TooltipProvider>,
+    );
+    expect(container.firstElementChild?.className).not.toContain("items-end");
+    expect(container.querySelector(".flex-row-reverse")).toBeNull();
+  });
+
+  it("should cycle sort button through asc, desc, and clear on clicks", () => {
+    const columns = generateColumns({
+      rowHeaders: [],
+      selection: null,
+      fieldTypes,
+    });
+
+    const toggleSorting = vi.fn();
+    const clearSorting = vi.fn();
+    let sortDirection: false | "asc" | "desc" = false;
+
+    const mockColumn = (col: (typeof columns)[number]) => ({
+      id: col.id,
+      getCanSort: () => true,
+      getCanFilter: () => false,
+      getIsSorted: () => sortDirection,
+      getSortIndex: () => -1,
+      getFilterValue: () => undefined,
+      toggleSorting,
+      clearSorting,
+      columnDef: { meta: col.meta },
+    });
+
+    const mock = mockColumn(columns[0]);
+
+    const { container, rerender } = render(
+      <TooltipProvider>
+        {/* oxlint-disable-next-line typescript/no-explicit-any */}
+        {(columns[0].header as any)({ column: mock })}
+      </TooltipProvider>,
+    );
+
+    const sortButton = container.querySelector(
       "[data-testid='data-table-sort-button']",
     );
-    expect(centerHeader?.className).not.toContain("flex-row-reverse");
+    expect(sortButton).toBeTruthy();
+
+    // first click unsorted > asc
+    fireEvent.click(sortButton!);
+    expect(toggleSorting).toHaveBeenCalledWith(false, true);
+
+    // Simulate asc state and re-render
+    sortDirection = "asc";
+    rerender(
+      <TooltipProvider>
+        {/* oxlint-disable-next-line typescript/no-explicit-any */}
+        {(columns[0].header as any)({ column: mock })}
+      </TooltipProvider>,
+    );
+
+    // second click asc >dsc
+    fireEvent.click(sortButton!);
+    expect(toggleSorting).toHaveBeenCalledWith(true, true);
+
+    // Simulate desc state and re-render
+    sortDirection = "desc";
+    rerender(
+      <TooltipProvider>
+        {/* oxlint-disable-next-line typescript/no-explicit-any */}
+        {(columns[0].header as any)({ column: mock })}
+      </TooltipProvider>,
+    );
+
+    // third click back to unsorted
+    fireEvent.click(sortButton!);
+    expect(clearSorting).toHaveBeenCalled();
   });
 
   it("should not include index column if it exists", () => {
@@ -503,7 +681,7 @@ describe("LocaleNumber", () => {
         <LocaleNumber value={1_234_567.89} />
       </I18nProvider>,
     );
-    // eslint-disable-next-line no-irregular-whitespace
+    // oxlint-disable-next-line no-irregular-whitespace
     expect(container.textContent).toMatchInlineSnapshot(`"1 234 567,89"`);
   });
 
@@ -571,6 +749,179 @@ describe("LocaleNumber", () => {
       </I18nProvider>,
     );
     expect(container.textContent).toMatchInlineSnapshot(`"10,000,000,000"`);
+  });
+
+  it("should pad decimals with minFractionDigits", () => {
+    const { container } = render(
+      <I18nProvider locale="en-US">
+        <LocaleNumber value={42} minFractionDigits={2} />
+      </I18nProvider>,
+    );
+    expect(container.textContent).toMatchInlineSnapshot(`"42.00"`);
+  });
+
+  it("should pad to minFractionDigits for numbers with fewer decimals", () => {
+    const { container } = render(
+      <I18nProvider locale="en-US">
+        <LocaleNumber value={1234.5} minFractionDigits={3} />
+      </I18nProvider>,
+    );
+    expect(container.textContent).toMatchInlineSnapshot(`"1,234.500"`);
+  });
+
+  it("should not truncate decimals beyond minFractionDigits", () => {
+    const { container } = render(
+      <I18nProvider locale="en-US">
+        <LocaleNumber value={1.234_56} minFractionDigits={2} />
+      </I18nProvider>,
+    );
+    expect(container.textContent).toMatchInlineSnapshot(`"1.23456"`);
+  });
+});
+
+describe("renderCellValue with string + edge whitespace", () => {
+  const createMockStringColumn = () =>
+    ({
+      id: "desc",
+      columnDef: {
+        meta: {
+          dataType: "string" as const,
+          dtype: "object",
+        },
+      },
+      getColumnFormatting: () => undefined,
+      getColumnWrapping: () => undefined,
+      applyColumnFormatting: (value: unknown) => value,
+    }) as unknown as Column<unknown>;
+
+  const renderWithProviders = (node: React.ReactNode) =>
+    render(
+      <I18nProvider locale="en-US">
+        <TooltipProvider>{node}</TooltipProvider>
+      </I18nProvider>,
+    );
+
+  it("renders edge whitespace markers and still detects the URL in the middle", () => {
+    const mockColumn = createMockStringColumn();
+    const value = "  https://example.com  ";
+    const result = renderCellValue({
+      column: mockColumn,
+      renderValue: () => value,
+      getValue: () => value,
+      selectCell: undefined,
+      cellStyles: "",
+    });
+
+    const { container } = renderWithProviders(result);
+
+    // URL detection runs on the middle, so the anchor is still rendered.
+    const link = container.querySelector("a");
+    expect(link).toBeTruthy();
+    expect(link?.href).toBe("https://example.com/");
+
+    // The link text is exactly the URL — no leading/trailing whitespace
+    // leaked into the anchor.
+    expect(link?.textContent).toBe("https://example.com");
+
+    // Both edge-whitespace marker containers are present and render
+    // visible glyphs (U+2423 "open box" for regular spaces).
+    const markerSpans = container.querySelectorAll(
+      "span[aria-label$='space'], span[aria-label$='spaces']",
+    );
+    expect(markerSpans.length).toBeGreaterThanOrEqual(2);
+    expect(container.textContent?.includes("\u2423")).toBe(true);
+  });
+
+  it("does not split URLs on whitespace padding (regression)", () => {
+    const mockColumn = createMockStringColumn();
+    // Trailing whitespace would previously be consumed by the URL regex
+    // (\S+). We render the middle only through parseContent to avoid that.
+    const value = "go here: https://example.com/path  ";
+    const result = renderCellValue({
+      column: mockColumn,
+      renderValue: () => value,
+      getValue: () => value,
+      selectCell: undefined,
+      cellStyles: "",
+    });
+
+    const { container } = renderWithProviders(result);
+
+    const link = container.querySelector("a");
+    expect(link).toBeTruthy();
+    // href is URL-normalized by the browser — should not include the
+    // trailing spaces as part of the URL path.
+    expect(link?.href).toBe("https://example.com/path");
+    expect(link?.textContent?.trimEnd()).toBe("https://example.com/path");
+  });
+
+  it("renders no marker span when the string has no edge whitespace", () => {
+    const mockColumn = createMockStringColumn();
+    const value = "https://example.com";
+    const result = renderCellValue({
+      column: mockColumn,
+      renderValue: () => value,
+      getValue: () => value,
+      selectCell: undefined,
+      cellStyles: "",
+    });
+
+    const { container } = renderWithProviders(result);
+    // No marker glyph leaked through.
+    expect(container.textContent?.includes("\u2423")).toBe(false);
+    // And no WhitespaceMarkers wrapper was rendered at all. The component
+    // returns null for empty strings, and always sets an aria-label
+    // generated by `describeWhitespace` when it does render (e.g.
+    // "1 space", "2 spaces", "1 tab", "1 unicode whitespace").
+    // Matching the "space"/"spaces" suffix is enough here because the
+    // test value contains no whitespace, so no marker of any kind should
+    // appear.
+    const markerSpans = container.querySelectorAll(
+      "span[aria-label$='space'], span[aria-label$='spaces']",
+    );
+    expect(markerSpans.length).toBe(0);
+  });
+});
+
+describe("renderCellValue with boolean values", () => {
+  const createMockColumn = () =>
+    ({
+      id: "active",
+      columnDef: {
+        meta: {
+          dataType: "boolean" as const,
+          dtype: "bool",
+        },
+      },
+      getColumnFormatting: () => undefined,
+      getColumnWrapping: () => undefined,
+      applyColumnFormatting: (value: unknown) => value,
+    }) as unknown as Column<unknown>;
+
+  it("should render true as True", () => {
+    const mockColumn = createMockColumn();
+    const result = renderCellValue({
+      column: mockColumn,
+      renderValue: () => true,
+      getValue: () => true,
+      selectCell: undefined,
+      cellStyles: "",
+    });
+    const { container } = render(result);
+    expect(container.textContent).toBe("True");
+  });
+
+  it("should render false as False", () => {
+    const mockColumn = createMockColumn();
+    const result = renderCellValue({
+      column: mockColumn,
+      renderValue: () => false,
+      getValue: () => false,
+      selectCell: undefined,
+      cellStyles: "",
+    });
+    const { container } = render(result);
+    expect(container.textContent).toBe("False");
   });
 });
 

@@ -6,7 +6,7 @@ import re
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 from marimo._ast.load import get_notebook_status
 from marimo._ast.parse import MarimoFileError
@@ -22,6 +22,7 @@ from marimo._utils import async_path
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
+    from marimo._config.config import LintConfig
     from marimo._lint.rules.base import LintRule
 
 
@@ -44,7 +45,7 @@ def contents_differ_excluding_generated_with(
 
 
 async def _to_async_iterator(
-    files_to_check: Union[AsyncIterator[Path], Iterator[Path]],
+    files_to_check: AsyncIterator[Path] | Iterator[Path],
 ) -> AsyncIterator[Path]:
     """Convert a regular iterator to an async iterator if needed."""
     if hasattr(files_to_check, "__aiter__"):
@@ -88,17 +89,23 @@ class Linter:
         rules: list[LintRule] | None = None,
         ignore_scripts: bool = False,
         formatter: str = "full",
+        lint_config: LintConfig | None = None,
     ):
         if rules is not None:
             self.rule_engine = RuleEngine(rules, early_stopping)
         else:
-            self.rule_engine = RuleEngine.create_default(early_stopping)
+            self.rule_engine = RuleEngine.create_default(
+                early_stopping, lint_config=lint_config
+            )
         self.pipe = pipe
         self.fix_files = fix_files
         self.unsafe_fixes = unsafe_fixes
         self.ignore_scripts = ignore_scripts
         self.formatter = formatter
         self.files: list[FileStatus] = []
+        self._lint_config = lint_config
+        self._early_stopping = early_stopping
+        self._explicit_rules = rules is not None
 
         # Create rule lookup for unsafe fixes
         self.rule_lookup = {rule.code: rule for rule in self.rule_engine.rules}
@@ -109,6 +116,42 @@ class Linter:
         # Counters for summary
         self.fixed_count: int = 0
         self.issues_count: int = 0
+
+    def _rule_engine_for_file(self, file_path: str) -> RuleEngine:
+        """Return a RuleEngine for the given file.
+
+        If the file contains PEP 723 ``[tool.marimo.lint]`` metadata and no
+        explicit rules were provided, create a per-file engine that merges
+        the file-level config with the global lint config.
+        """
+        if self._explicit_rules:
+            return self.rule_engine
+
+        from marimo._config.manager import ScriptConfigManager
+
+        try:
+            file_config = ScriptConfigManager(file_path).get_config(
+                hide_secrets=False
+            )
+        except Exception:
+            return self.rule_engine
+
+        file_lint = file_config.get("lint")
+        if not file_lint:
+            return self.rule_engine
+
+        # Merge: file-level config is additive to the global config
+        merged: LintConfig = {**self._lint_config} if self._lint_config else {}
+        if "select" in file_lint:
+            existing = list(merged.get("select") or [])
+            merged["select"] = existing + file_lint["select"]
+        if "ignore" in file_lint:
+            existing = list(merged.get("ignore") or [])
+            merged["ignore"] = existing + file_lint["ignore"]
+
+        return RuleEngine.create_default(
+            self._early_stopping, lint_config=merged
+        )
 
     async def _process_single_file(self, file: Path) -> FileStatus:
         """Process a single file and return its status."""
@@ -138,7 +181,7 @@ class Linter:
             self.errored = True
             file_status.failed = True
             file_status.message = f"Failed to parse: {file_path}"
-            file_status.details = [f"SyntaxError: {str(e)}"]
+            file_status.details = [f"SyntaxError: {e!s}"]
             return file_status
         except MarimoFileError as e:
             # Handle syntax errors in notebooks
@@ -155,7 +198,7 @@ class Linter:
                 file_status.message = (
                     f"Not recognizable as a marimo notebook: {file_path}"
                 )
-                file_status.details = [f"MarimoFileError: {str(e)}"]
+                file_status.details = [f"MarimoFileError: {e!s}"]
                 return file_status
 
         file_status.notebook = load_result.notebook
@@ -179,16 +222,15 @@ class Linter:
                 )
         elif load_result.notebook is not None:
             try:
+                rule_engine = self._rule_engine_for_file(file_path)
                 # Check notebook with all rules including parsing
-                file_status.diagnostics = (
-                    await self.rule_engine.check_notebook(
-                        load_result.notebook,
-                        load_result.contents or "",
-                        # Add parsing rule if there's captured output
-                        stdout=stdout.getvalue().strip(),
-                        stderr=stderr.getvalue().strip(),
-                        logs=logs,
-                    )
+                file_status.diagnostics = await rule_engine.check_notebook(
+                    load_result.notebook,
+                    load_result.contents or "",
+                    # Add parsing rule if there's captured output
+                    stdout=stdout.getvalue().strip(),
+                    stderr=stderr.getvalue().strip(),
+                    logs=logs,
                 )
             except Exception as e:
                 # Handle other parsing errors
@@ -279,13 +321,13 @@ class Linter:
         )
 
     def run_streaming(
-        self, files_to_check: Union[AsyncIterator[Path], Iterator[Path]]
+        self, files_to_check: AsyncIterator[Path] | Iterator[Path]
     ) -> None:
         """Run linting checks with real-time streaming output."""
         asyncio.run(self._run_streaming_async(files_to_check))
 
     async def _run_streaming_async(
-        self, files_to_check: Union[AsyncIterator[Path], Iterator[Path]]
+        self, files_to_check: AsyncIterator[Path] | Iterator[Path]
     ) -> None:
         """Internal async implementation of run_streaming."""
         # Process files as they complete
@@ -300,15 +342,18 @@ class Linter:
             self._pipe_file_status(file_status)
 
             # Add to fix queue and potentially fix if requested
-            if self.fix_files and not (
-                file_status.skipped
-                or file_status.failed
-                or file_status.notebook is None
+            if (
+                self.fix_files
+                and not (
+                    file_status.skipped
+                    or file_status.failed
+                    or file_status.notebook is None
+                )
+                and await self.fix(file_status)
             ):
-                if await self.fix(file_status):
-                    fixed_count += 1
-                    if self.pipe:
-                        self.pipe(f"Updated: {file_status.file}")
+                fixed_count += 1
+                if self.pipe:
+                    self.pipe(f"Updated: {file_status.file}")
 
         self.fixed_count = fixed_count
 

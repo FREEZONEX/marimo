@@ -23,6 +23,8 @@ export type ExportAsIPYNBRequest = schemas["ExportAsIPYNBRequest"];
 export type ExportAsScriptRequest = schemas["ExportAsScriptRequest"];
 export type ExportAsPDFRequest = schemas["ExportAsPDFRequest"];
 export type UpdateCellOutputsRequest = schemas["UpdateCellOutputsRequest"];
+export type FileCopyRequest = schemas["FileCopyRequest"];
+export type FileCopyResponse = schemas["FileCopyResponse"];
 export type FileCreateRequest = schemas["FileCreateRequest"];
 export type FileCreateResponse = schemas["FileCreateResponse"];
 export type FileDeleteRequest = schemas["FileDeleteRequest"];
@@ -59,6 +61,7 @@ export type PreviewDatasetColumnRequest =
   schemas["PreviewDatasetColumnRequest"];
 export type PreviewSQLTableRequest = schemas["PreviewSQLTableRequest"];
 export type ListSQLTablesRequest = schemas["ListSQLTablesRequest"];
+export type ListSQLSchemasRequest = schemas["ListSQLSchemasRequest"];
 export type ListDataSourceConnectionRequest =
   schemas["ListDataSourceConnectionRequest"];
 export type ValidateSQLRequest = schemas["ValidateSQLRequest"];
@@ -77,9 +80,21 @@ export type SaveUserConfigurationRequest =
 export interface SetCellConfigRequest {
   configs: Record<CellId, Partial<CellConfig>>;
 }
+/**
+ * Client-side shape for creating a file/directory/notebook. The HTTP
+ * transport sends this as multipart/form-data; the WASM bridge base64-encodes
+ * `file` internally and crosses the JS<->Py boundary as JSON.
+ */
+export interface FileCreateInput {
+  path: string;
+  type: "file" | "directory" | "notebook";
+  name: string;
+  file?: Blob;
+}
 export type UpdateUIElementRequest = schemas["UpdateUIElementRequest"];
 export type ModelRequest = schemas["ModelRequest"];
-export type UpdateCellIdsRequest = schemas["UpdateCellIdsRequest"];
+export type NotebookDocumentTransactionRequest =
+  schemas["NotebookDocumentTransactionRequest"];
 export type UpdateUserConfigRequest = schemas["UpdateUserConfigRequest"];
 export type ShutdownSessionRequest = schemas["ShutdownSessionRequest"];
 export type Snippet = schemas["Snippet"];
@@ -137,7 +152,9 @@ export interface EditRequests {
   saveAppConfig: (request: SaveAppConfigurationRequest) => Promise<null>;
   saveCellConfig: (request: SetCellConfigRequest) => Promise<null>;
   sendRestart: () => Promise<null>;
-  syncCellIds: (request: UpdateCellIdsRequest) => Promise<null>;
+  sendDocumentTransaction: (
+    request: NotebookDocumentTransactionRequest,
+  ) => Promise<null>;
   sendInstallMissingPackages: (
     request: InstallPackagesRequest,
   ) => Promise<null>;
@@ -146,6 +163,7 @@ export interface EditRequests {
   previewDatasetColumn: (request: PreviewDatasetColumnRequest) => Promise<null>;
   previewSQLTable: (request: PreviewSQLTableRequest) => Promise<null>;
   previewSQLTableList: (request: ListSQLTablesRequest) => Promise<null>;
+  previewSQLSchemaList: (request: ListSQLSchemasRequest) => Promise<null>;
   previewDataSourceConnection: (
     request: ListDataSourceConnectionRequest,
   ) => Promise<null>;
@@ -158,11 +176,12 @@ export interface EditRequests {
   sendListFiles: (request: FileListRequest) => Promise<FileListResponse>;
   sendSearchFiles: (request: FileSearchRequest) => Promise<FileSearchResponse>;
   sendCreateFileOrFolder: (
-    request: FileCreateRequest,
+    request: FileCreateInput,
   ) => Promise<FileCreateResponse>;
   sendDeleteFileOrFolder: (
     request: FileDeleteRequest,
   ) => Promise<FileDeleteResponse>;
+  sendCopyFileOrFolder: (request: FileCopyRequest) => Promise<FileCopyResponse>;
   sendRenameFileOrFolder: (
     request: FileMoveRequest,
   ) => Promise<FileMoveResponse>;

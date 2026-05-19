@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from textwrap import dedent
-from typing import TYPE_CHECKING, Optional, Union, cast
+from typing import TYPE_CHECKING, cast
 
 from marimo import _loggers
 from marimo._ast.app import App, InternalApp
@@ -14,9 +15,8 @@ from marimo._ast.cell import Cell, CellConfig
 from marimo._ast.compiler import compile_cell
 from marimo._messaging.cell_output import CellOutput
 from marimo._output.utils import uri_encode_component
-from marimo._session.notebook import AppFileManager
+from marimo._session.notebook import AppFileManager, load_notebook
 from marimo._types.ids import CellId_t
-from marimo._utils.marimo_path import MarimoPath
 from marimo._version import __version__
 
 if sys.platform == "win32":  # handling for windows
@@ -57,18 +57,17 @@ class MarimoIslandStub:
         self._display_output = display_output
         self._is_reactive = is_reactive
 
-        self._internal_app: Optional[InternalApp] = None
-        self._session_view: Optional[SessionView] = None
-        self._output: Optional[CellOutput] = None
+        self._internal_app: InternalApp | None = None
+        self._session_view: SessionView | None = None
+        self._output: CellOutput | None = None
 
     @property
-    def output(self) -> Optional[CellOutput]:
+    def output(self) -> CellOutput | None:
         # Leave output accessible for direct use for non-interactive cases e.g.
         # pdf.
-        if self._output is None:
-            if self._session_view is not None:
-                outputs = self._session_view.get_cell_outputs([self._cell_id])
-                self._output = outputs.get(self._cell_id, None)
+        if self._output is None and self._session_view is not None:
+            outputs = self._session_view.get_cell_outputs([self._cell_id])
+            self._output = outputs.get(self._cell_id, None)
         return self._output
 
     @property
@@ -77,9 +76,9 @@ class MarimoIslandStub:
 
     def render(
         self,
-        display_code: Optional[bool] = None,
-        display_output: Optional[bool] = None,
-        is_reactive: Optional[bool] = None,
+        display_code: bool | None = None,
+        display_output: bool | None = None,
+        is_reactive: bool | None = None,
         as_raw: bool = False,
     ) -> str:
         """
@@ -251,6 +250,10 @@ class MarimoIslandGenerator:
         self._app = InternalApp(App())
         self._stubs: list[MarimoIslandStub] = []
         self._config = _AppConfig()
+        # When constructed via ``from_file``, this records the notebook
+        # source path so cells see ``__file__`` / ``mo.notebook_dir()``
+        # resolve to the notebook rather than to the host process.
+        self._source_filename: str | None = None
 
     @staticmethod
     def from_file(
@@ -266,15 +269,13 @@ class MarimoIslandGenerator:
         - filename (str): Marimo .py filename to convert to reactive HTML.
         - display_code (bool): Whether to display the code in HTML snippets.
         """
-        from marimo._server.file_router import AppFileRouter
-
-        path = MarimoPath(filename)
-        file_router = AppFileRouter.from_filename(path)
-        file_key = file_router.get_unique_file_key()
-        assert file_key is not None
-        file_manager = file_router.get_file_manager(file_key)
+        file_manager = load_notebook(filename)
 
         generator = MarimoIslandGenerator()
+        # Resolve at capture time so a chdir between ``from_file`` and
+        # ``build`` doesn't change which absolute path cells see for
+        # ``__file__`` / ``mo.notebook_dir()``.
+        generator._source_filename = os.path.abspath(filename)
         stubs = []
         for cell_data in file_manager.app.cell_manager.cell_data():
             stubs.append(
@@ -346,7 +347,9 @@ class MarimoIslandGenerator:
             raise ValueError("You can only call build() once")
 
         (session, did_error) = await run_app_until_completion(
-            file_manager=AppFileManager.from_app(self._app),
+            file_manager=AppFileManager.from_app(
+                self._app, filename=self._source_filename
+            ),
             cli_args={},
             argv=None,
         )
@@ -363,7 +366,7 @@ class MarimoIslandGenerator:
         self,
         *,
         version_override: str = __version__,
-        _development_url: Union[str, bool] = False,
+        _development_url: str | bool = False,
     ) -> str:
         """
         Render the header for the app.
@@ -412,10 +415,13 @@ class MarimoIslandGenerator:
                 base_url = _development_url
             return dedent(
                 f"""
-                <script
-                    type="module"
-                    src="{base_url}/src/core/islands/main.ts"
-                ></script>
+                <script type="module" src="{base_url}/dist/main.js"></script>
+                <link
+                    href="{base_url}/dist/style.css"
+                    rel="stylesheet"
+                    title="marimo-islands"
+                    crossorigin="anonymous"
+                />
                 {fonts}
                 """
             ).strip()
@@ -430,6 +436,7 @@ class MarimoIslandGenerator:
             <link
                 href="{base_url}/dist/style.css"
                 rel="stylesheet"
+                title="marimo-islands"
                 crossorigin="anonymous"
             />
             {fonts}
@@ -487,9 +494,9 @@ class MarimoIslandGenerator:
         self,
         *,
         include_init_island: bool = True,
-        max_width: Optional[str] = None,
-        margin: Optional[str] = None,
-        style: Optional[str] = None,
+        max_width: str | None = None,
+        margin: str | None = None,
+        style: str | None = None,
     ) -> str:
         """
         Render the body for the app.
@@ -538,11 +545,11 @@ class MarimoIslandGenerator:
         self,
         *,
         version_override: str = __version__,
-        _development_url: Union[str, bool] = False,
+        _development_url: str | bool = False,
         include_init_island: bool = True,
-        max_width: Optional[str] = None,
-        margin: Optional[str] = None,
-        style: Optional[str] = None,
+        max_width: str | None = None,
+        margin: str | None = None,
+        style: str | None = None,
     ) -> str:
         """
         Render reactive html for the app.

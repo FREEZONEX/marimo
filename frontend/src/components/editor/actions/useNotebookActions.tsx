@@ -1,7 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import { startCase } from "lodash-es";
 import {
   BookMarkedIcon,
   CheckIcon,
@@ -18,7 +17,6 @@ import {
   EyeOffIcon,
   FastForwardIcon,
   FileIcon,
-  FilePlus2Icon,
   Files,
   FileTextIcon,
   FolderDownIcon,
@@ -37,6 +35,7 @@ import {
   PresentationIcon,
   SettingsIcon,
   Share2Icon,
+  SparklesIcon,
   Undo2Icon,
   XCircleIcon,
   YoutubeIcon,
@@ -44,14 +43,17 @@ import {
 } from "lucide-react";
 import { settingDialogAtom } from "@/components/app-config/state";
 import { MarkdownIcon } from "@/components/editor/cell/code/icons";
+import { MarimoPlusIcon } from "@/components/icons/marimo-icons";
 import { useImperativeModal } from "@/components/modal/ImperativeModal";
 import { renderShortcut } from "@/components/shortcuts/renderShortcut";
+import { PairWithAgentModal } from "@/components/editor/actions/pair-with-agent-modal";
 import { ShareStaticNotebookModal } from "@/components/static-html/share-modal";
 import { toast } from "@/components/ui/use-toast";
 import {
   canUndoDeletesAtom,
   getNotebook,
   hasDisabledCellsAtom,
+  undoLabelAtom,
   useCellActions,
 } from "@/core/cells/cells";
 import { disabledCellIds } from "@/core/cells/utils";
@@ -80,6 +82,7 @@ import {
 import { Filenames } from "@/utils/filenames";
 import { Objects } from "@/utils/objects";
 import type { ProgressState } from "@/utils/progress";
+import { Strings } from "@/utils/strings";
 import { newNotebookURL } from "@/utils/urls";
 import { useRunAllCells } from "../cell/useRunCells";
 import { useChromeActions, useChromeState } from "../chrome/state";
@@ -135,6 +138,7 @@ export function useNotebookActions() {
 
   const hasDisabledCells = useAtomValue(hasDisabledCellsAtom);
   const canUndoDeletes = useAtomValue(canUndoDeletesAtom);
+  const undoLabel = useAtomValue(undoLabelAtom);
   const { selectedLayout } = useLayoutState();
   const { setLayoutView } = useLayoutActions();
   const togglePresenting = useTogglePresenting();
@@ -344,6 +348,15 @@ export function useNotebookActions() {
     },
 
     {
+      icon: <SparklesIcon size={14} strokeWidth={1.5} />,
+      label: "Pair with an agent",
+      hidden: isWasm(),
+      handle: async () => {
+        openModal(<PairWithAgentModal onClose={closeModal} />);
+      },
+    },
+
+    {
       icon: <Share2Icon size={14} strokeWidth={1.5} />,
       label: "Share",
       handle: NOOP_HANDLER,
@@ -371,6 +384,18 @@ export function useNotebookActions() {
             });
           },
         },
+        {
+          icon: <MarimoPlusIcon size={14} strokeWidth={1.5} />,
+          label: "Create molab notebook",
+          handle: async () => {
+            const code = await readCode();
+            const url = createShareableLink({
+              code: code.contents,
+              baseUrl: `${Constants.molab}/new`,
+            });
+            window.open(url, "_blank");
+          },
+        },
       ],
     },
 
@@ -385,7 +410,7 @@ export function useNotebookActions() {
             return [];
           }
           return {
-            label: startCase(id),
+            label: Strings.startCase(id),
             rightElement: renderCheckboxElement(selectedPanel === id),
             icon: <Icon size={14} strokeWidth={1.5} />,
             handle: () => toggleApplication(id),
@@ -502,7 +527,7 @@ export function useNotebookActions() {
     },
     {
       icon: <Undo2Icon size={14} strokeWidth={1.5} />,
-      label: "Undo cell deletion",
+      label: undoLabel,
       hidden: !canUndoDeletes || kioskMode,
       handle: () => {
         undoDeleteCell();
@@ -634,7 +659,7 @@ export function useNotebookActions() {
     },
 
     {
-      icon: <FilePlus2Icon size={14} strokeWidth={1.5} />,
+      icon: <MarimoPlusIcon size={14} strokeWidth={1.5} />,
       label: "New notebook",
       // If file is in the url, then we ran `marimo edit`
       // without a specific file

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from marimo import _loggers
 from marimo._data.models import (
@@ -53,7 +53,9 @@ def get_datasets_from_variables(
     return tables
 
 
-def _get_data_table(value: object, variable_name: VariableName) -> Optional[DataTable]:
+def _get_data_table(
+    value: object, variable_name: VariableName
+) -> DataTable | None:
     try:
         table = get_table_manager_or_none(value)
         if table is None:
@@ -129,7 +131,7 @@ def _get_default_connection() -> "duckdb.DuckDBPyConnection":
 
 
 def execute_duckdb_query(
-    connection: Optional[duckdb.DuckDBPyConnection], query: str
+    connection: duckdb.DuckDBPyConnection | None, query: str
 ) -> list[Any]:
     """Execute a DuckDB query and return the result.
 
@@ -152,8 +154,8 @@ def execute_duckdb_query(
 
 
 def get_databases_from_duckdb(
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName] = None,
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None = None,
 ) -> list[Database]:
     try:
         return _get_databases_from_duckdb_internal(connection, engine_name)
@@ -163,8 +165,8 @@ def get_databases_from_duckdb(
 
 
 def _get_empty_databases(
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName],
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None,
 ) -> list[Database]:
     # Fallback to get database names from DuckDB
     all_dbs = _get_duckdb_database_names(connection)
@@ -180,8 +182,8 @@ def _get_empty_databases(
 
 
 def _get_databases_from_duckdb_internal(
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName] = None,
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None = None,
 ) -> list[Database]:
     """Get database information from DuckDB."""
     # Columns
@@ -271,6 +273,7 @@ def _get_databases_from_duckdb_internal(
                 for column_name, column_type in zip(
                     cast(list[str], column_names),
                     cast(list[str], column_types),
+                    strict=False,
                 )
             ]
 
@@ -298,7 +301,7 @@ def _get_databases_from_duckdb_internal(
 
 
 def get_table_columns(
-    connection: Optional[duckdb.DuckDBPyConnection], table_name: str
+    connection: duckdb.DuckDBPyConnection | None, table_name: str
 ) -> list[DataTableColumn]:
     """Dedicated query to get columns from a table."""
     query = f"DESCRIBE TABLE {table_name}"
@@ -334,8 +337,8 @@ def get_table_columns(
 
 def form_databases_from_dict(
     databases_dict: dict[str, dict[str, list[DataTable]]],
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName],
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None,
     backfill_empty_databases: bool,
 ) -> list[Database]:
     # Convert grouped data into Database objects
@@ -370,8 +373,8 @@ def form_databases_from_dict(
 
 
 def get_duckdb_databases_agg_query(
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName],
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None,
 ) -> list[Database]:
     """Uses a different query to get database information, which has wider support but has some aggregation overhead"""
 
@@ -468,7 +471,7 @@ def get_duckdb_databases_agg_query(
 
 
 def _get_duckdb_database_names(
-    connection: Optional[duckdb.DuckDBPyConnection],
+    connection: duckdb.DuckDBPyConnection | None,
 ) -> list[str]:
     """Get database names from DuckDB. This includes internal databases and databases that have no tables."""
     # Columns
@@ -560,6 +563,7 @@ _BINARY_TYPES = {"bit", "bitstring", "binary", "varbinary", "bytea"}
 _UNKNOWN_TYPES = {
     "row",
     "geometry",
+    "inet",
     # Null type (can occur when attaching databases or with unknown column types)
     "null",
     '"null"',
@@ -578,11 +582,7 @@ def _db_type_to_data_type(db_type: str) -> DataType:
     if db_type in _INTEGER_TYPES or db_type.startswith("uint"):
         return "integer"
 
-    if (
-        db_type in _NUMERIC_TYPES
-        or db_type.startswith("decimal")
-        or db_type.startswith("float")
-    ):
+    if db_type in _NUMERIC_TYPES or db_type.startswith(("decimal", "float")):
         return "number"
 
     if db_type in _BOOLEAN_TYPES:
@@ -607,15 +607,9 @@ def _db_type_to_data_type(db_type: str) -> DataType:
         return "string"
 
     # Nested types
-    if (
-        db_type.startswith("union")
-        or db_type.startswith("map")
-        or db_type.startswith("struct")
-        or db_type.startswith("list")
-        or db_type.startswith("array")
-        or db_type.startswith("json")
-        or ("[" in db_type and "]" in db_type)
-    ):
+    if db_type.startswith(
+        ("union", "map", "struct", "list", "array", "json")
+    ) or ("[" in db_type and "]" in db_type):
         return "unknown"
 
     # Other special types

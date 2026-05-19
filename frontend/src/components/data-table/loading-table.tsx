@@ -24,7 +24,10 @@ export const LoadingTable = ({
 
   return (
     <div className={cn(wrapperClassName, "flex flex-col space-y-2")}>
-      <div className={cn(className || "rounded-md border")}>
+      <div
+        part="table-wrapper"
+        className={cn(className || "rounded-md border")}
+      >
         <Table>
           <TableHeader>
             {Array.from({ length: 1 }).map((_, i) => (
@@ -40,7 +43,7 @@ export const LoadingTable = ({
           <TableBody>
             {Array.from({ length: pageSize }).map((_, i) => (
               <TableRow key={i}>
-                {Array.from({ length: NUM_COLUMNS }).map((_, j) => (
+                {Array.from({ length: NUM_COLUMNS }).map((__, j) => (
                   <TableCell key={j}>
                     <div className="h-4 bg-(--slate-5) animate-pulse rounded-md w-[90%]" />
                   </TableCell>

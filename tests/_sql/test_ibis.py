@@ -310,7 +310,7 @@ def test_ibis_sql_types() -> None:
     assert table.num_rows is None
 
     for column in table.columns:
-        assert column.name in expected_marimo_type.keys()
+        assert column.name in expected_marimo_type
         assert column.type == expected_marimo_type[column.name], (
             f"{column.name} {column.type} {expected_marimo_type[column.name]}"
         )
@@ -457,7 +457,7 @@ def test_ibis_engine_get_schemas(ibis_backend: SQLBackend) -> None:
     """Test IbisEngine get_schemas method."""
     var_name = VariableName("my_ibis")
     engine = IbisEngine(ibis_backend, engine_name=var_name)
-    schemas = engine._get_schemas(
+    schemas = engine.get_schemas(
         database="memory",
         include_tables=True,
         include_table_details=True,
@@ -473,7 +473,7 @@ def test_ibis_engine_get_schemas(ibis_backend: SQLBackend) -> None:
     assert schema == get_expected_schema("my_schema", "test2")
 
     # Test with include_table_details false
-    schemas = engine._get_schemas(
+    schemas = engine.get_schemas(
         database="memory",
         include_tables=True,
         include_table_details=False,
@@ -489,7 +489,7 @@ def test_ibis_engine_get_schemas(ibis_backend: SQLBackend) -> None:
     assert schema.tables[0] == expected_table
 
     # Test with include_tables false
-    schemas = engine._get_schemas(
+    schemas = engine.get_schemas(
         database="memory",
         include_tables=False,
         include_table_details=True,

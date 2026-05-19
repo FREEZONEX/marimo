@@ -1,5 +1,23 @@
 /* Copyright 2026 Marimo. All rights reserved. */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { components } from "@marimo-team/marimo-api";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  cellId,
+  requestId,
+  uiElementId,
+  widgetModelId,
+} from "@/__tests__/branded";
+
+type Base64String = components["schemas"]["Base64String"];
+interface TestIslandApp {
+  id: string;
+  cells: { code: string; idx: number; output: string }[];
+}
+interface TestExportContext {
+  trusted: true;
+  notebookCode?: string;
+}
 
 // Mock browser APIs before any imports
 vi.stubGlobal(
@@ -23,8 +41,23 @@ class MockURL {
 vi.stubGlobal("URL", MockURL);
 
 // Mock the worker RPC before importing the bridge
-const mockBridge = vi.fn();
-const mockLoadPackages = vi.fn();
+const {
+  mockBridge,
+  mockLoadPackages,
+  mockStartSessionRequest,
+  mockParseMarimoIslandApps,
+  mockCreateMarimoFile,
+  mockGetMarimoExportContext,
+} = vi.hoisted(() => ({
+  mockBridge: vi.fn(),
+  mockLoadPackages: vi.fn(),
+  mockStartSessionRequest: vi.fn(),
+  mockParseMarimoIslandApps: vi.fn<() => TestIslandApp[]>(() => []),
+  mockCreateMarimoFile: vi.fn(),
+  mockGetMarimoExportContext: vi.fn<() => TestExportContext | undefined>(
+    () => undefined,
+  ),
+}));
 
 vi.mock("@/core/wasm/rpc", () => ({
   getWorkerRPC: () => ({
@@ -32,7 +65,7 @@ vi.mock("@/core/wasm/rpc", () => ({
       request: {
         bridge: mockBridge,
         loadPackages: mockLoadPackages,
-        startSession: vi.fn(),
+        startSession: mockStartSessionRequest,
       },
       send: {
         consumerReady: vi.fn(),
@@ -44,13 +77,17 @@ vi.mock("@/core/wasm/rpc", () => ({
 
 // Mock the parse module to avoid DOM dependencies
 vi.mock("../parse", () => ({
-  parseMarimoIslandApps: () => [],
-  createMarimoFile: vi.fn(),
+  parseMarimoIslandApps: mockParseMarimoIslandApps,
+  createMarimoFile: mockCreateMarimoFile,
 }));
 
 // Mock uuid to have predictable tokens
 vi.mock("@/utils/uuid", () => ({
   generateUUID: () => "test-uuid-12345",
+}));
+
+vi.mock("@/core/static/export-context", () => ({
+  getMarimoExportContext: mockGetMarimoExportContext,
 }));
 
 // Mock getMarimoVersion
@@ -61,6 +98,7 @@ vi.mock("@/core/meta/globals", () => ({
 // Mock the jotai store
 vi.mock("@/core/state/jotai", () => ({
   store: {
+    get: vi.fn(),
     set: vi.fn(),
   },
 }));
@@ -73,23 +111,96 @@ describe("IslandsPyodideBridge", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    // Reset the singleton by clearing the window property
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    delete (window as any)._marimo_private_IslandsPyodideBridge;
-    // Access the singleton - creates a fresh instance
-    bridge = IslandsPyodideBridge.INSTANCE;
+    mockParseMarimoIslandApps.mockReturnValue([]);
+    mockCreateMarimoFile.mockReset();
+    mockGetMarimoExportContext.mockReturnValue(undefined);
+    bridge = new IslandsPyodideBridge({ autoStartSessions: false });
   });
 
-  afterEach(() => {
-    // Clean up singleton
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    delete (window as any)._marimo_private_IslandsPyodideBridge;
+  describe("startSessionsForAllApps", () => {
+    it("should prefer trusted export notebook code when there is exactly one reactive app", async () => {
+      mockParseMarimoIslandApps.mockReturnValue([
+        {
+          id: "app-1",
+          cells: [{ code: "x = 1", idx: 0, output: "<div>1</div>" }],
+        },
+      ]);
+      mockGetMarimoExportContext.mockReturnValue({
+        trusted: true,
+        notebookCode:
+          "import marimo\napp = marimo.App()\n@app.cell\ndef __():\n    x = 1\n    return",
+      });
+
+      await (
+        bridge as unknown as { startSessionsForAllApps(): Promise<void> }
+      ).startSessionsForAllApps();
+
+      expect(mockCreateMarimoFile).not.toHaveBeenCalled();
+      expect(mockStartSessionRequest).toHaveBeenCalledWith({
+        appId: "app-1",
+        code: "import marimo\napp = marimo.App()\n@app.cell\ndef __():\n    x = 1\n    return",
+      });
+    });
+
+    it("should keep synthesized per-app files for multiple reactive apps even when export context exists", async () => {
+      mockParseMarimoIslandApps.mockReturnValue([
+        {
+          id: "app-1",
+          cells: [{ code: "x = 1", idx: 0, output: "<div>1</div>" }],
+        },
+        {
+          id: "app-2",
+          cells: [{ code: "y = 2", idx: 0, output: "<div>2</div>" }],
+        },
+      ]);
+      mockGetMarimoExportContext.mockReturnValue({
+        trusted: true,
+        notebookCode: "full notebook should be ignored",
+      });
+      mockCreateMarimoFile
+        .mockReturnValueOnce("generated app 1")
+        .mockReturnValueOnce("generated app 2");
+
+      await (
+        bridge as unknown as { startSessionsForAllApps(): Promise<void> }
+      ).startSessionsForAllApps();
+
+      expect(mockCreateMarimoFile).toHaveBeenCalledTimes(2);
+      expect(mockStartSessionRequest).toHaveBeenNthCalledWith(1, {
+        appId: "app-1",
+        code: "generated app 1",
+      });
+      expect(mockStartSessionRequest).toHaveBeenNthCalledWith(2, {
+        appId: "app-2",
+        code: "generated app 2",
+      });
+    });
+
+    it("should synthesize a file for a single app when no trusted export context is present", async () => {
+      mockParseMarimoIslandApps.mockReturnValue([
+        {
+          id: "app-1",
+          cells: [{ code: "x = 1", idx: 0, output: "<div>1</div>" }],
+        },
+      ]);
+      mockCreateMarimoFile.mockReturnValue("generated app 1");
+
+      await (
+        bridge as unknown as { startSessionsForAllApps(): Promise<void> }
+      ).startSessionsForAllApps();
+
+      expect(mockCreateMarimoFile).toHaveBeenCalledTimes(1);
+      expect(mockStartSessionRequest).toHaveBeenCalledWith({
+        appId: "app-1",
+        code: "generated app 1",
+      });
+    });
   });
 
   describe("sendComponentValues", () => {
     it("should include type field and token in control request", async () => {
       const request = {
-        objectIds: ["Hbol-0"],
+        objectIds: [uiElementId("Hbol-0")],
         values: [58],
       };
 
@@ -108,7 +219,7 @@ describe("IslandsPyodideBridge", () => {
 
     it("should preserve all request properties", async () => {
       const request = {
-        objectIds: ["slider-1", "slider-2"],
+        objectIds: [uiElementId("slider-1"), uiElementId("slider-2")],
         values: [10, 20],
       };
 
@@ -128,7 +239,7 @@ describe("IslandsPyodideBridge", () => {
   describe("sendFunctionRequest", () => {
     it("should include type field in control request", async () => {
       const request = {
-        functionCallId: "call-123",
+        functionCallId: requestId("call-123"),
         namespace: "test_namespace",
         functionName: "my_function",
         args: { x: 1, y: 2 },
@@ -152,7 +263,7 @@ describe("IslandsPyodideBridge", () => {
   describe("sendRun", () => {
     it("should include type field in control request", async () => {
       const request = {
-        cellIds: ["cell-1", "cell-2"],
+        cellIds: [cellId("cell-1"), cellId("cell-2")],
         codes: ["print('hello')", "print('world')"],
       };
 
@@ -170,7 +281,7 @@ describe("IslandsPyodideBridge", () => {
 
     it("should call loadPackages before putControlRequest", async () => {
       const request = {
-        cellIds: ["cell-1"],
+        cellIds: [cellId("cell-1")],
         codes: ["import pandas"],
       };
 
@@ -190,13 +301,13 @@ describe("IslandsPyodideBridge", () => {
   describe("sendModelValue", () => {
     it("should include type field in control request", async () => {
       const request = {
-        modelId: "widget-1",
+        modelId: widgetModelId("widget-1"),
         message: {
           method: "update" as const,
           state: { value: 42 },
           bufferPaths: [],
         },
-        buffers: [],
+        buffers: [] as Base64String[],
       };
 
       await bridge.sendModelValue(request);
@@ -222,16 +333,16 @@ describe("IslandsPyodideBridge", () => {
       // Test all methods to ensure they include the type field
       await bridge.sendComponentValues({ objectIds: [], values: [] });
       await bridge.sendFunctionRequest({
-        functionCallId: "",
+        functionCallId: requestId(""),
         namespace: "",
         functionName: "",
         args: {},
       });
       await bridge.sendRun({ cellIds: [], codes: [] });
       await bridge.sendModelValue({
-        modelId: "",
+        modelId: widgetModelId(""),
         message: { method: "update", state: {}, bufferPaths: [] },
-        buffers: [],
+        buffers: [] as Base64String[],
       });
 
       // All calls should have the type field

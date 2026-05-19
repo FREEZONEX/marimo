@@ -239,7 +239,6 @@ class DependencyManager:
     pytest = Dependency("pytest")
     vegafusion = Dependency("vegafusion")
     vl_convert_python = Dependency("vl_convert")
-    dotenv = Dependency("dotenv")
     docstring_to_markdown = Dependency(
         "docstring_to_markdown", min_version="0.17.0"
     )
@@ -248,6 +247,7 @@ class DependencyManager:
     boto3 = Dependency("boto3")
 
     redshift_connector = Dependency("redshift_connector")
+    starrocks = Dependency("starrocks")
     mcp = Dependency("mcp")
     pydantic_ai = Dependency(
         "pydantic_ai", pkg_name_to_install="pydantic-ai-slim"
@@ -259,6 +259,7 @@ class DependencyManager:
     # Storage
     obstore = Dependency("obstore")
     fsspec = Dependency("fsspec")
+    cloudpathlib = Dependency("cloudpathlib")
 
     # Version requirements to properly support the new superfences introduced in
     # pymdown#2470

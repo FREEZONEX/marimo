@@ -6,7 +6,7 @@ Provides mode-specific logic for determining whether and how to resume sessions.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from marimo import _loggers
 from marimo._session.model import ConnectionState, SessionMode
@@ -17,7 +17,7 @@ from marimo._types.ids import SessionId
 LOGGER = _loggers.marimo_logger()
 
 if TYPE_CHECKING:
-    from marimo._server.file_router import MarimoFileKey
+    from marimo._server.workspace import FileKey
 
 
 class SessionResumeStrategy(Protocol):
@@ -26,8 +26,8 @@ class SessionResumeStrategy(Protocol):
     def try_resume(
         self,
         new_session_id: SessionId,
-        file_key: MarimoFileKey,
-    ) -> Optional[Session]:
+        file_key: FileKey,
+    ) -> Session | None:
         """Try to resume a session.
 
         Args:
@@ -53,18 +53,22 @@ class EditModeResumeStrategy(SessionResumeStrategy):
     def try_resume(
         self,
         new_session_id: SessionId,
-        file_key: MarimoFileKey,
-    ) -> Optional[Session]:
+        file_key: FileKey,
+    ) -> Session | None:
         """Try to resume an orphaned session for the same file."""
         import os
 
+        from marimo._server.workspace import NewFileKey
+
+        if isinstance(file_key, NewFileKey):
+            return None
+
+        abs_path = os.path.abspath(file_key.path)
         # Find sessions with the same file
         sessions_with_file = []
         for session in self._repository.get_all():
             session_id = self._repository.get_session_id(session)
-            if session_id and session.app_file_manager.path == os.path.abspath(
-                file_key
-            ):
+            if session_id and session.app_file_manager.path == abs_path:
                 sessions_with_file.append((session_id, session))
 
         if len(sessions_with_file) == 0:
@@ -108,8 +112,8 @@ class RunModeResumeStrategy(SessionResumeStrategy):
     def try_resume(
         self,
         new_session_id: SessionId,
-        file_key: MarimoFileKey,  # noqa: ARG002
-    ) -> Optional[Session]:
+        file_key: FileKey,  # noqa: ARG002
+    ) -> Session | None:
         """Try to resume a session with matching ID if orphaned."""
         session = self._repository.get_sync(new_session_id)
 

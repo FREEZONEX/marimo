@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,6 +18,7 @@ from marimo._server.api.endpoints.ws.ws_connection_validator import (
 )
 from marimo._server.codes import WebSocketCodes
 from marimo._server.session_manager import SessionManager
+from marimo._server.workspace import serialize_file_key
 from marimo._session.model import ConnectionState, SessionMode
 from marimo._utils.parse_dataclass import parse_raw
 from tests._server.api.endpoints.ws_helpers import (
@@ -31,6 +32,8 @@ from tests._server.conftest import get_kernel_tasks, get_user_config_manager
 from tests._server.mocks import get_session_manager
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from starlette.testclient import TestClient, WebSocketTestSession
 
 
@@ -161,13 +164,16 @@ async def test_file_watcher_calls_reload(client: TestClient) -> None:
     with client.websocket_connect(WS_URL) as websocket:
         data = websocket.receive_json()
         assert_kernel_ready_response(data)
-        filename = session_manager.file_router.get_unique_file_key()
-        assert filename
+        file_key = session_manager.workspace.get_unique_file_key()
+        assert file_key
+        filename = serialize_file_key(file_key)
         with open(filename, "a") as f:  # noqa: ASYNC230
             f.write("\n# test")
             f.close()
         assert session_manager._watcher_manager._watchers
-        watcher = list(session_manager._watcher_manager._watchers.values())[0]
+        watcher = next(
+            iter(session_manager._watcher_manager._watchers.values())
+        )
         await watcher.callback(Path(filename))
         # Drain messages until we get the reload message
         # (other messages like 'variables' may arrive first)
@@ -302,7 +308,7 @@ async def test_connects_to_existing_session_with_same_file(
             # This can/may change if implementation changes, but this is a snapshot to
             # make sure it doesn't change when we don't expect it to
             assert len(messages1) == 14
-            assert messages1[0]["op"] == "update-cell-ids"
+            assert messages1[0]["op"] == "notebook-document-transaction"
 
             # Connect second client - should connect to same session
             with client.websocket_connect(ws_2) as websocket2:
@@ -315,11 +321,11 @@ async def test_connects_to_existing_session_with_same_file(
                 assert_parse_ready_response(data2)
                 assert data2["data"]["resumed"] is True
 
-                messages2 = flush_messages(websocket2, at_least=4)
+                messages2 = flush_messages(websocket2, at_least=3)
                 # This can/may change if implementation changes, but this is a snapshot to
                 # make sure it doesn't change when we don't expect it to
-                assert len(messages2) == 4
-                assert messages2[0]["op"] == "update-cell-ids"
+                assert len(messages2) == 3
+                assert messages2[0]["op"] == "variables"
 
 
 def flush_messages(
@@ -547,7 +553,7 @@ def test_ttl_close_skips_when_session_has_active_consumer() -> None:
     cleanup_fn = MagicMock()
 
     with patch(
-        "marimo._server.api.endpoints.ws_endpoint.asyncio.get_event_loop"
+        "marimo._server.api.endpoints.ws_endpoint.asyncio.get_running_loop"
     ) as mock_loop:
         mock_loop.return_value.call_later = capture_call_later
         handler._on_disconnect(Exception("disconnect"), cleanup_fn)
@@ -654,7 +660,7 @@ def test_run_mode_ttl_close_with_manager_ttl_none() -> None:
     cleanup_fn = MagicMock()
 
     with patch(
-        "marimo._server.api.endpoints.ws_endpoint.asyncio.get_event_loop"
+        "marimo._server.api.endpoints.ws_endpoint.asyncio.get_running_loop"
     ) as mock_loop:
         mock_loop.return_value.call_later = capture_call_later
         handler._on_disconnect(Exception("disconnect"), cleanup_fn)
@@ -706,7 +712,7 @@ async def test_edit_mode_without_session_ttl_no_delayed_cleanup(
 def test_missing_file_key_closes_connection(client: TestClient) -> None:
     """Test that missing file key causes connection to close.
 
-    This can happen when file_router.get_unique_file_key() returns None.
+    This can happen when workspace.get_unique_file_key() returns None.
     """
     from unittest.mock import patch
 
@@ -714,7 +720,7 @@ def test_missing_file_key_closes_connection(client: TestClient) -> None:
 
     # Mock get_unique_file_key to return None
     with patch.object(
-        session_manager.file_router,
+        session_manager.workspace,
         "get_unique_file_key",
         return_value=None,
     ):

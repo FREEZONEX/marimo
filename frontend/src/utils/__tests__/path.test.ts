@@ -9,6 +9,26 @@ describe("Paths", () => {
     expect(Paths.isAbsolute("/user/docs/Letter.txt")).toBe(true);
     expect(Paths.isAbsolute("C:\\user\\docs\\Letter.txt")).toBe(true);
     expect(Paths.isAbsolute("user/docs/Letter.txt")).toBe(false);
+
+    // Any Windows drive letter, either separator, and any case
+    expect(Paths.isAbsolute("D:\\Users\\x\\a.py")).toBe(true);
+    expect(Paths.isAbsolute("z:/tmp/file")).toBe(true);
+    expect(Paths.isAbsolute("e:\\")).toBe(true);
+
+    // UNC / server paths
+    expect(Paths.isAbsolute("\\\\server\\share\\file")).toBe(true);
+
+    // URI schemes
+    expect(Paths.isAbsolute("s3://bucket/key")).toBe(true);
+    expect(Paths.isAbsolute("gs://bucket/key")).toBe(true);
+    expect(Paths.isAbsolute("file:///tmp/file")).toBe(true);
+    expect(Paths.isAbsolute("http://example.com/x")).toBe(true);
+
+    // Negative cases
+    expect(Paths.isAbsolute("C:file")).toBe(false); // drive without separator
+    expect(Paths.isAbsolute("notebook.py")).toBe(false);
+    expect(Paths.isAbsolute("./relative")).toBe(false);
+    expect(Paths.isAbsolute("")).toBe(false);
   });
 
   describe("dirname", () => {
@@ -170,36 +190,39 @@ describe("PathBuilder", () => {
   });
 
   describe("edge case filenames", () => {
-    it.each(
-      EDGE_CASE_FILENAMES,
-    )("should handle unicode and spaces in basename: %s", (filename) => {
-      const basename = Paths.basename(filename);
-      expect(basename).toBe(filename);
-      expect(typeof basename).toBe("string");
-      expect(basename).not.toBe("");
-    });
+    it.each(EDGE_CASE_FILENAMES)(
+      "should handle unicode and spaces in basename: %s",
+      (filename) => {
+        const basename = Paths.basename(filename);
+        expect(basename).toBe(filename);
+        expect(typeof basename).toBe("string");
+        expect(basename).not.toBe("");
+      },
+    );
 
-    it.each(
-      EDGE_CASE_FILENAMES,
-    )("should handle unicode and spaces in dirname: %s", (filename) => {
-      const fullPath = `/path/to/${filename}`;
-      const dirname = Paths.dirname(fullPath);
-      expect(dirname).toBe("/path/to");
-    });
+    it.each(EDGE_CASE_FILENAMES)(
+      "should handle unicode and spaces in dirname: %s",
+      (filename) => {
+        const fullPath = `/path/to/${filename}`;
+        const dirname = Paths.dirname(fullPath);
+        expect(dirname).toBe("/path/to");
+      },
+    );
 
-    it.each(
-      EDGE_CASE_FILENAMES,
-    )("should handle unicode and spaces in path operations: %s", (filename) => {
-      const baseName = Paths.basename(filename);
-      const extension = Paths.extension(filename);
+    it.each(EDGE_CASE_FILENAMES)(
+      "should handle unicode and spaces in path operations: %s",
+      (filename) => {
+        const baseName = Paths.basename(filename);
+        const extension = Paths.extension(filename);
 
-      // Should preserve unicode characters in basename
-      expect(baseName).toContain(filename.split(".")[0]);
+        // Should preserve unicode characters in basename
+        expect(baseName).toContain(filename.split(".")[0]);
 
-      // Should correctly extract extension
-      if (filename.includes(".")) {
-        expect(extension).toBe(filename.split(".").pop());
-      }
-    });
+        // Should correctly extract extension
+        if (filename.includes(".")) {
+          expect(extension).toBe(filename.split(".").pop());
+        }
+      },
+    );
   });
 });

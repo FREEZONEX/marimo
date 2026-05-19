@@ -14,7 +14,10 @@ import {
 import { Footer } from "./footer";
 import { Sidebar } from "./sidebar";
 import "./app-chrome.css";
-import { TooltipProvider } from "@radix-ui/react-tooltip";
+import { Tooltip } from "radix-ui";
+
+const TooltipProvider = Tooltip.Provider;
+
 import { useAtom, useAtomValue } from "jotai";
 import { XIcon } from "lucide-react";
 import useEvent from "react-use-event-hook";
@@ -534,6 +537,7 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
         {helperPanel}
         <Panel
           id="app-chrome-body"
+          data-testid="chrome-body"
           className={cn(isDeveloperPanelOpen && !isSidebarOpen && "border-l")}
         >
           <PanelGroup autoSaveId="marimo:chrome:v1:l1" direction="vertical">

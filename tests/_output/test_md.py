@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -15,11 +16,11 @@ if TYPE_CHECKING:
 def test_md() -> None:
     # Test basic markdown conversion
     input_text = "This is **bold** and this is _italic_."
-    expected_output = '<span class="markdown prose dark:prose-invert contents"><span class="paragraph">This is <strong>bold</strong> and this is <em>italic</em>.</span></span>'  # noqa: E501
+    expected_output = '<span class="markdown prose dark:prose-invert contents"><span class="paragraph">This is <strong>bold</strong> and this is <em>italic</em>.</span></span>'
     assert _md(input_text).text == expected_output
 
     # Test disabling markdown class
-    expected_output_no_class = '<span class="paragraph">This is <strong>bold</strong> and this is <em>italic</em>.</span>'  # noqa: E501
+    expected_output_no_class = '<span class="paragraph">This is <strong>bold</strong> and this is <em>italic</em>.</span>'
     assert (
         _md(input_text, apply_markdown_class=False).text
         == expected_output_no_class
@@ -28,14 +29,14 @@ def test_md() -> None:
 
 # def test_md_size() -> None:
 #     input_text = "This is **bold** and this is _italic_."
-#     expected_output = '<span class="markdown prose dark:prose-invert contents prose-lg"><span class="paragraph">This is <strong>bold</strong> and this is <em>italic</em>.</span></span>'  # noqa: E501
+#     expected_output = '<span class="markdown prose dark:prose-invert contents prose-lg"><span class="paragraph">This is <strong>bold</strong> and this is <em>italic</em>.</span></span>'
 #     assert _md(input_text, size="lg").text == expected_output
 
 
 def test_md_code_blocks() -> None:
     # Test code block conversion
     code_input = "```python\nprint('Hello, world!')\n```"
-    expected_output = '<div class="language-python codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="s1">&#39;Hello, world!&#39;</span><span class="p">)</span>\n</code></pre></div>'  # noqa: E501
+    expected_output = '<div class="language-python codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="s1">&#39;Hello, world!&#39;</span><span class="p">)</span>\n</code></pre></div>'
     assert _md(code_input, apply_markdown_class=False).text == expected_output
 
 
@@ -73,42 +74,53 @@ def test_md_latex() -> None:
 def test_md_links() -> None:
     # Test external link conversion
     link_input = "[Google](https://google.com)"
-    expected_output = '<span class="paragraph"><a href="https://google.com" rel="noopener noreferrer" target="_blank">Google</a></span>'  # noqa: E501
+    expected_output = '<span class="paragraph"><a href="https://google.com" rel="noopener noreferrer" target="_blank">Google</a></span>'
     assert _md(link_input, apply_markdown_class=False).text == (
         expected_output
     )
 
 
 def test_md_footnotes() -> None:
-    # Test footnote conversion
+    # Test footnote conversion. The footnote extension assigns a unique
+    # prefix on each render (so multi-document pages don't collide), so
+    # match the structure rather than the exact prefix.
     footnote_input = (
         "Here is a footnote reference[^1].\n\n[^1]: Here is the footnote."
     )
-    expected_output = '<span class="paragraph">Here is a footnote reference<sup id="fnref:2-1"><a class="footnote-ref" href="#fn:2-1">1</a></sup>.</span>\n<div class="footnote">\n<hr />\n<ol>\n<li id="fn:2-1">Here is the footnote.&#160;<a class="footnote-backref" href="#fnref:2-1" title="Jump back to footnote 1 in the text">&#8617;</a></li>\n</ol>\n</div>'  # noqa: E501
-    assert _md(footnote_input, apply_markdown_class=False).text == (
-        expected_output
+    rendered = _md(footnote_input, apply_markdown_class=False).text
+    match = re.search(
+        r'<span class="paragraph">Here is a footnote reference'
+        r'<sup id="fnref:(\d+-1)"><a class="footnote-ref" '
+        r'href="#fn:\1">1</a></sup>\.</span>\n'
+        r'<div class="footnote">\n<hr />\n<ol>\n'
+        r'<li id="fn:\1">Here is the footnote\.&#160;'
+        r'<a class="footnote-backref" href="#fnref:\1" '
+        r'title="Jump back to footnote 1 in the text">&#8617;</a></li>\n'
+        r"</ol>\n</div>",
+        rendered,
     )
+    assert match is not None, rendered
 
 
 def test_md_iconify() -> None:
     # Test iconify conversion
     iconify_input = "This is an icon: ::lucide:user::"
-    expected_output = '<span class="paragraph">This is an icon: <iconify-icon icon="lucide:user" inline=""></iconify-icon></span>'  # noqa: E501
+    expected_output = '<span class="paragraph">This is an icon: <iconify-icon icon="lucide:user" inline=""></iconify-icon></span>'
     assert (
         _md(iconify_input, apply_markdown_class=False).text == expected_output
     )
 
     # Test multiple icons
     multiple_icons_input = "Icons: ::mdi:home:: ::fa:car:: ::lucide:settings::"
-    expected_output = '<span class="paragraph">Icons: <iconify-icon icon="mdi:home" inline=""></iconify-icon> <iconify-icon icon="fa:car" inline=""></iconify-icon> <iconify-icon icon="lucide:settings" inline=""></iconify-icon></span>'  # noqa: E501
+    expected_output = '<span class="paragraph">Icons: <iconify-icon icon="mdi:home" inline=""></iconify-icon> <iconify-icon icon="fa:car" inline=""></iconify-icon> <iconify-icon icon="lucide:settings" inline=""></iconify-icon></span>'
     assert (
         _md(multiple_icons_input, apply_markdown_class=False).text
         == expected_output
     )
 
     # Test icon within other markdown elements
-    mixed_input = "# Header with ::lucide:star:: icon\n\n**Bold text with ::mdi:alert:: icon**"  # noqa: E501
-    expected_output = '<h1 id="header-with-icon">Header with <iconify-icon icon="lucide:star" inline=""></iconify-icon> icon</h1>\n<span class="paragraph"><strong>Bold text with <iconify-icon icon="mdi:alert" inline=""></iconify-icon> icon</strong></span>'  # noqa: E501
+    mixed_input = "# Header with ::lucide:star:: icon\n\n**Bold text with ::mdi:alert:: icon**"
+    expected_output = '<h1 id="header-with-icon">Header with <iconify-icon icon="lucide:star" inline=""></iconify-icon> icon</h1>\n<span class="paragraph"><strong>Bold text with <iconify-icon icon="mdi:alert" inline=""></iconify-icon> icon</strong></span>'
     assert _md(mixed_input, apply_markdown_class=False).text == expected_output
 
 
@@ -158,12 +170,8 @@ def test_md_flexible_indent_spaces(spaces: int) -> None:
     assert result == snapshot(
         """\
 <ul>
-<li>
-<span class="paragraph">Item 1</span>
-<ul>
-<li>
-<span class="paragraph">Nested item</span>
-<ul>
+<li>Item 1<ul>
+<li>Nested item<ul>
 <li>Deep nested</li>
 </ul>
 </li>
@@ -188,12 +196,8 @@ def test_md_flexible_indent_mixed_normalization() -> None:
     assert result == snapshot(
         """\
 <ul>
-<li>
-<span class="paragraph">Item 1</span>
-<ul>
-<li>
-<span class="paragraph">Nested item (3 spaces, should normalize to 2 or 4)</span>
-<ul>
+<li>Item 1<ul>
+<li>Nested item (3 spaces, should normalize to 2 or 4)<ul>
 <li>Deep nested (6 spaces)</li>
 </ul>
 </li>
@@ -219,18 +223,98 @@ def test_md_flexible_indent_ordered_lists(spaces: int) -> None:
     assert result == snapshot(
         """\
 <ol>
-<li>
-<span class="paragraph">Item 1</span>
-<ol>
-<li>
-<span class="paragraph">Nested ordered item</span>
-<ol>
+<li>Item 1<ol>
+<li>Nested ordered item<ol>
 <li>Deep nested ordered</li>
 </ol>
 </li>
 </ol>
 </li>
 <li>Item 2</li>
+</ol>\
+"""
+    )
+
+
+def test_md_nested_list_no_paragraph_wrapper() -> None:
+    # Nested list items should not have <p>/<span class="paragraph"> wrappers
+    input_text = """- Item 1
+  - Nested item
+- Item 2"""
+
+    result = _md(input_text, apply_markdown_class=False).text
+    assert result == snapshot(
+        """\
+<ul>
+<li>Item 1<ul>
+<li>Nested item</li>
+</ul>
+</li>
+<li>Item 2</li>
+</ul>\
+"""
+    )
+    assert '<span class="paragraph">' not in result
+
+
+def test_md_nested_list_preserves_multi_paragraph() -> None:
+    input_text = """- Paragraph one
+
+    Paragraph two
+
+- Item 2"""
+
+    result = _md(input_text, apply_markdown_class=False).text
+    assert result == snapshot(
+        """\
+<ul>
+<li>
+<span class="paragraph">Paragraph one</span>
+<span class="paragraph">Paragraph two</span>
+</li>
+<li>Item 2</li>
+</ul>\
+"""
+    )
+
+
+def test_md_nested_list_with_inline_elements() -> None:
+    # Inline elements like bold/italic/code should survive p-unwrapping
+    input_text = """- **Bold item**
+    - *Nested italic*
+        - `code item`"""
+
+    result = _md(input_text, apply_markdown_class=False).text
+    assert result == snapshot(
+        """\
+<ul>
+<li><strong>Bold item</strong></li>
+<li><em>Nested italic</em><ul>
+<li><code>code item</code></li>
+</ul>
+</li>
+</ul>\
+"""
+    )
+
+
+def test_md_nested_mixed_list_types() -> None:
+    # Mixed ordered/unordered nested lists should unwrap correctly
+    input_text = """1. Ordered item
+  - Unordered nested
+  - Another nested
+2. Second ordered"""
+
+    result = _md(input_text, apply_markdown_class=False).text
+    assert result == snapshot(
+        """\
+<ol>
+<li>Ordered item<ul>
+<li>Unordered nested</li>
+<li>Another nested</li>
+</ul>
+</li>
+<li>Second ordered</li>
 </ol>\
 """
     )
@@ -545,13 +629,18 @@ def test_latex_via_url(mock_urlopen: MagicMock, output: MagicMock) -> None:
 @patch("marimo._output.md.is_pyodide")
 def test_b64_extension_not_in_non_wasm(mock_is_pyodide: MagicMock) -> None:
     # Test that b64 extension is NOT included in non-WASM mode
-    from marimo._output.md import _get_extension_configs, _get_extensions
+    from marimo._output.md import (
+        _get_extension_configs,
+        _get_extensions,
+        _get_markdown,
+    )
 
     mock_is_pyodide.return_value = False
 
     # Clear the cache to ensure fresh evaluation
     _get_extensions.cache_clear()
     _get_extension_configs.cache_clear()
+    _get_markdown.cache_clear()
 
     extensions = _get_extensions()
     configs = _get_extension_configs()
@@ -568,7 +657,11 @@ def test_b64_extension_in_wasm(
     mock_is_pyodide: MagicMock, mock_notebook_dir: MagicMock
 ) -> None:
     # Test that b64 extension IS included in WASM mode
-    from marimo._output.md import _get_extension_configs, _get_extensions
+    from marimo._output.md import (
+        _get_extension_configs,
+        _get_extensions,
+        _get_markdown,
+    )
 
     mock_is_pyodide.return_value = True
     mock_notebook_dir.return_value = "/fake/notebook/dir"
@@ -576,6 +669,7 @@ def test_b64_extension_in_wasm(
     # Clear the cache to ensure fresh evaluation
     _get_extensions.cache_clear()
     _get_extension_configs.cache_clear()
+    _get_markdown.cache_clear()
 
     extensions = _get_extensions()
     configs = _get_extension_configs()
@@ -595,7 +689,11 @@ def test_md_with_b64_in_wasm(
     tmp_path: Path,
 ) -> None:
     # Test that markdown with image paths gets base64 encoded in WASM mode
-    from marimo._output.md import _get_extension_configs, _get_extensions
+    from marimo._output.md import (
+        _get_extension_configs,
+        _get_extensions,
+        _get_markdown,
+    )
 
     mock_is_pyodide.return_value = True
     mock_notebook_dir.return_value = str(tmp_path)
@@ -613,6 +711,7 @@ def test_md_with_b64_in_wasm(
     # Clear the cache to ensure fresh evaluation
     _get_extensions.cache_clear()
     _get_extension_configs.cache_clear()
+    _get_markdown.cache_clear()
 
     # Test markdown with image reference using b64 syntax
     # The pymdownx.b64 extension uses ![](test.png) syntax and converts to base64

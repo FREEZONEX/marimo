@@ -104,9 +104,10 @@ components:
         \ the Google AI config\n    - `bedrock`: the Bedrock config\n    - `azure`:\
         \ the Azure config\n    - `ollama`: the Ollama config\n    - `github`: the\
         \ GitHub config\n    - `openrouter`: the OpenRouter config\n    - `wandb`:\
-        \ the Weights & Biases config\n    - `custom_providers`: a dict of custom\
-        \ OpenAI-compatible providers\n    - `open_ai_compatible`: the OpenAI-compatible\
-        \ config (deprecated, use custom_providers)"
+        \ the Weights & Biases config\n    - `opencode_go`: the OpenCode Go config\n\
+        \    - `custom_providers`: a dict of custom OpenAI-compatible providers\n\
+        \    - `open_ai_compatible`: the OpenAI-compatible config (deprecated, use\
+        \ custom_providers)"
       properties:
         anthropic:
           $ref: '#/components/schemas/AnthropicConfig'
@@ -138,6 +139,8 @@ components:
         open_ai:
           $ref: '#/components/schemas/OpenAiConfig'
         open_ai_compatible:
+          $ref: '#/components/schemas/OpenAiConfig'
+        opencode_go:
           $ref: '#/components/schemas/OpenAiConfig'
         openrouter:
           $ref: '#/components/schemas/OpenAiConfig'
@@ -258,6 +261,7 @@ components:
       type: object
     Base64String:
       contentEncoding: base64
+      format: base64
       type: string
     BaseResponse:
       properties:
@@ -370,6 +374,7 @@ components:
       title: CellConfig
       type: object
     CellId:
+      format: cell-id
       type: string
     CellNotification:
       description: "Updates a cell's state in the frontend.\n\n    Only fields that\
@@ -620,7 +625,7 @@ components:
         \        cell_id: Cell where completion is requested."
       properties:
         cellId:
-          type: string
+          $ref: '#/components/schemas/CellId'
         document:
           type: string
         id:
@@ -638,7 +643,7 @@ components:
     CodeCompletionRequest:
       properties:
         cellId:
-          type: string
+          $ref: '#/components/schemas/CellId'
         document:
           type: string
         id:
@@ -726,11 +731,21 @@ components:
       title: ColumnStats
       type: object
     CompletedRunNotification:
-      description: Run of submitted cells and descendants completed.
+      description: "Run of submitted cells and descendants completed.\n\n    Attributes:\n\
+        \        run_id: Correlation ID echoed from the command that triggered\n \
+        \           this completion. ``None`` for handlers that don't take a\n   \
+        \         ``run_id`` (everything except ``handle_execute_scratchpad``\n  \
+        \          today). Consumers that want to wait for a specific command's\n\
+        \            completion filter on this field."
       properties:
         op:
           enum:
           - completed-run
+        run_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
       required:
       - op
       title: CompletedRunNotification
@@ -799,7 +814,7 @@ components:
         \ Length of prefix to replace.\n        options: Completion options to display."
       properties:
         completion_id:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         op:
           enum:
           - completion-result
@@ -826,6 +841,38 @@ components:
       - source
       - destination
       title: CopyNotebookRequest
+      type: object
+    CreateCell:
+      description: Insert a new cell into the notebook.
+      properties:
+        after:
+          anyOf:
+          - $ref: '#/components/schemas/CellId'
+          - type: 'null'
+          default: null
+        before:
+          anyOf:
+          - $ref: '#/components/schemas/CellId'
+          - type: 'null'
+          default: null
+        cellId:
+          $ref: '#/components/schemas/CellId'
+        code:
+          type: string
+        config:
+          $ref: '#/components/schemas/CellConfig'
+        name:
+          type: string
+        type:
+          enum:
+          - create-cell
+      required:
+      - type
+      - cellId
+      - code
+      - name
+      - config
+      title: CreateCell
       type: object
     CreateNotebookCommand:
       description: "Instantiate and initialize a notebook.\n\n    Sent when a notebook\
@@ -1192,7 +1239,7 @@ components:
         \ to debug.\n        request: HTTP request context if available."
       properties:
         cellId:
-          type: string
+          $ref: '#/components/schemas/CellId'
         request:
           anyOf:
           - $ref: '#/components/schemas/HTTPRequest'
@@ -1209,7 +1256,7 @@ components:
     DebugCellRequest:
       properties:
         cellId:
-          type: string
+          $ref: '#/components/schemas/CellId'
         request:
           anyOf:
           - $ref: '#/components/schemas/HTTPRequest'
@@ -1219,13 +1266,26 @@ components:
       - cellId
       title: DebugCellRequest
       type: object
+    DeleteCell:
+      description: Remove a cell from the notebook.
+      properties:
+        cellId:
+          $ref: '#/components/schemas/CellId'
+        type:
+          enum:
+          - delete-cell
+      required:
+      - type
+      - cellId
+      title: DeleteCell
+      type: object
     DeleteCellCommand:
       description: "Delete a cell from the notebook.\n\n    Removes cell from the\
         \ dependency graph and cleans up its variables.\n    Dependent cells may become\
         \ stale.\n\n    Attributes:\n        cell_id: Cell to delete."
       properties:
         cellId:
-          type: string
+          $ref: '#/components/schemas/CellId'
         type:
           enum:
           - delete-cell
@@ -1237,7 +1297,7 @@ components:
     DeleteCellRequest:
       properties:
         cellId:
-          type: string
+          $ref: '#/components/schemas/CellId'
       required:
       - cellId
       title: DeleteCellRequest
@@ -1372,7 +1432,7 @@ components:
         \        timestamp: Unix timestamp when command was created."
       properties:
         cellId:
-          type: string
+          $ref: '#/components/schemas/CellId'
         code:
           type: string
         request:
@@ -1401,7 +1461,7 @@ components:
       properties:
         cellIds:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
         codes:
           items:
@@ -1427,7 +1487,7 @@ components:
       properties:
         cellIds:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
         codes:
           items:
@@ -1448,13 +1508,33 @@ components:
         \ execution environment that doesn't affect\n    the notebook's cells or dependencies.\
         \ Runs in an isolated cell with a copy\n    of the global namespace, useful\
         \ for experimentation.\n\n    Attributes:\n        code: Python code to execute.\n\
-        \        request: HTTP request context if available."
+        \        request: HTTP request context if available.\n        notebook_cells:\
+        \ Snapshot of notebook cells from the session document.\n            Used\
+        \ to populate the document ContextVar so code_mode can read\n            cell\
+        \ ordering, code, names, and configs.\n        run_id: Optional correlation\
+        \ ID. When set, the\n            ``CompletedRunNotification`` emitted at the\
+        \ end of this command\n            carries the same ``run_id`` so a caller\
+        \ holding a\n            ``ScratchCellListener`` can filter for *its* completion\
+        \ and\n            ignore ``CompletedRun`` events from unrelated commands\
+        \ on the\n            same session."
       properties:
         code:
           type: string
+        notebookCells:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/NotebookCell'
+            type: array
+          - type: 'null'
+          default: null
         request:
           anyOf:
           - $ref: '#/components/schemas/HTTPRequest'
+          - type: 'null'
+          default: null
+        runId:
+          anyOf:
+          - type: string
           - type: 'null'
           default: null
         type:
@@ -1469,9 +1549,21 @@ components:
       properties:
         code:
           type: string
+        notebookCells:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/NotebookCell'
+            type: array
+          - type: 'null'
+          default: null
         request:
           anyOf:
           - $ref: '#/components/schemas/HTTPRequest'
+          - type: 'null'
+          default: null
+        runId:
+          anyOf:
+          - type: string
           - type: 'null'
           default: null
       required:
@@ -1568,6 +1660,63 @@ components:
       - download
       title: ExportAsScriptRequest
       type: object
+    FileCopyRequest:
+      properties:
+        newPath:
+          type: string
+        path:
+          type: string
+      required:
+      - path
+      - newPath
+      title: FileCopyRequest
+      type: object
+    FileCopyResponse:
+      properties:
+        info:
+          anyOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/FileInfo'
+          default: null
+        message:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        success:
+          type: boolean
+      required:
+      - success
+      title: FileCopyResponse
+      type: object
+    FileCreateMultipartRequest:
+      description: "multipart/form-data body for POST /api/files/create.\n\n    Schema-only:\
+        \ this struct exists to describe the multipart shape in\n    OpenAPI. At runtime,\
+        \ the endpoint reads the string fields from\n    ``MultipartRequest.body``\
+        \ and the uploaded bytes from\n    ``MultipartRequest.files[\"file\"]`` \u2014\
+        \ ``body.file`` is never populated."
+      properties:
+        file:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          format: binary
+        name:
+          type: string
+        path:
+          type: string
+        type:
+          enum:
+          - directory
+          - file
+          - notebook
+      required:
+      - path
+      - type
+      - name
+      title: FileCreateMultipartRequest
+      type: object
     FileCreateRequest:
       properties:
         contents:
@@ -1646,6 +1795,9 @@ components:
           default: null
         file:
           $ref: '#/components/schemas/FileInfo'
+        isBase64:
+          default: false
+          type: boolean
         mimeType:
           anyOf:
           - type: string
@@ -1842,7 +1994,7 @@ components:
     FocusCellRequest:
       properties:
         cellId:
-          type: string
+          $ref: '#/components/schemas/CellId'
       required:
       - cellId
       title: FocusCellRequest
@@ -2082,7 +2234,10 @@ components:
       description: "Package installation progress with streaming logs.\n\n    Attributes:\n\
         \        packages: Package name to status (queued/installing/installed/failed).\n\
         \        logs: Optional streaming logs per package.\n        log_status: Log\
-        \ stream status (append/start/done)."
+        \ stream status (append/start/done).\n        source: Which Python environment\
+        \ packages are installed into.\n                \"kernel\" (default) installs\
+        \ in the kernel's venv; \"server\"\n                installs in the server's\
+        \ own Python env."
       properties:
         log_status:
           anyOf:
@@ -2110,6 +2265,11 @@ components:
             - installing
             - queued
           type: object
+        source:
+          default: kernel
+          enum:
+          - kernel
+          - server
       required:
       - op
       - packages
@@ -2129,7 +2289,7 @@ components:
           default: null
         objectIds:
           items:
-            type: string
+            $ref: '#/components/schemas/UIElementId'
           type: array
         values:
           type: array
@@ -2187,7 +2347,7 @@ components:
         args:
           type: object
         functionCallId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         functionName:
           type: string
         namespace:
@@ -2208,7 +2368,7 @@ components:
         args:
           type: object
         functionCallId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         functionName:
           type: string
         namespace:
@@ -2386,6 +2546,7 @@ components:
           - $ref: '#/components/schemas/PreviewDatasetColumnCommand'
           - $ref: '#/components/schemas/PreviewSQLTableCommand'
           - $ref: '#/components/schemas/ListSQLTablesCommand'
+          - $ref: '#/components/schemas/ListSQLSchemasCommand'
           - $ref: '#/components/schemas/ValidateSQLCommand'
           - $ref: '#/components/schemas/ListDataSourceConnectionCommand'
           - $ref: '#/components/schemas/StorageListEntriesCommand'
@@ -2410,6 +2571,7 @@ components:
               invoke-function: '#/components/schemas/InvokeFunctionCommand'
               list-data-source-connection: '#/components/schemas/ListDataSourceConnectionCommand'
               list-secret-keys: '#/components/schemas/ListSecretKeysCommand'
+              list-sql-schemas: '#/components/schemas/ListSQLSchemasCommand'
               list-sql-tables: '#/components/schemas/ListSQLTablesCommand'
               model: '#/components/schemas/ModelCommand'
               preview-dataset-column: '#/components/schemas/PreviewDatasetColumnCommand'
@@ -2496,6 +2658,7 @@ components:
           - $ref: '#/components/schemas/DataColumnPreviewNotification'
           - $ref: '#/components/schemas/SQLTablePreviewNotification'
           - $ref: '#/components/schemas/SQLTableListPreviewNotification'
+          - $ref: '#/components/schemas/SQLSchemaListPreviewNotification'
           - $ref: '#/components/schemas/DataSourceConnectionsNotification'
           - $ref: '#/components/schemas/ValidateSQLResultNotification'
           - $ref: '#/components/schemas/StorageNamespacesNotification'
@@ -2505,8 +2668,7 @@ components:
           - $ref: '#/components/schemas/CacheClearedNotification'
           - $ref: '#/components/schemas/CacheInfoNotification'
           - $ref: '#/components/schemas/FocusCellNotification'
-          - $ref: '#/components/schemas/UpdateCellCodesNotification'
-          - $ref: '#/components/schemas/UpdateCellIdsNotification'
+          - $ref: '#/components/schemas/NotebookDocumentTransactionNotification'
           discriminator:
             mapping:
               alert: '#/components/schemas/AlertNotification'
@@ -2527,6 +2689,7 @@ components:
               kernel-startup-error: '#/components/schemas/KernelStartupErrorNotification'
               missing-package-alert: '#/components/schemas/MissingPackageAlertNotification'
               model-lifecycle: '#/components/schemas/ModelLifecycleNotification'
+              notebook-document-transaction: '#/components/schemas/NotebookDocumentTransactionNotification'
               query-params-append: '#/components/schemas/QueryParamsAppendNotification'
               query-params-clear: '#/components/schemas/QueryParamsClearNotification'
               query-params-delete: '#/components/schemas/QueryParamsDeleteNotification'
@@ -2536,14 +2699,13 @@ components:
               remove-ui-elements: '#/components/schemas/RemoveUIElementsNotification'
               secret-keys-result: '#/components/schemas/SecretKeysResultNotification'
               send-ui-element-message: '#/components/schemas/UIElementMessageNotification'
+              sql-schema-list-preview: '#/components/schemas/SQLSchemaListPreviewNotification'
               sql-table-list-preview: '#/components/schemas/SQLTableListPreviewNotification'
               sql-table-preview: '#/components/schemas/SQLTablePreviewNotification'
               startup-logs: '#/components/schemas/StartupLogsNotification'
               storage-download-ready: '#/components/schemas/StorageDownloadReadyNotification'
               storage-entries: '#/components/schemas/StorageEntriesNotification'
               storage-namespaces: '#/components/schemas/StorageNamespacesNotification'
-              update-cell-codes: '#/components/schemas/UpdateCellCodesNotification'
-              update-cell-ids: '#/components/schemas/UpdateCellIdsNotification'
               validate-sql-result: '#/components/schemas/ValidateSQLResultNotification'
               variable-values: '#/components/schemas/VariableValuesNotification'
               variables: '#/components/schemas/VariablesNotification'
@@ -2582,6 +2744,25 @@ components:
       - data
       title: LayoutConfig
       type: object
+    LintConfig:
+      description: "Configuration for lint rule selection.\n\n    Follows ruff-inspired\
+        \ semantics for selecting which rules to run\n    during ``marimo check``.\n\
+        \n    **Keys.**\n\n    - ``select``: list of rule code prefixes that replaces\
+        \ the default\n      enabled set. Use ``\"ALL\"`` to select all rules.\n \
+        \     Example: ``[\"MB\", \"MR001\"]``\n    - ``ignore``: list of rule code\
+        \ prefixes to remove from the\n      enabled set."
+      properties:
+        ignore:
+          items:
+            type: string
+          type: array
+        select:
+          items:
+            type: string
+          type: array
+      required: []
+      title: LintConfig
+      type: object
     ListDataSourceConnectionCommand:
       description: "List data source schemas.\n\n    Retrieves available schemas for\
         \ a data source engine.\n\n    Attributes:\n        engine: Data source engine\
@@ -2615,6 +2796,43 @@ components:
       - packages
       title: ListPackagesResponse
       type: object
+    ListSQLSchemasCommand:
+      description: "List schemas in an SQL database.\n\n    Retrieves names of all\
+        \ schemas in a database. Used by the SQL editor for\n    schema selection.\n\
+        \n    Attributes:\n        request_id: Unique identifier for this request.\n\
+        \        engine: SQL engine ('postgresql', 'mysql', 'duckdb', etc.).\n   \
+        \     database: Database to query."
+      properties:
+        database:
+          type: string
+        engine:
+          type: string
+        requestId:
+          $ref: '#/components/schemas/RequestId'
+        type:
+          enum:
+          - list-sql-schemas
+      required:
+      - type
+      - requestId
+      - engine
+      - database
+      title: ListSQLSchemasCommand
+      type: object
+    ListSQLSchemasRequest:
+      properties:
+        database:
+          type: string
+        engine:
+          type: string
+        requestId:
+          $ref: '#/components/schemas/RequestId'
+      required:
+      - requestId
+      - engine
+      - database
+      title: ListSQLSchemasRequest
+      type: object
     ListSQLTablesCommand:
       description: "List tables in an SQL schema.\n\n    Retrieves names of all tables\
         \ and views in a schema. Used by the SQL\n    editor for table selection.\n\
@@ -2628,7 +2846,7 @@ components:
         engine:
           type: string
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         schema:
           type: string
         type:
@@ -2649,7 +2867,7 @@ components:
         engine:
           type: string
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         schema:
           type: string
       required:
@@ -2665,7 +2883,7 @@ components:
         \ for this request."
       properties:
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         type:
           enum:
           - list-secret-keys
@@ -2677,7 +2895,7 @@ components:
     ListSecretKeysRequest:
       properties:
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
       required:
       - requestId
       title: ListSecretKeysRequest
@@ -2902,6 +3120,8 @@ components:
           $ref: '#/components/schemas/KeymapConfig'
         language_servers:
           $ref: '#/components/schemas/LanguageServersConfig'
+        lint:
+          $ref: '#/components/schemas/LintConfig'
         mcp:
           $ref: '#/components/schemas/MCPConfig'
         package_management:
@@ -2939,6 +3159,11 @@ components:
           anyOf:
           - $ref: '#/components/schemas/CellId'
           - type: 'null'
+        traceback:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
         type:
           enum:
           - exception
@@ -2967,7 +3192,7 @@ components:
           type: string
         sessionId:
           anyOf:
-          - type: string
+          - $ref: '#/components/schemas/SessionId'
           - type: 'null'
           default: null
       required:
@@ -3140,7 +3365,7 @@ components:
               update: '#/components/schemas/ModelUpdateMessage'
             propertyName: method
         modelId:
-          type: string
+          $ref: '#/components/schemas/WidgetModelId'
         token:
           type: string
         type:
@@ -3256,7 +3481,7 @@ components:
               update: '#/components/schemas/ModelUpdateMessage'
             propertyName: method
         modelId:
-          type: string
+          $ref: '#/components/schemas/WidgetModelId'
         token:
           type: string
       required:
@@ -3316,6 +3541,29 @@ components:
       - bufferPaths
       title: ModelUpdateMessage
       type: object
+    MoveCell:
+      description: Reposition a cell in the notebook.
+      properties:
+        after:
+          anyOf:
+          - $ref: '#/components/schemas/CellId'
+          - type: 'null'
+          default: null
+        before:
+          anyOf:
+          - $ref: '#/components/schemas/CellId'
+          - type: 'null'
+          default: null
+        cellId:
+          $ref: '#/components/schemas/CellId'
+        type:
+          enum:
+          - move-cell
+      required:
+      - type
+      - cellId
+      title: MoveCell
+      type: object
     MultipleDefinitionError:
       properties:
         cells:
@@ -3332,6 +3580,66 @@ components:
       - name
       - cells
       title: MultipleDefinitionError
+      type: object
+    NotebookCell:
+      description: "A single cell in the document. Mutable \u2014 owned by the document."
+      properties:
+        code:
+          type: string
+        config:
+          $ref: '#/components/schemas/CellConfig'
+        id:
+          $ref: '#/components/schemas/CellId'
+        name:
+          type: string
+      required:
+      - id
+      - code
+      - name
+      - config
+      title: NotebookCell
+      type: object
+    NotebookDocumentTransactionNotification:
+      description: "Broadcasts an applied transaction to the frontend.\n\n    Sent\
+        \ by the session when the document changes (from any source).\n    The frontend\
+        \ applies the ops to update its local state."
+      properties:
+        op:
+          enum:
+          - notebook-document-transaction
+        transaction:
+          $ref: '#/components/schemas/Transaction'
+      required:
+      - op
+      - transaction
+      title: NotebookDocumentTransactionNotification
+      type: object
+    NotebookDocumentTransactionRequest:
+      properties:
+        changes:
+          items:
+            anyOf:
+            - $ref: '#/components/schemas/CreateCell'
+            - $ref: '#/components/schemas/DeleteCell'
+            - $ref: '#/components/schemas/MoveCell'
+            - $ref: '#/components/schemas/ReorderCells'
+            - $ref: '#/components/schemas/SetCode'
+            - $ref: '#/components/schemas/SetName'
+            - $ref: '#/components/schemas/SetConfig'
+            discriminator:
+              mapping:
+                create-cell: '#/components/schemas/CreateCell'
+                delete-cell: '#/components/schemas/DeleteCell'
+                move-cell: '#/components/schemas/MoveCell'
+                reorder-cells: '#/components/schemas/ReorderCells'
+                set-code: '#/components/schemas/SetCode'
+                set-config: '#/components/schemas/SetConfig'
+                set-name: '#/components/schemas/SetName'
+              propertyName: type
+          type: array
+      required:
+      - changes
+      title: NotebookDocumentTransactionRequest
       type: object
     OpenAiConfig:
       description: "Configuration options for OpenAI or OpenAI-compatible services.\n\
@@ -3395,6 +3703,7 @@ components:
           anyOf:
           - enum:
             - dataflow
+            - external-dependencies
             - fileformat
             - for-jupyter-users
             - intro
@@ -3524,7 +3833,7 @@ components:
         engine:
           type: string
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         schema:
           type: string
         tableName:
@@ -3548,7 +3857,7 @@ components:
         engine:
           type: string
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         schema:
           type: string
         tableName:
@@ -3781,7 +4090,25 @@ components:
       - filename
       title: RenameNotebookRequest
       type: object
+    ReorderCells:
+      description: "Replace the full cell ordering.\n\n    Cell IDs present in the\
+        \ document but missing from ``cell_ids``\n    are appended at the end. IDs\
+        \ not in the document are ignored."
+      properties:
+        cellIds:
+          items:
+            $ref: '#/components/schemas/CellId'
+          type: array
+        type:
+          enum:
+          - reorder-cells
+      required:
+      - type
+      - cellIds
+      title: ReorderCells
+      type: object
     RequestId:
+      format: request-id
       type: string
     RunningNotebooksResponse:
       properties:
@@ -3827,7 +4154,10 @@ components:
         \ is `\"auto\"`.\n    - `default_auto_download`: an Optional list of export\
         \ types to automatically snapshot your notebook as:\n       `html`, `markdown`,\
         \ `ipynb`.\n       The default is None.\n    - `default_csv_encoding`: the\
-        \ default encoding for CSV exports.\n        The default is `\"utf-8\"`."
+        \ default encoding for CSV exports.\n        The default is `\"utf-8\"`.\n\
+        \    - `show_tracebacks`: if `True`, show detailed error tracebacks in run\
+        \ mode.\n        When enabled, exceptions will display a clickable toast that\
+        \ opens a modal with the full traceback.\n        The default is `False`."
       properties:
         auto_instantiate:
           type: boolean
@@ -3870,6 +4200,8 @@ components:
           type: boolean
         serve_cached_sessions_in_apps:
           type: boolean
+        show_tracebacks:
+          type: boolean
         std_stream_max_bytes:
           type: integer
         watcher_on_save:
@@ -3886,6 +4218,19 @@ components:
       - std_stream_max_bytes
       - watcher_on_save
       title: RuntimeConfig
+      type: object
+    SQLDatabaseMetadata:
+      description: "SQL database metadata.\n\n    Attributes:\n        connection:\
+        \ Connection identifier.\n        database: Database name."
+      properties:
+        connection:
+          type: string
+        database:
+          type: string
+      required:
+      - connection
+      - database
+      title: SQLDatabaseMetadata
       type: object
     SQLMetadata:
       description: "SQL database and schema metadata.\n\n    Attributes:\n       \
@@ -3907,6 +4252,35 @@ components:
       - database
       - schema
       title: SQLMetadata
+      type: object
+    SQLSchemaListPreviewNotification:
+      description: "List of SQL schemas in a database.\n\n    Attributes:\n      \
+        \  request_id: Request ID this responds to.\n        metadata: Database and\
+        \ schema metadata.\n        schemas: Schemas in database.\n        error:\
+        \ Error message if failed."
+      properties:
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        metadata:
+          $ref: '#/components/schemas/SQLDatabaseMetadata'
+        op:
+          enum:
+          - sql-schema-list-preview
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+        schemas:
+          default: []
+          items:
+            $ref: '#/components/schemas/Schema'
+          type: array
+      required:
+      - op
+      - request_id
+      - metadata
+      title: SQLSchemaListPreviewNotification
       type: object
     SQLTableListPreviewNotification:
       description: "List of SQL tables in a schema.\n\n    Attributes:\n        request_id:\
@@ -3997,7 +4371,7 @@ components:
       properties:
         cellIds:
           items:
-            type: string
+            $ref: '#/components/schemas/CellId'
           type: array
         codes:
           items:
@@ -4138,7 +4512,64 @@ components:
       title: ServerConfig
       type: object
     SessionId:
+      format: session-id
       type: string
+    SetCode:
+      description: Replace a cell's source code.
+      properties:
+        cellId:
+          $ref: '#/components/schemas/CellId'
+        code:
+          type: string
+        type:
+          enum:
+          - set-code
+      required:
+      - type
+      - cellId
+      - code
+      title: SetCode
+      type: object
+    SetConfig:
+      description: Replace a cell's config.
+      properties:
+        cellId:
+          $ref: '#/components/schemas/CellId'
+        column:
+          anyOf:
+          - type: integer
+          - type: 'null'
+        disabled:
+          type: boolean
+        hideCode:
+          type: boolean
+        type:
+          enum:
+          - set-config
+      required:
+      - type
+      - cellId
+      - column
+      - disabled
+      - hideCode
+      title: SetConfig
+      type: object
+    SetName:
+      description: Rename a cell.
+      properties:
+        cellId:
+          $ref: '#/components/schemas/CellId'
+        name:
+          type: string
+        type:
+          enum:
+          - set-name
+      required:
+      - type
+      - cellId
+      - name
+      title: SetName
+      type: object
     SetupRootError:
       properties:
         edges_with_vars:
@@ -4178,7 +4609,7 @@ components:
     ShutdownSessionRequest:
       properties:
         sessionId:
-          type: string
+          $ref: '#/components/schemas/SessionId'
       required:
       - sessionId
       title: ShutdownSessionRequest
@@ -4402,7 +4833,7 @@ components:
           default: false
           type: boolean
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
       required:
       - requestId
       - namespace
@@ -4527,7 +4958,7 @@ components:
           - type: 'null'
           default: null
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
       required:
       - requestId
       - namespace
@@ -4668,6 +5099,49 @@ components:
       - mode
       title: ToolDefinition
       type: object
+    Transaction:
+      description: "An atomic batch of changes applied to a NotebookDocument.\n\n\
+        \    ``source`` identifies the writer (e.g. ``\"frontend\"``, ``\"kernel\"\
+        ``).\n    ``version`` is ``None`` when created and stamped by\n    ``NotebookDocument.apply()``."
+      properties:
+        changes:
+          items:
+            anyOf:
+            - $ref: '#/components/schemas/CreateCell'
+            - $ref: '#/components/schemas/DeleteCell'
+            - $ref: '#/components/schemas/MoveCell'
+            - $ref: '#/components/schemas/ReorderCells'
+            - $ref: '#/components/schemas/SetCode'
+            - $ref: '#/components/schemas/SetName'
+            - $ref: '#/components/schemas/SetConfig'
+            discriminator:
+              mapping:
+                create-cell: '#/components/schemas/CreateCell'
+                delete-cell: '#/components/schemas/DeleteCell'
+                move-cell: '#/components/schemas/MoveCell'
+                reorder-cells: '#/components/schemas/ReorderCells'
+                set-code: '#/components/schemas/SetCode'
+                set-config: '#/components/schemas/SetConfig'
+                set-name: '#/components/schemas/SetName'
+              propertyName: type
+          type: array
+        source:
+          enum:
+          - cell-manager
+          - code-mode
+          - file-watch
+          - frontend
+          - kernel
+        version:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: null
+      required:
+      - changes
+      - source
+      title: Transaction
+      type: object
     TyLanguageServerConfig:
       description: 'Configuration options for Ty Language Server.
 
@@ -4682,6 +5156,7 @@ components:
       title: TyLanguageServerConfig
       type: object
     UIElementId:
+      format: ui-element-id
       type: string
     UIElementMessageNotification:
       description: "Sends a message to a UI element/widget.\n\n    Attributes:\n \
@@ -4725,44 +5200,6 @@ components:
       - msg
       title: UnknownError
       type: object
-    UpdateCellCodesNotification:
-      description: "Updates cell code contents (kiosk mode and edit-mode file reload).\n\
-        \n    Attributes:\n        cell_ids: Cells to update.\n        codes: New\
-        \ code for each cell.\n        code_is_stale: If True, code was not executed\
-        \ on backend (output may not match).\n        names: Cell names for each cell\
-        \ (optional, for file reload).\n        configs: Cell configs for each cell\
-        \ (optional, for file reload)."
-      properties:
-        cell_ids:
-          items:
-            $ref: '#/components/schemas/CellId'
-          type: array
-        code_is_stale:
-          type: boolean
-        codes:
-          items:
-            type: string
-          type: array
-        configs:
-          default: []
-          items:
-            $ref: '#/components/schemas/CellConfig'
-          type: array
-        names:
-          default: []
-          items:
-            type: string
-          type: array
-        op:
-          enum:
-          - update-cell-codes
-      required:
-      - op
-      - cell_ids
-      - codes
-      - code_is_stale
-      title: UpdateCellCodesNotification
-      type: object
     UpdateCellConfigCommand:
       description: "Update cell configuration.\n\n    Updates cell-level settings\
         \ like disabled state, hide code, etc.\n\n    Attributes:\n        configs:\
@@ -4790,32 +5227,6 @@ components:
       required:
       - configs
       title: UpdateCellConfigRequest
-      type: object
-    UpdateCellIdsNotification:
-      description: "Updates cell ordering in notebook.\n\n    Attributes:\n      \
-        \  cell_ids: Complete ordered list of cell IDs."
-      properties:
-        cell_ids:
-          items:
-            $ref: '#/components/schemas/CellId'
-          type: array
-        op:
-          enum:
-          - update-cell-ids
-      required:
-      - op
-      - cell_ids
-      title: UpdateCellIdsNotification
-      type: object
-    UpdateCellIdsRequest:
-      properties:
-        cellIds:
-          items:
-            type: string
-          type: array
-      required:
-      - cellIds
-      title: UpdateCellIdsRequest
       type: object
     UpdateCellOutputsRequest:
       properties:
@@ -4867,7 +5278,7 @@ components:
       properties:
         objectIds:
           items:
-            type: string
+            $ref: '#/components/schemas/UIElementId'
           type: array
         request:
           anyOf:
@@ -4891,7 +5302,7 @@ components:
       properties:
         objectIds:
           items:
-            type: string
+            $ref: '#/components/schemas/UIElementId'
           type: array
         request:
           anyOf:
@@ -4911,7 +5322,7 @@ components:
       properties:
         objectIds:
           items:
-            type: string
+            $ref: '#/components/schemas/UIElementId'
           type: array
         values:
           type: array
@@ -4967,7 +5378,7 @@ components:
         query:
           type: string
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
         type:
           enum:
           - validate-sql
@@ -4995,7 +5406,7 @@ components:
         query:
           type: string
         requestId:
-          type: string
+          $ref: '#/components/schemas/RequestId'
       required:
       - requestId
       - query
@@ -5056,7 +5467,7 @@ components:
             $ref: '#/components/schemas/CellId'
           type: array
         name:
-          type: string
+          $ref: '#/components/schemas/VariableName'
         used_by:
           items:
             $ref: '#/components/schemas/CellId'
@@ -5068,6 +5479,7 @@ components:
       title: VariableDeclarationNotification
       type: object
     VariableName:
+      format: variable-name
       type: string
     VariableValue:
       description: "Variable value and type for variables panel.\n\n    Attributes:\n\
@@ -5138,6 +5550,7 @@ components:
       title: VenvConfig
       type: object
     WidgetModelId:
+      format: widget-model-id
       type: string
     WorkspaceFilesRequest:
       properties:
@@ -5424,6 +5837,26 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
           description: Broadcasts a datasource connection
+  /api/datasources/preview_sql_schema_list:
+    post:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ListSQLSchemasRequest'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+          description: Preview a list of schemas in an SQL database
   /api/datasources/preview_sql_table:
     post:
       parameters:
@@ -5464,6 +5897,26 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
           description: Preview a list of tables in an SQL schema
+  /api/document/transaction:
+    post:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotebookDocumentTransactionRequest'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+          description: Apply a document transaction
   /api/documentation/snippets:
     get:
       parameters:
@@ -5680,13 +6133,27 @@ paths:
           description: Update the cell outputs
         400:
           description: File must be saved before downloading
-  /api/files/create:
+  /api/files/copy:
     post:
       requestBody:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/FileCreateRequest'
+              $ref: '#/components/schemas/FileCopyRequest'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileCopyResponse'
+          description: Copy a file or directory
+  /api/files/create:
+    post:
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FileCreateMultipartRequest'
       responses:
         200:
           content:
@@ -6293,26 +6760,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
           description: Send input to the stdin stream
-  /api/kernel/sync/cell_ids:
-    post:
-      parameters:
-      - in: header
-        name: Marimo-Session-Id
-        required: true
-        schema:
-          type: string
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/UpdateCellIdsRequest'
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SuccessResponse'
-          description: Sync cell ids
   /api/kernel/takeover:
     post:
       parameters:
@@ -6670,6 +7117,22 @@ paths:
               schema:
                 type: string
       summary: Submit login form
+      tags:
+      - auth
+  /auth/token:
+    get:
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                properties:
+                  token:
+                    nullable: true
+                    type: string
+                type: object
+          description: The auth token (null if auth is disabled)
+      summary: Get the auth token for the current session
       tags:
       - auth
 

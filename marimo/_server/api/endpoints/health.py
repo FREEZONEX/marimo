@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from starlette.authentication import requires
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -11,6 +11,7 @@ from marimo import _loggers
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._server.api.deps import AppState
 from marimo._server.router import APIRouter
+from marimo._server.workspace import NEW_FILE_WIRE
 from marimo._utils.health import (
     get_cgroup_cpu_percent,
     get_cgroup_mem_stats,
@@ -74,7 +75,7 @@ async def status(request: Request) -> JSONResponse:
     """
     app_state = AppState(request)
     files = [
-        session.app_file_manager.filename or "__new__"
+        session.app_file_manager.filename or NEW_FILE_WIRE
         for session in app_state.session_manager.sessions.values()
     ]
     return JSONResponse(
@@ -100,23 +101,9 @@ class SessionInfo(TypedDict):
 @router.get("/api/sessions", include_in_schema=False)
 @requires("edit")
 async def list_sessions(request: Request) -> JSONResponse:
-    """List active session IDs and their notebook paths.
-
-    Only available when the server was started without an auth token
-    (``--no-token``) and without skew protection
-    (``--no-skew-protection``).
-    """
+    """List active session IDs and their notebook paths."""
 
     state = AppState(request)
-
-    if state.enable_auth or state.skew_protection:
-        return JSONResponse(
-            {
-                "error": "Session listing requires --no-token and "
-                "--no-skew-protection"
-            },
-            status_code=403,
-        )
 
     sessions = {
         session_id: SessionInfo(
@@ -129,6 +116,7 @@ async def list_sessions(request: Request) -> JSONResponse:
 
 
 @router.get("/api/version")
+@requires("read")
 async def version(request: Request) -> PlainTextResponse:
     """
     responses:
@@ -229,7 +217,7 @@ async def usage(request: Request) -> JSONResponse:
                             - memory
                             - cpu
 
-    """  # noqa: E501
+    """
     import subprocess
 
     import psutil
@@ -258,7 +246,7 @@ async def usage(request: Request) -> JSONResponse:
         cpu = psutil.cpu_percent(interval=None)
 
     # Collect kernel PIDs first so we can exclude them from server memory
-    kernel_memory: Optional[int] = None
+    kernel_memory: int | None = None
     kernel_pids: set[int] = set()
     session = AppState(request).get_current_session()
     try:
@@ -350,6 +338,7 @@ async def usage(request: Request) -> JSONResponse:
 
 
 @router.get("/api/status/connections")
+@requires("read")
 async def connections(request: Request) -> JSONResponse:
     """
     responses:
@@ -382,7 +371,7 @@ def _is_gpu_available() -> bool:
 
     if DependencyManager.which("nvidia-smi"):
         try:
-            _ = subprocess.run(  # noqa: ASYNC221
+            _ = subprocess.run(
                 _GPU_STATS_CMD,
                 capture_output=True,
                 text=True,

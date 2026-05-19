@@ -1,9 +1,10 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from marimo import _loggers as loggers
+from marimo._cli.tips import CliTip
 from marimo._config.manager import MarimoConfigManager, ScriptConfigManager
 from marimo._server.config import StarletteServerState
 from marimo._server.session_manager import SessionManager
@@ -27,7 +28,7 @@ class AppStateBase:
     """The app state."""
 
     @staticmethod
-    def from_request(request: Union[Request, WebSocket]) -> AppState:
+    def from_request(request: Request | WebSocket) -> AppState:
         """Get the app state with a request."""
         return AppState(request)
 
@@ -61,7 +62,7 @@ class AppStateBase:
         return self.state.port
 
     @property
-    def maybe_port(self) -> Optional[int]:
+    def maybe_port(self) -> int | None:
         return getattr(self.state, "port", None)
 
     @property
@@ -89,7 +90,7 @@ class AppStateBase:
         return self.session_manager.skew_protection_token
 
     @property
-    def remote_url(self) -> Optional[str]:
+    def remote_url(self) -> str | None:
         if hasattr(self.state, "remote_url"):
             return self.state.remote_url
         return None
@@ -99,7 +100,7 @@ class AppStateBase:
         return self.state.mcp_server_enabled
 
     @property
-    def asset_url(self) -> Optional[str]:
+    def asset_url(self) -> str | None:
         if hasattr(self.state, "asset_url"):
             return self.state.asset_url
         return None
@@ -111,21 +112,26 @@ class AppStateBase:
         return True
 
     @property
-    def html_head(self) -> Optional[str]:
+    def startup_tip(self) -> CliTip | None:
+        startup_tip = getattr(self.state, "startup_tip", None)
+        return cast(CliTip | None, startup_tip)
+
+    @property
+    def html_head(self) -> str | None:
         if hasattr(self.state, "html_head"):
-            return cast(Optional[str], self.state.html_head)
+            return cast(str | None, self.state.html_head)
         return None
 
 
 class AppState(AppStateBase):
     """The app state with a request."""
 
-    def __init__(self, request: Union[Request, WebSocket]) -> None:
+    def __init__(self, request: Request | WebSocket) -> None:
         """Initialize the app state with a request."""
         super().__init__(request.app.state)
         self.request = request
 
-    def get_current_session_id(self) -> Optional[SessionId]:
+    def get_current_session_id(self) -> SessionId | None:
         """Get the current session."""
         session_id = self.request.headers.get("Marimo-Session-Id")
         return SessionId(session_id) if session_id is not None else None
@@ -137,7 +143,7 @@ class AppState(AppStateBase):
             raise ValueError("Missing Marimo-Session-Id header")
         return session_id
 
-    def get_current_session(self) -> Optional[Session]:
+    def get_current_session(self) -> Session | None:
         """Get the current session."""
         session_id = self.get_current_session_id()
         if session_id is None:
@@ -171,7 +177,7 @@ class AppState(AppStateBase):
             raise ValueError(f"Missing query parameter: {param}")
         return value
 
-    def query_params(self, param: str) -> Optional[str]:
+    def query_params(self, param: str) -> str | None:
         """Get a query parameter."""
         if param not in self.request.query_params:
             return None

@@ -1,7 +1,7 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
+import { Slot as SlotPrimitive } from "radix-ui";
 import * as React from "react";
 import { parseShortcut } from "@/core/hotkeys/shortcuts";
 import { useEventListener } from "@/hooks/useEventListener";
@@ -92,7 +92,8 @@ const buttonVariants = cva(
 );
 
 export interface ButtonProps
-  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
+  extends
+    React.ButtonHTMLAttributes<HTMLButtonElement>,
     Omit<VariantProps<typeof buttonVariants>, "disabled"> {
   asChild?: boolean;
   keyboardShortcut?: string;
@@ -107,17 +108,16 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
 
     React.useImperativeHandle(
       ref,
-      // eslint-disable-next-line @typescript-eslint/non-nullable-type-assertion-style
+      // oxlint-disable-next-line typescript/non-nullable-type-assertion-style
       () => buttonRef.current as HTMLButtonElement,
     );
 
     const handleKeyPress = React.useCallback(
       (e: KeyboardEvent) => {
-        if (!keyboardShortcut) {
+        if (!keyboardShortcut || e.defaultPrevented) {
           return;
         }
 
-        // Ignore keyboard events from input elements
         if (Events.shouldIgnoreKeyboardEvent(e)) {
           return;
         }
@@ -135,7 +135,7 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
 
     useEventListener(document, "keydown", handleKeyPress);
 
-    const Comp = asChild ? Slot : "button";
+    const Comp = asChild ? SlotPrimitive.Slot : "button";
     return (
       <Comp
         className={cn(

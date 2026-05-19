@@ -15,11 +15,11 @@ import {
 } from "lucide-react";
 import React, { useId, useRef } from "react";
 import { useLocale } from "react-aria";
-import type { FieldPath, FieldValues } from "react-hook-form";
 import { useForm } from "react-hook-form";
 import type z from "zod";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { acceptCompletionOnEnterAtom } from "@/core/codemirror/completion/accept-on-enter-atom";
 import {
   Form,
   FormControl,
@@ -59,104 +59,9 @@ import { Tooltip } from "../ui/tooltip";
 import { AiConfig } from "./ai-config";
 import { formItemClasses, SettingGroup } from "./common";
 import { DataForm } from "./data-form";
+import { applyManualInjections, getDirtyValues } from "./get-dirty-values";
 import { IsOverridden } from "./is-overridden";
 import { OptionalFeatures } from "./optional-features";
-
-/**
- * Extract only the values that have been modified (dirty) from form state.
- * This prevents sending unchanged fields that could overwrite backend values.
- */
-export function getDirtyValues<T extends FieldValues>(
-  values: T,
-  dirtyFields: Partial<Record<keyof T, unknown>>,
-): Partial<T> {
-  const result: Partial<T> = {};
-  for (const key of Object.keys(dirtyFields) as (keyof T)[]) {
-    const dirty = dirtyFields[key];
-    const value = values[key];
-
-    // Skip if the value no longer exists (e.g., deleted from a record)
-    if (value === undefined) {
-      continue;
-    }
-
-    if (dirty === true) {
-      result[key] = value;
-    } else if (typeof dirty === "object" && dirty !== null) {
-      // Nested object - recurse
-      const nested = getDirtyValues(
-        value as FieldValues,
-        dirty as Partial<Record<string, unknown>>,
-      );
-      if (Object.keys(nested).length > 0) {
-        result[key] = nested as T[keyof T];
-      }
-    }
-  }
-  return result;
-}
-
-type ManualInjector = (
-  values: UserConfig,
-  dirtyValues: Partial<UserConfig>,
-) => void;
-
-const modelsAiInjection = (
-  values: UserConfig,
-  dirtyValues: Partial<UserConfig>,
-) => {
-  dirtyValues.ai = {
-    ...dirtyValues.ai,
-    models: {
-      ...dirtyValues.ai?.models,
-      displayed_models: values.ai?.models?.displayed_models ?? [],
-      custom_models: values.ai?.models?.custom_models ?? [],
-    },
-  };
-};
-
-// Some fields (like AI model lists) have empty arrays as default values.
-// If a user explicitly clears them, RHF won't mark them dirty, so we use
-// touchedFields to force-include those values in the payload.
-const MANUAL_INJECT_ENTRIES = [
-  ["ai.models.displayed_models", modelsAiInjection],
-  ["ai.models.custom_models", modelsAiInjection],
-] as const satisfies readonly (readonly [
-  FieldPath<UserConfig>,
-  ManualInjector,
-])[];
-
-const MANUAL_INJECT_FIELDS = new Map(MANUAL_INJECT_ENTRIES);
-
-const isTouchedPath = (
-  touched: unknown,
-  path: FieldPath<UserConfig>,
-): boolean => {
-  if (!touched) {
-    return false;
-  }
-  let current: unknown = touched;
-  for (const segment of path.split(".")) {
-    if (typeof current !== "object" || current === null) {
-      return false;
-    }
-    current = (current as Record<string, unknown>)[segment];
-  }
-  return current === true;
-};
-
-export const applyManualInjections = (opts: {
-  values: UserConfig;
-  dirtyValues: Partial<UserConfig>;
-  touchedFields: unknown;
-}) => {
-  const { values, dirtyValues, touchedFields } = opts;
-  for (const [fieldPath, injector] of MANUAL_INJECT_FIELDS) {
-    if (isTouchedPath(touchedFields, fieldPath)) {
-      injector(values, dirtyValues);
-    }
-  }
-};
 
 const categories = [
   {
@@ -222,6 +127,9 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
   onSubmitted,
 }) => {
   const [config, setConfig] = useUserConfig();
+  const [acceptOnEnter, setAcceptOnEnter] = useAtom(
+    acceptCompletionOnEnterAtom,
+  );
   const formElement = useRef<HTMLFormElement>(null);
   const setKeyboardShortcutsOpen = useSetAtom(keyboardShortcutsAtom);
   const [activeCategory, setActiveCategory] = useAtom(
@@ -555,6 +463,27 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
+              <div className="flex flex-col space-y-1">
+                <FormItem className={formItemClasses}>
+                  <FormLabel className="font-normal">
+                    Accept suggestion on Enter
+                  </FormLabel>
+                  <FormControl>
+                    <Checkbox
+                      data-testid="accept-completion-on-enter-checkbox"
+                      checked={acceptOnEnter}
+                      onCheckedChange={(checked) =>
+                        setAcceptOnEnter(Boolean(checked))
+                      }
+                    />
+                  </FormControl>
+                </FormItem>
+                <FormDescription>
+                  When unchecked, pressing Enter inserts a new line instead of
+                  accepting an autocomplete suggestion. Use Tab to accept
+                  suggestions.
+                </FormDescription>
+              </div>
               <FormField
                 control={form.control}
                 name="completion.signature_hint_on_typing"
@@ -1381,33 +1310,6 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       docs
                     </ExternalLink>
                     .
-                  </FormDescription>
-                </div>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="experimental.storage_inspector"
-              render={({ field }) => (
-                <div className="flex flex-col gap-y-1">
-                  <FormItem className={formItemClasses}>
-                    <FormLabel className="font-normal">
-                      Storage Inspector
-                    </FormLabel>
-                    <FormControl>
-                      <Checkbox
-                        data-testid="storage-inspector-checkbox"
-                        checked={field.value === true}
-                        onCheckedChange={field.onChange}
-                      />
-                    </FormControl>
-                  </FormItem>
-                  <IsOverridden
-                    userConfig={config}
-                    name="experimental.storage_inspector"
-                  />
-                  <FormDescription>
-                    Enable experimental storage inspector.
                   </FormDescription>
                 </div>
               )}

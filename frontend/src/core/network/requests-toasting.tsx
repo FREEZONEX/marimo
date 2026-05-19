@@ -1,5 +1,5 @@
 /* Copyright 2026 Marimo. All rights reserved. */
-/* eslint-disable @typescript-eslint/no-explicit-any */
+/* oxlint-disable typescript/no-explicit-any */
 
 import { useAtomValue } from "jotai";
 import { Spinner } from "@/components/icons/spinner";
@@ -21,7 +21,7 @@ export function createErrorToastingRequests(
     sendInstantiate: "Failed to instantiate",
     sendFunctionRequest: "Failed to send function request",
     sendRestart: "Failed to restart",
-    syncCellIds: "Failed to sync cell IDs",
+    sendDocumentTransaction: "Failed to sync document transaction",
     sendRun: "Failed to run",
     sendRunScratchpad: "Failed to run scratchpad",
     sendRename: "Failed to rename",
@@ -41,6 +41,7 @@ export function createErrorToastingRequests(
     previewDatasetColumn: "Failed to fetch data sources",
     previewSQLTable: "Failed to fetch SQL table",
     previewSQLTableList: "Failed to fetch SQL table list",
+    previewSQLSchemaList: "Failed to fetch SQL schema list",
     previewDataSourceConnection: "Failed to preview data source connection",
     validateSQL: "Failed to validate SQL",
     openFile: "Failed to open file",
@@ -50,6 +51,7 @@ export function createErrorToastingRequests(
     sendPdb: "Failed to start debug session",
     sendCreateFileOrFolder: "Failed to create file or folder",
     sendDeleteFileOrFolder: "Failed to delete file or folder",
+    sendCopyFileOrFolder: "Failed to duplicate file or folder",
     sendRenameFileOrFolder: "Failed to rename file or folder",
     sendUpdateFile: "Failed to update file",
     sendFileDetails: "Failed to get file details",

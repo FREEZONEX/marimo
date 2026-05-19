@@ -4,13 +4,14 @@ from __future__ import annotations
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 from marimo._config.manager import UserConfigManager
 from marimo._messaging.notification import (
     CellNotification,
     KernelReadyNotification,
 )
+from marimo._server.workspace import serialize_file_key
 from marimo._session import Session
 from marimo._types.ids import SessionId
 from marimo._utils.parse_dataclass import parse_raw
@@ -25,9 +26,7 @@ if TYPE_CHECKING:
     from starlette.testclient import TestClient
 
 
-def get_session(
-    client: TestClient, session_id: SessionId
-) -> Optional[Session]:
+def get_session(client: TestClient, session_id: SessionId) -> Session | None:
     return get_session_manager(client).get_session(session_id)
 
 
@@ -116,7 +115,7 @@ def test_refresh_session(client: TestClient) -> None:
 def test_save_session(client: TestClient) -> None:
     filename = (
         get_session_manager(client)
-        .file_router.get_single_app_file_manager()
+        .workspace.get_single_app_file_manager()
         .filename
     )
     with client.websocket_connect(_create_ws_url("123")) as websocket:
@@ -265,8 +264,9 @@ def test_resume_session_after_file_change(client: TestClient) -> None:
 
         # Write to the notebook file to add a new cell
         # we write it as the second to last cell
-        filename = session_manager.file_router.get_unique_file_key()
-        assert filename
+        file_key = session_manager.workspace.get_unique_file_key()
+        assert file_key
+        filename = serialize_file_key(file_key)
         with open(filename) as f:
             content = f.read()
         last_cell_pos = content.rindex("@app.cell")
@@ -286,12 +286,13 @@ def test_resume_session_after_file_change(client: TestClient) -> None:
         assert result.handled
 
         data = websocket.receive_json()
-        assert data == {
-            "op": "update-cell-ids",
-            "data": {"cell_ids": ["MJUe", "Hbol"], "op": "update-cell-ids"},
-        }
-        data = websocket.receive_json()
-        assert data["op"] == "update-cell-codes"
+        assert data["op"] == "notebook-document-transaction"
+        tx = data["data"]["transaction"]
+        # Transaction should contain the new cell and reorder.
+        op_types = [op["type"] for op in tx["changes"]]
+        assert "create-cell" in op_types
+        assert "reorder-cells" in op_types
+        assert tx["source"] == "file-watch"
 
     # Resume session with new ID (simulates refresh)
     with client.websocket_connect(_create_ws_url("456")) as websocket:
@@ -302,24 +303,10 @@ def test_resume_session_after_file_change(client: TestClient) -> None:
         # Check for KernelReady message
         data = websocket.receive_json()
         assert parse_raw(data["data"], KernelReadyNotification)
-        messages: list[dict[str, Any]] = []
 
-        # Wait for update-cell-ids message
-        while True:
-            data = websocket.receive_json()
-            messages.append(data)
-            if data["op"] == "update-cell-ids":
-                break
-
-        # 2 messages:
-        # 1. banner
-        # 2. update-cell-ids
-        assert len(messages) == 2
-        assert messages[0]["op"] == "banner"
-        assert messages[1] == {
-            "op": "update-cell-ids",
-            "data": {"cell_ids": ["MJUe", "Hbol"], "op": "update-cell-ids"},
-        }
+        # Banner notification (session replay)
+        data = websocket.receive_json()
+        assert data["op"] == "banner"
 
 
 @contextmanager

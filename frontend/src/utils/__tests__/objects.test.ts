@@ -29,9 +29,9 @@ describe("Objects", () => {
     });
 
     it("should return falsy input unchanged", () => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      // oxlint-disable-next-line typescript/no-explicit-any
       expect(Objects.mapValues(null as any, (v) => v)).toBe(null);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      // oxlint-disable-next-line typescript/no-explicit-any
       expect(Objects.mapValues(undefined as any, (v) => v)).toBe(undefined);
     });
   });
@@ -249,7 +249,7 @@ describe("Objects", () => {
 
     it("should handle omitting non-existent keys", () => {
       const obj = { a: 1, b: 2 };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      // oxlint-disable-next-line typescript/no-explicit-any
       const result = Objects.omit(obj, ["c" as any]);
       expect(result).toEqual({ a: 1, b: 2 });
     });
@@ -258,6 +258,40 @@ describe("Objects", () => {
       const obj = { a: 1, b: 2 };
       const result = Objects.omit(obj, []);
       expect(result).toEqual({ a: 1, b: 2 });
+    });
+  });
+
+  describe("pick", () => {
+    it("should pick specified keys", () => {
+      const obj = { a: 1, b: 2, c: 3 };
+      expect(Objects.pick(obj, ["a", "c"])).toEqual({ a: 1, c: 3 });
+    });
+
+    it("should omit keys not present on the object", () => {
+      const obj = { a: 1, b: 2 };
+      expect(Objects.pick(obj, ["a", "z"])).toEqual({ a: 1 });
+    });
+
+    it("should preserve undefined values for existing keys", () => {
+      const obj = { a: undefined, b: 2 };
+      const result = Objects.pick(obj, ["a", "b"]);
+      expect(result).toEqual({ a: undefined, b: 2 });
+      expect("a" in result).toBe(true);
+    });
+
+    it("should not pick inherited properties", () => {
+      const parent = { inherited: true };
+      const obj = Object.create(parent);
+      obj.own = 1;
+      expect(Objects.pick(obj, ["own", "inherited"])).toEqual({ own: 1 });
+    });
+
+    it("should return empty object when picking no keys", () => {
+      expect(Objects.pick({ a: 1 }, [])).toEqual({});
+    });
+
+    it("should handle empty object", () => {
+      expect(Objects.pick({}, ["a"])).toEqual({});
     });
   });
 });

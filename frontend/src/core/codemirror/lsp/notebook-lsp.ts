@@ -22,7 +22,7 @@ import {
   type ILanguageServerClient,
   isClientWithNotify,
 } from "./types";
-import { getLSPDocument } from "./utils";
+import { getLspDocumentUri } from "./utils";
 
 /**
  * Check if a variable name is private (starts with underscore but not dunder).
@@ -189,7 +189,7 @@ export class NotebookLanguageServerClient implements ILanguageServerClient {
       EditorView | null | undefined
     > = defaultGetNotebookEditors,
   ) {
-    this.documentUri = getLSPDocument();
+    this.documentUri = getLspDocumentUri();
     this.getNotebookEditors = getNotebookEditors;
     this.initialSettings = initialSettings;
     this.client = client;
@@ -815,7 +815,7 @@ export class NotebookLanguageServerClient implements ILanguageServerClient {
                 ...diag,
                 range: lens.reverseRange(diag.range, cellId),
               };
-              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+              // oxlint-disable-next-line typescript/no-non-null-assertion
               diagnosticsByCellId.get(cellId)!.push(cellDiag);
               break; // Exit inner loop once we find the matching cell
             }

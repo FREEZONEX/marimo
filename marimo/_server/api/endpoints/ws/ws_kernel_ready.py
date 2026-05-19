@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from marimo import _loggers
 from marimo._ast.cell import CellConfig
 from marimo._dependencies.dependencies import DependencyManager
+from marimo._messaging.notebook.document import NotebookDocument
 from marimo._messaging.notification import (
     KernelCapabilitiesNotification,
     KernelReadyNotification,
@@ -17,14 +18,17 @@ from marimo._session.model import SessionMode
 from marimo._types.ids import CellId_t
 
 if TYPE_CHECKING:
-    from marimo._server.file_router import MarimoFileKey
     from marimo._server.rtc.doc import LoroDocManager
     from marimo._server.session_manager import SessionManager
+    from marimo._server.workspace import FileKey
     from marimo._session import Session
 
 LOGGER = _loggers.marimo_logger()
 
 LORO_ALLOWED = sys.version_info >= (3, 11)
+
+# Strong refs so fire-and-forget tasks aren't GC'd mid-flight.
+_background_tasks: set[asyncio.Task[Any]] = set()
 
 
 def build_kernel_ready(
@@ -36,7 +40,7 @@ def build_kernel_ready(
     last_execution_time: dict[CellId_t, float],
     kiosk: bool,
     rtc_enabled: bool,
-    file_key: MarimoFileKey,
+    file_key: FileKey,
     mode: SessionMode,
     doc_manager: LoroDocManager,
     auto_instantiated: bool = False,
@@ -62,7 +66,8 @@ def build_kernel_ready(
     Returns:
         KernelReady message operation.
     """
-    codes, names, configs, cell_ids = _extract_cell_data(session, manager)
+    document = session.document
+    codes, names, configs, cell_ids = _extract_cell_data(document, manager)
 
     # Initialize RTC if needed
     if _should_init_rtc(rtc_enabled, mode):
@@ -86,7 +91,7 @@ def build_kernel_ready(
 
 
 def _extract_cell_data(
-    session: Session,
+    document: NotebookDocument,
     manager: SessionManager,
 ) -> tuple[
     tuple[str, ...],
@@ -97,14 +102,14 @@ def _extract_cell_data(
     """Extract cell data based on mode.
 
     Args:
-        session: Current session
+        document: Current document
         manager: Session manager
 
     Returns:
         Tuple of (codes, names, configs, cell_ids).
     """
-    file_manager = session.app_file_manager
-    app = file_manager.app
+    if not document.cells:
+        return ((), (), (), ())
 
     if manager.should_send_code_to_frontend():
         # Send full cell data to frontend
@@ -112,13 +117,14 @@ def _extract_cell_data(
             zip(
                 *tuple(
                     (
-                        cell_data.code,
-                        cell_data.name,
-                        cell_data.config,
-                        cell_data.cell_id,
+                        cell.code,
+                        cell.name,
+                        cell.config,
+                        cell.id,
                     )
-                    for cell_data in app.cell_manager.cell_data()
-                )
+                    for cell in document.cells
+                ),
+                strict=False,
             )
         )
         return codes, names, configs, cell_ids
@@ -127,9 +133,10 @@ def _extract_cell_data(
         codes, names, configs, cell_ids = tuple(
             zip(
                 *tuple(
-                    ("", cell_data.name, cell_data.config, cell_data.cell_id)
-                    for cell_data in app.cell_manager.cell_data()
-                )
+                    ("", cell.name, cell.config, cell.id)
+                    for cell in document.cells
+                ),
+                strict=False,
             )
         )
         return codes, names, configs, cell_ids
@@ -160,7 +167,7 @@ def _should_init_rtc(rtc_enabled: bool, mode: SessionMode) -> bool:
 def _try_init_rtc_doc(
     cell_ids: tuple[CellId_t, ...],
     codes: tuple[str, ...],
-    file_key: MarimoFileKey,
+    file_key: FileKey,
     doc_manager: LoroDocManager,
 ) -> None:
     """Try to initialize RTC document with cell data.
@@ -180,4 +187,8 @@ def _try_init_rtc_doc(
             "RTC: Loro is not installed, disabling real-time collaboration"
         )
     else:
-        asyncio.create_task(doc_manager.create_doc(file_key, cell_ids, codes))
+        task = asyncio.create_task(
+            doc_manager.create_doc(file_key, cell_ids, codes)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)

@@ -13,9 +13,7 @@ from html import escape
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Generic,
-    Optional,
     TypeVar,
     cast,
 )
@@ -34,7 +32,7 @@ from marimo._runtime.functions import Function
 from marimo._types.ids import UIElementId
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from marimo._plugins.ui._impl.input import form as form_plugin
 
@@ -72,8 +70,8 @@ class Lens:
 class InitializationArgs(Generic[S, T]):
     component_name: str
     initial_value: S
-    label: Optional[str]
-    on_change: Optional[Callable[[T], None]]
+    label: str | None
+    on_change: Callable[[T], None] | None
     args: dict[str, JSONType]
     slotted_html: str
     functions: tuple[Function[Any, Any], ...]
@@ -126,8 +124,8 @@ class UIElement(Html, Generic[S, T]):
         self,
         component_name: str,
         initial_value: S,
-        label: Optional[str],
-        on_change: Optional[Callable[[T], None]],
+        label: str | None,
+        on_change: Callable[[T], None] | None,
         args: dict[str, JSONType],
         slotted_html: str = "",
         functions: tuple[Function[Any, Any], ...] = (),
@@ -268,15 +266,16 @@ class UIElement(Html, Generic[S, T]):
                 self._ctx.function_registry.register(
                     namespace=self._id, function=function
                 )
-        self._initial_value_frontend = initial_value
-        self._value_frontend = initial_value
+        frontend_value = self._frontend_initial_value(initial_value)
+        self._initial_value_frontend = frontend_value
+        self._value_frontend = frontend_value
         self._value = self._initial_value = self._convert_value(initial_value)
         self._on_change = on_change
         self._component_args = args
 
         self._inner_text = build_ui_plugin(
             component_name,
-            initial_value,
+            frontend_value,
             label,
             args,
             slotted_html,
@@ -296,7 +295,14 @@ class UIElement(Html, Generic[S, T]):
         This method must convert `value`, the JSON-decoded value sent by the
         frontend, to a value of type `T` for the `UIElement`.
         """
-        pass
+
+    def _frontend_initial_value(self, value: S) -> S:
+        """Return the initial value to embed in HTML sent to the frontend.
+
+        Override to sanitize the value for HTML rendering (e.g. masking
+        passwords) while keeping the real value for Python-side state.
+        """
+        return value
 
     def _register_as_view(self, parent: UIElement[Any, Any], key: str) -> None:
         """Register this element as a view of `parent`."""
@@ -348,16 +354,14 @@ class UIElement(Html, Generic[S, T]):
         bordered: bool = True,
         loading: bool = False,
         submit_button_label: str = "Submit",
-        submit_button_tooltip: Optional[str] = None,
+        submit_button_tooltip: str | None = None,
         submit_button_disabled: bool = False,
         clear_on_submit: bool = False,
         show_clear_button: bool = False,
         clear_button_label: str = "Clear",
-        clear_button_tooltip: Optional[str] = None,
-        validate: Optional[
-            Callable[[Optional[JSONType]], Optional[str]]
-        ] = None,
-        on_change: Optional[Callable[[Optional[T]], None]] = None,
+        clear_button_tooltip: str | None = None,
+        validate: Callable[[JSONType | None], str | None] | None = None,
+        on_change: Callable[[T | None], None] | None = None,
     ) -> form_plugin[S, T]:
         """Create a submittable form out of this `UIElement`.
 
@@ -426,7 +430,7 @@ class UIElement(Html, Generic[S, T]):
         )
 
     def _send_message(
-        self, message: dict[str, object], buffers: Optional[Sequence[bytes]]
+        self, message: dict[str, object], buffers: Sequence[bytes] | None
     ) -> None:
         """
         Send a message to the element rendered on the frontend

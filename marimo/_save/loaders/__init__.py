@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Literal
 
 from marimo._save.loaders.json import JsonLoader
+from marimo._save.loaders.lazy import LazyLoader
 from marimo._save.loaders.loader import (
     BasePersistenceLoader,
     Loader,
@@ -13,21 +14,23 @@ from marimo._save.loaders.loader import (
 from marimo._save.loaders.memory import MemoryLoader
 from marimo._save.loaders.pickle import PickleLoader
 
-LoaderKey = Literal["memory", "pickle", "json"]
+LoaderKey = Literal["memory", "pickle", "json", "lazy"]
 
 PERSISTENT_LOADERS: dict[LoaderKey, LoaderType] = {
     "pickle": PickleLoader,
     "json": JsonLoader,
+    "lazy": LazyLoader,
 }
 
 __all__ = [
+    "PERSISTENT_LOADERS",
     "BasePersistenceLoader",
     "JsonLoader",
+    "LazyLoader",
     "Loader",
     "LoaderKey",
     "LoaderPartial",
     "LoaderType",
     "MemoryLoader",
-    "PERSISTENT_LOADERS",
     "PickleLoader",
 ]

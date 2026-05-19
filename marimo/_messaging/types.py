@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import abc
+import dataclasses
 import io
-from typing import NewType, Optional
+from typing import NewType
 
 from marimo._messaging.mimetypes import ConsoleMimeType
 from marimo._types.ids import CellId_t
@@ -19,11 +20,15 @@ class Stream(abc.ABC):
     The `write` method is called by the kernel.
     """
 
-    cell_id: Optional[CellId_t] = None
+    cell_id: CellId_t | None = None
 
     @abc.abstractmethod
     def write(self, data: KernelMessage) -> None:
         pass
+
+    def flush_console(self) -> None:
+        """Flush buffered console output, if any."""
+        return
 
     def stop(self) -> None:
         """Tear down resources, if any."""
@@ -74,7 +79,6 @@ class Stdout(io.TextIOBase):
 
     def _stop(self) -> None:
         """Tear down resources, if any."""
-        pass
 
 
 class Stderr(io.TextIOBase):
@@ -93,7 +97,6 @@ class Stderr(io.TextIOBase):
 
     def _stop(self) -> None:
         """Tear down resources, if any."""
-        pass
 
 
 class Stdin(io.TextIOBase):
@@ -101,4 +104,13 @@ class Stdin(io.TextIOBase):
 
     def _stop(self) -> None:
         """Tear down resources, if any."""
-        pass
+
+
+@dataclasses.dataclass(kw_only=True)
+class KernelStreams:
+    """The four I/O channels the kernel uses to communicate with the host."""
+
+    stream: Stream
+    stdout: Stdout | None
+    stderr: Stderr | None
+    stdin: Stdin | None

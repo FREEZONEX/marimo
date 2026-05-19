@@ -1,3 +1,4 @@
+/* oxlint-disable no-console -- LSP server uses console for logging */
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import { dirname } from "node:path";
@@ -29,25 +30,21 @@ class Logger {
     try {
       await appendFile(this.logFilePath, `${log}\n`);
     } catch (error) {
-      // biome-ignore lint/suspicious/noConsole: For printing to the console
       console.error("Failed to write to log file:", error);
     }
   }
 
   debug(...args: Parameters<typeof console.log>): void {
-    // biome-ignore lint/suspicious/noConsole: For printing to the console
     console.log(...args);
     void this.appendToLogFile("[DEBUG]", ...args);
   }
 
   log(...args: Parameters<typeof console.log>): void {
-    // biome-ignore lint/suspicious/noConsole: For printing to the console
     console.log(...args);
     void this.appendToLogFile("[INFO]", ...args);
   }
 
   error(...args: Parameters<typeof console.error>): void {
-    // biome-ignore lint/suspicious/noConsole: For printing to the console
     console.error(...args);
     void this.appendToLogFile("[ERROR]", ...args);
   }
@@ -194,13 +191,52 @@ function startWebSocketServer(
       webSocket.close();
     }
   });
+
+  // When the parent process sends SIGTERM (e.g., marimo shutdown),
+  // close all WebSocket connections so that the onClose handlers fire
+  // and child language server processes (e.g. copilot) are killed via
+  // the jsonRpcConnection.dispose() → process.kill() chain.
+  let isShuttingDown = false;
+  const shutdown = () => {
+    if (isShuttingDown) {
+      return;
+    }
+    isShuttingDown = true;
+    logger.log("Received shutdown signal, closing all connections...");
+    for (const client of [...webSocketServer.clients]) {
+      try {
+        client.close();
+      } catch (error) {
+        logger.error("Error while closing client WebSocket:", error);
+      }
+    }
+    // Wait for the server close callback so onClose handlers can fire
+    // and dispose child processes before we exit.
+    webSocketServer.close((error) => {
+      if (error) {
+        logger.error("Error while closing WebSocket server:", error);
+      }
+    });
+    // Force-exit if graceful shutdown takes too long. On Unix/non-Windows
+    // deployments, the parent process may send SIGTERM to the whole process
+    // group, so child LSP processes may already have received the signal —
+    // we still exit promptly here after attempting graceful cleanup. Use
+    // unref() so this timer doesn't keep the process alive if cleanup
+    // finishes earlier.
+    setTimeout(() => {
+      logger.error("Forced shutdown after timeout, exiting process.");
+      process.exit(0);
+    }, 500).unref();
+  };
+
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
 async function main(): Promise<void> {
   const argv = parseArgs(process.argv);
 
   if (argv.help) {
-    // biome-ignore lint/suspicious/noConsole: For printing to the console
     console.log(
       'Usage: node index.cjs --log-file <path> --lsp "<command>" [--port <port>]',
     );

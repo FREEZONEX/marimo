@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Union, cast
+from typing import Any, Literal, cast
 
 from marimo import _loggers
 from marimo._data.models import DataSourceConnection, DataTable
@@ -20,13 +20,12 @@ from marimo._messaging.notification import (
     ModelOpen,
     ModelUpdate,
     NotificationMessage,
+    SQLSchemaListPreviewNotification,
     SQLTableListPreviewNotification,
     SQLTablePreviewNotification,
     StartupLogsNotification,
     StorageNamespacesNotification,
     UIElementMessageNotification,
-    UpdateCellCodesNotification,
-    UpdateCellIdsNotification,
     VariablesNotification,
     VariableValue,
     VariableValuesNotification,
@@ -42,6 +41,7 @@ from marimo._runtime.commands import (
     UpdateUIElementCommand,
 )
 from marimo._sql.connection_utils import (
+    update_schema_list_in_connection,
     update_table_in_connection,
     update_table_list_in_connection,
 )
@@ -55,7 +55,7 @@ ExportType = Literal["html", "md", "ipynb", "session"]
 MIMEBUNDLE_TYPE: KnownMimeType = "application/vnd.marimo+mimebundle"
 
 
-BufferPath = tuple[Union[str, int], ...]
+BufferPath = tuple[str | int, ...]
 
 
 @dataclass
@@ -73,7 +73,10 @@ class ModelReplayState:
 
     @staticmethod
     def from_open(model_id: WidgetModelId, msg: ModelOpen) -> ModelReplayState:
-        buffers = {tuple(p): b for p, b in zip(msg.buffer_paths, msg.buffers)}
+        buffers = {
+            tuple(p): b
+            for p, b in zip(msg.buffer_paths, msg.buffers, strict=False)
+        }
         return ModelReplayState(
             model_id=model_id,
             state=dict(msg.state),
@@ -91,7 +94,7 @@ class ModelReplayState:
         }
         # Merge new state and buffers
         self.state.update(msg.state)
-        for path, buf in zip(msg.buffer_paths, msg.buffers):
+        for path, buf in zip(msg.buffer_paths, msg.buffers, strict=False):
             self.buffers[tuple(path)] = buf
 
     def to_notification(self) -> ModelLifecycleNotification:
@@ -131,7 +134,6 @@ class SessionView:
     """A representation of a session state for replay and serialization.
 
     Of note, a SessionView stores:
-    * the last-seen notebook-order of Cell IDs
     * a mapping from cell IDs to their last seen notification of interest,
       such as an output, status, or console output
     * various other state needed for replay
@@ -142,8 +144,6 @@ class SessionView:
     """
 
     def __init__(self) -> None:
-        # Last seen notebook-order of cell IDs
-        self.cell_ids: Optional[UpdateCellIdsNotification] = None
         # A mapping from cell (IDs) to their last seen notification
         self.cell_notifications: dict[CellId_t, CellNotification] = {}
         # The most recent datasets notification.
@@ -168,8 +168,6 @@ class SessionView:
         self.last_executed_code: dict[CellId_t, str] = {}
         # Map of cell id to the last cell execution time
         self.last_execution_time: dict[CellId_t, float] = {}
-        # Any stale code that was read from a file-watcher
-        self.stale_code: Optional[UpdateCellCodesNotification] = None
         # Aggregated model state — one snapshot per live model.
         # Updates merge in; close removes the entry.
         self.model_states: dict[WidgetModelId, ModelReplayState] = {}
@@ -179,7 +177,7 @@ class SessionView:
         ] = {}
 
         # Startup logs for startup command - only one at a time
-        self.startup_logs: Optional[StartupLogsNotification] = None
+        self.startup_logs: StartupLogsNotification | None = None
 
         # Package installation logs - accumulated per package
         self.package_logs: dict[
@@ -259,9 +257,9 @@ class SessionView:
             self.variable_notifications = notification
 
             # Set of variable names that are in scope.
-            variable_names: set[str] = set(
-                [v.name for v in self.variable_notifications.variables]
-            )
+            variable_names: set[str] = {
+                v.name for v in self.variable_notifications.variables
+            }
 
             # Remove any variable values that are no longer in scope.
             next_values: dict[str, VariableValue] = {}
@@ -367,6 +365,17 @@ class SessionView:
                     sql_table_preview.table,
                 )
 
+        elif isinstance(notification, SQLSchemaListPreviewNotification):
+            sql_schema_list_preview = notification
+            sql_db_metadata = sql_schema_list_preview.metadata
+            schema_list_connections = self.data_connectors.connections
+            if sql_schema_list_preview.schemas is not None:
+                update_schema_list_in_connection(
+                    schema_list_connections,
+                    sql_db_metadata,
+                    sql_schema_list_preview.schemas,
+                )
+
         elif isinstance(notification, SQLTableListPreviewNotification):
             sql_table_list_preview = notification
             sql_metadata = sql_table_list_preview.metadata
@@ -376,15 +385,6 @@ class SessionView:
                 sql_metadata,
                 sql_table_list_preview.tables,
             )
-
-        elif isinstance(notification, UpdateCellIdsNotification):
-            self.cell_ids = notification
-
-        elif (
-            isinstance(notification, UpdateCellCodesNotification)
-            and notification.code_is_stale
-        ):
-            self.stale_code = notification
 
         elif isinstance(notification, UIElementMessageNotification):
             # TODO: Consider reducing to a single message per element
@@ -532,8 +532,6 @@ class SessionView:
     @property
     def notifications(self) -> list[NotificationMessage]:
         all_notifications: list[NotificationMessage] = []
-        if self.cell_ids:
-            all_notifications.append(self.cell_ids)
         if self.variable_notifications.variables:
             all_notifications.append(self.variable_notifications)
         if self.variable_values:
@@ -559,8 +557,6 @@ class SessionView:
                 all_notifications.extend(ui_messages)
 
         all_notifications.extend(self.cell_notifications.values())
-        if self.stale_code:
-            all_notifications.append(self.stale_code)
         # Only include startup logs if they are in progress (not done)
         if self.startup_logs and self.startup_logs.status != "done":
             all_notifications.append(self.startup_logs)
@@ -634,7 +630,7 @@ def _merge_consecutive_console_outputs(
 
 
 def merge_cell_notification(
-    previous: Optional[CellNotification],
+    previous: CellNotification | None,
     current: CellNotification,
 ) -> CellNotification:
     """Merge two cell notifications."""

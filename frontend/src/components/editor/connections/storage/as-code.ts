@@ -173,13 +173,13 @@ function generateGDriveCode(
     );
     const code = dedent(`
       _creds = json.loads("""${connection.credentials_json?.startsWith("ENV:") ? `{${creds}}` : connection.credentials_json}""")
-      fs = GoogleDriveFileSystem(creds=_creds, token="service_account")
+      fs = GoogleDriveFileSystem(creds=_creds, token="service_account", use_listings_cache=False)
     `);
     return { imports, code };
   }
 
   const code = dedent(`
-    fs = GoogleDriveFileSystem(token="browser")
+    fs = GoogleDriveFileSystem(token="browser", use_listings_cache=False)
   `);
   return { imports, code };
 }
@@ -214,7 +214,7 @@ export function generateStorageCode(
   }
 
   const allImports = new Set([...secrets.imports, ...result.imports]);
-  const lines = [...allImports].sort();
+  const lines = [...allImports].toSorted();
   lines.push("");
   const secretsStr = secrets.formatSecrets();
   if (secretsStr) {

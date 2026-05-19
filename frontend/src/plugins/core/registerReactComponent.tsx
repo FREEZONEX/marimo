@@ -1,6 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-/* eslint-disable unicorn/prefer-spread */
+/* oxlint-disable unicorn/prefer-spread */
 /**
  * WebComponent Factory for React Components
  *
@@ -23,6 +23,7 @@ import React, {
 import ReactDOM, { type Root } from "react-dom/client";
 import useEvent from "react-use-event-hook";
 import { type ZodSchema, z } from "zod";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { notebookAtom } from "@/core/cells/cells.ts";
 import { HTMLCellId } from "@/core/cells/ids.ts";
 import { isUninstantiated } from "@/core/cells/utils";
@@ -88,7 +89,7 @@ interface PluginSlotProps<T> {
 
 /* Handles synchronization of value on behalf of the component */
 
-// eslint-disable-next-line react/function-component-definition
+// oxlint-disable-next-line react/function-component-definition
 function PluginSlotInternal<T>(
   { hostElement, plugin, children, getInitialValue }: PluginSlotProps<T>,
   ref: React.Ref<PluginSlotHandle>,
@@ -231,7 +232,7 @@ function PluginSlotInternal<T>(
     }
 
     return methods;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [plugin.functions, hostElement, resetNonce]);
 
   // If we failed to parse the initial value, render an error
@@ -250,14 +251,16 @@ function PluginSlotInternal<T>(
     <StyleNamespace>
       <div className={`contents ${theme}`}>
         <Suspense fallback={<div />}>
-          {plugin.render({
-            setValue: setValueAndSendInput,
-            value,
-            data: parsedResult.data,
-            children: childNodes,
-            host: hostElement,
-            functions: functionMethods,
-          })}
+          <TooltipProvider>
+            {plugin.render({
+              setValue: setValueAndSendInput,
+              value,
+              data: parsedResult.data,
+              children: childNodes,
+              host: hostElement,
+              functions: functionMethods,
+            })}
+          </TooltipProvider>
         </Suspense>
       </div>
     </StyleNamespace>
@@ -265,7 +268,7 @@ function PluginSlotInternal<T>(
 }
 
 const PluginSlot: React.ForwardRefExoticComponent<
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // oxlint-disable-next-line typescript/no-explicit-any
   PluginSlotProps<any> & React.RefAttributes<PluginSlotHandle>
 > = React.forwardRef(PluginSlotInternal);
 

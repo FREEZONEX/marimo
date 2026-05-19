@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from starlette.authentication import requires
@@ -18,7 +17,6 @@ from marimo._server.api.endpoints.ws.ws_connection_validator import (
 )
 from marimo._server.api.endpoints.ws_endpoint import DOC_MANAGER
 from marimo._server.api.utils import dispatch_control_request, parse_request
-from marimo._server.file_router import MarimoFileKey
 from marimo._server.models.models import (
     BaseResponse,
     DebugCellRequest,
@@ -32,7 +30,13 @@ from marimo._server.models.models import (
 )
 from marimo._server.router import APIRouter
 from marimo._server.uvicorn_utils import close_uvicorn
+from marimo._server.workspace import (
+    FileKey,
+    PathFileKey,
+    parse_file_key,
+)
 from marimo._types.ids import ConsumerId
+from marimo._utils.asyncio_utils import cancel_and_wait
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -46,6 +50,7 @@ router = APIRouter()
 
 
 @router.post("/set_ui_element_value")
+@requires("read")
 async def set_ui_element_values(
     *,
     request: Request,
@@ -86,6 +91,7 @@ async def set_ui_element_values(
 
 
 @router.post("/set_model_value")
+@requires("read")
 async def set_model_values(
     *,
     request: Request,
@@ -151,6 +157,7 @@ async def instantiate(
 
 
 @router.post("/function_call")
+@requires("read")
 async def function_call(
     *,
     request: Request,
@@ -230,7 +237,7 @@ async def run_cell(
                 application/json:
                     schema:
                         $ref: "#/components/schemas/SuccessResponse"
-    """  # noqa: E501
+    """
     app_state = AppState(request)
     body = await parse_request(request, cls=ExecuteCellsRequest)
     body.request = HTTPRequest.from_request(request)
@@ -261,7 +268,7 @@ async def execute_code(
                 text/event-stream:
                     schema:
                         type: string
-    """  # noqa: E501
+    """
     from marimo._runtime.commands import ExecuteScratchpadCommand
     from marimo._server.scratchpad import (
         ScratchCellListener,
@@ -272,11 +279,11 @@ async def execute_code(
     body = await parse_request(request, cls=ExecuteScratchpadRequest)
     session = app_state.require_current_session()
 
-    # Auto-instantiate so headless /api/execute works without a prior
-    # /api/instantiate call. The kernel no-ops if already instantiated,
-    # and queue ordering guarantees it completes before the scratchpad runs.
+    # Register cells into the graph without executing them so that
+    # code_mode's run_cell can resolve dependencies. The kernel
+    # no-ops if already instantiated.
     session.instantiate(
-        InstantiateNotebookRequest(object_ids=[], values=[], auto_run=True),
+        InstantiateNotebookRequest(object_ids=[], values=[], auto_run=False),
         http_request=HTTPRequest.from_request(request),
     )
 
@@ -294,25 +301,45 @@ async def execute_code(
 
     async def sse_generator() -> AsyncGenerator[str, None]:
         disconnect_task = asyncio.create_task(_watch_disconnect())
+        # Correlation ID: tags both the scratchpad command and the
+        # listener so we wait for *our* completion and ignore
+        # ``CompletedRun`` events from other commands on this session
+        # (e.g. the ``session.instantiate`` call above, or concurrent
+        # browser activity).
+        run_id = str(uuid4())
         try:
-            listener = ScratchCellListener()
+            listener = ScratchCellListener(run_id=run_id)
             with session.scoped(listener):
                 async with session.scratchpad_lock:
+                    http_req = HTTPRequest.from_request(request)
+                    # Inject trusted server URL and auth token for
+                    # code-mode screenshot support.  We use the
+                    # server's own host/port (from config) rather
+                    # than the request's Host header to prevent
+                    # header-spoofing attacks.
+                    http_req.meta["screenshot_auth_token"] = str(
+                        app_state.session_manager.auth_token
+                    )
+                    base_url = app_state.base_url.rstrip("/")
+                    scheme = request.url.scheme or "http"
+                    http_req.meta["screenshot_server_url"] = (
+                        f"{scheme}://{app_state.host}:{app_state.port}{base_url}"
+                    )
                     session.put_control_request(
                         ExecuteScratchpadCommand(
                             code=body.code,
-                            request=HTTPRequest.from_request(request),
+                            request=http_req,
+                            notebook_cells=tuple(session.document.cells),
+                            run_id=run_id,
                         ),
                         from_consumer_id=None,
                     )
                     async for event in listener.stream():
                         yield event
 
-                yield build_done_event(session)
+                yield build_done_event(session, listener)
         finally:
-            disconnect_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await disconnect_task
+            await cancel_and_wait(disconnect_task)
 
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
@@ -342,7 +369,7 @@ async def run_scratchpad(
                 application/json:
                     schema:
                         $ref: "#/components/schemas/SuccessResponse"
-    """  # noqa: E501
+    """
     return await dispatch_control_request(request, ExecuteScratchpadRequest)
 
 
@@ -371,7 +398,7 @@ async def run_post_mortem(
                 application/json:
                     schema:
                         $ref: "#/components/schemas/SuccessResponse"
-    """  # noqa: E501
+    """
     return await dispatch_control_request(request, DebugCellRequest)
 
 
@@ -395,7 +422,7 @@ async def restart_session(
                 application/json:
                     schema:
                         $ref: "#/components/schemas/SuccessResponse"
-    """  # noqa: E501
+    """
     app_state = AppState(request)
     session_manager = app_state.session_manager
 
@@ -405,12 +432,16 @@ async def restart_session(
     session = app_state.require_current_session()
     session_manager.close_session(session_id)
 
-    # Close RTC doc if it exists
-    file_key: Optional[MarimoFileKey] = (
-        app_state.query_params(FILE_QUERY_PARAM_KEY)
-        or session_manager.file_router.get_unique_file_key()
-        or session.app_file_manager.path
-    )
+    # Close RTC doc if it exists. Empty ``?file=`` falls back to the workspace
+    # key — same as a missing query param — to preserve the prior or-chain.
+    raw_file_key = app_state.query_params(FILE_QUERY_PARAM_KEY)
+    file_key: FileKey | None
+    if raw_file_key:
+        file_key = parse_file_key(raw_file_key)
+    else:
+        file_key = session_manager.workspace.get_unique_file_key()
+        if file_key is None and session.app_file_manager.path is not None:
+            file_key = PathFileKey(session.app_file_manager.path)
     if file_key is not None:
         await DOC_MANAGER.remove_doc(file_key)
     else:
@@ -443,7 +474,7 @@ async def shutdown(
     LOGGER.debug("Received shutdown request")
     app_state = AppState(request)
     session_manager = app_state.session_manager
-    file_router = session_manager.file_router
+    workspace = session_manager.workspace
 
     def shutdown_server() -> None:
         app_state.session_manager.shutdown()
@@ -452,7 +483,7 @@ async def shutdown(
     # If we are only operating on a single file (new or explicit file),
     # and there are no other sessions (user may have opened another notebook
     # from the file explorer) then we should shutdown the whole server
-    key = file_router.get_unique_file_key()
+    key = workspace.get_unique_file_key()
     if key and len(session_manager.sessions) <= 1:
         shutdown_server()
         return SuccessResponse()
@@ -496,9 +527,12 @@ async def takeover_endpoint(
     """
     app_state = AppState(request)
 
-    file_key: Optional[MarimoFileKey] = (
-        app_state.query_params(FILE_QUERY_PARAM_KEY)
-        or app_state.session_manager.file_router.get_unique_file_key()
+    raw_file_key = app_state.query_params(FILE_QUERY_PARAM_KEY)
+    # Empty ``?file=`` falls back to the workspace key — same as missing.
+    file_key: FileKey | None = (
+        parse_file_key(raw_file_key)
+        if raw_file_key
+        else app_state.session_manager.workspace.get_unique_file_key()
     )
     if file_key is None:
         LOGGER.error("No file key provided")

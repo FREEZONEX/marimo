@@ -11,6 +11,7 @@ import pytest
 
 import marimo
 from marimo._ast.app import App
+from marimo._dependencies.dependencies import DependencyManager
 from marimo._plugins.ui._impl.input import dropdown
 from marimo._runtime.commands import ExecuteCellCommand
 from marimo._runtime.runtime import Kernel
@@ -293,7 +294,7 @@ class TestScriptCache:
             app.run()
         except Exception as e:
             if "--cov=marimo" not in sys.argv:
-                raise e
+                raise
             pytest.mark.xfail(
                 reason="Coverage conflict with cache introspection"
             )
@@ -342,7 +343,7 @@ class TestScriptCache:
             with persistent_cache(name="one",
                                   _loader=MockLoader(
                                     data={"X": 7, "Y": 8})
-                                  ) as cache:  # noqa: E501
+                                  ) as cache:
                 Y = 9
                 X = 10
             # fmt: on
@@ -2552,6 +2553,44 @@ class TestCacheDecorator:
                 assert future.result() == 5
             return
 
+    @pytest.mark.skipif(
+        not DependencyManager.pandas.has(),
+        reason="pandas not installed",
+    )
+    async def test_cache_dataframe_object_column(
+        self, k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        """Regression test for marimo-team/marimo#9068.
+
+        @cache with a DataFrame containing an object-dtype column previously
+        raised: ValueError: The truth value of a DataFrame is ambiguous.
+        Caused by an unsafe truthiness check in get_type() that called
+        bool() on the scope value instead of checking key presence.
+        """
+        await k.run(
+            [
+                exec_req.get(
+                    """
+                    import pandas as pd
+                    from marimo._save.save import cache
+
+                    @cache
+                    def get_length(df):
+                        return len(df)
+
+                    result = get_length(
+                        pd.DataFrame(
+                            {"a": list(range(100)), "b": list(map(str, range(100)))}
+                        )
+                    )
+                    """
+                ),
+            ]
+        )
+
+        assert not k.stderr.messages
+        assert k.globals["result"] == 100
+
 
 class TestPersistentCache:
     async def test_pickle_context(
@@ -3409,3 +3448,78 @@ class TestAsyncCacheDecorator:
         assert k.globals["expensive_async_compute"].hits == 0, (
             "First execution should be a miss, deduplication doesn't count as hits"
         )
+
+    async def test_async_cache_stale_task_different_loop(
+        self, k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        """Regression test for GH-8866.
+
+        In marimo run, each session runs in its own thread with a separate event
+        loop. When a pending task from session A's loop is found by session B
+        (different loop), it must not be awaited — doing so raises RuntimeError.
+        """
+        import asyncio
+
+        from marimo._save.save import _cache_call_async
+
+        await k.run(
+            [
+                exec_req.get(
+                    """
+                    import asyncio
+                    from marimo._save.save import cache
+
+                    @cache
+                    async def compute(x):
+                        await asyncio.sleep(0)
+                        return x * 2
+
+                    result = await compute(42)
+                    """
+                )
+            ]
+        )
+
+        assert not k.stderr.messages
+        assert k.globals["result"] == 84
+
+        fn = k.globals["compute"]
+        cache_key = fn._last_hash
+
+        # Inject a stale future from a different event loop into the per-loop
+        # pending dict, simulating session A's in-progress task. Session B
+        # (the current kernel loop) must use its own loop's pending dict and
+        # never see or touch session A's future.
+        other_loop = asyncio.new_event_loop()
+        try:
+            stale_future = (
+                other_loop.create_future()
+            )  # Future, no coroutine → no warning
+
+            with _cache_call_async._pending_lock:
+                import weakref
+
+                if fn not in _cache_call_async._pending_executions:
+                    _cache_call_async._pending_executions[fn] = (
+                        weakref.WeakKeyDictionary()
+                    )
+                _cache_call_async._pending_executions[fn][other_loop] = {
+                    cache_key: stale_future
+                }
+
+            # Session B looks up its own loop's pending dict → not found →
+            # fresh execution → cache hit → result = 84, no RuntimeError.
+            await k.run([exec_req.get("result2 = await compute(42)")])
+
+            assert not k.stderr.messages, k.stderr
+            assert k.globals["result2"] == 84
+            # The stale future must be untouched: if __call__ had tried to
+            # await it the future would have raised an error and been resolved.
+            assert not stale_future.done(), (
+                "stale future was awaited/cancelled — __call__ must not touch "
+                "pending tasks from a different event loop"
+            )
+        finally:
+            with _cache_call_async._pending_lock:
+                _cache_call_async._pending_executions.pop(fn, None)
+            other_loop.close()

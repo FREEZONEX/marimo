@@ -1,11 +1,12 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
 import { historyField } from "@codemirror/commands";
+import { dequal as isEqual } from "dequal";
 import { type Atom, atom, useAtom, useAtomValue } from "jotai";
 import { atomFamily, selectAtom, splitAtom } from "jotai/utils";
-import { isEqual } from "lodash-es";
 import { createRef, type ReducerWithoutAction } from "react";
 import type { CellHandle } from "@/components/editor/notebook-cell";
+import type { CollapsibleTree } from "@/utils/id-tree";
 import {
   type CellColumnId,
   type CellIndex,
@@ -22,13 +23,16 @@ import {
   splitEditor,
   updateEditorCodeFromPython,
 } from "../codemirror/language/utils";
+import type { SerializedEditorState } from "../codemirror/types";
 import { findCollapseRange, mergeOutlines } from "../dom/outline";
 import type { CellMessage } from "../kernel/messages";
 import { isErrorMime } from "../mime";
 import type { CellConfig } from "../network/types";
 import { isRtcEnabled } from "../rtc/state";
 import { createDeepEqualAtom, store } from "../state/jotai";
+import { isWasm } from "../wasm/utils";
 import { prepareCellForExecution, transitionCell } from "./cell";
+import { documentTransactionMiddleware } from "./document-changes";
 import { CellId, SCRATCH_CELL_ID, SETUP_CELL_ID } from "./ids";
 import { type CellLog, getCellLogsForMessage } from "./logs";
 import {
@@ -47,10 +51,35 @@ import {
   canUndoDeletes,
   disabledCellIds,
   enabledCellIds,
+  getUndoLabel,
   notebookIsRunning,
   notebookNeedsRun,
   notebookQueueOrRunningCount,
 } from "./utils";
+
+/**
+ * History entry for undoing a cell deletion.
+ */
+export interface UndoDeleteEntry {
+  type: "delete";
+  name: string;
+  serializedEditorState: SerializedEditorState;
+  column: CellColumnId;
+  index: CellIndex;
+  isSetupCell: boolean;
+  config: CellConfig;
+}
+
+/**
+ * History entry for undoing a cut-paste (move).
+ */
+export interface UndoMoveEntry {
+  type: "move";
+  cellIds: CellId[];
+  placements: Array<{ columnId: CellColumnId; index: CellIndex }>;
+}
+
+export type HistoryEntry = UndoDeleteEntry | UndoMoveEntry;
 
 /**
  * The state of the notebook.
@@ -73,19 +102,9 @@ export interface NotebookState {
    */
   cellHandles: Record<CellId, React.RefObject<CellHandle | null>>;
   /**
-   * Array of deleted cells (with their data and index) so that cell deletion can be undone
-   *
-   * (CodeMirror types the serialized config as any.)
+   * Undo stack: deleted cells and cut-paste moves, in chronological order.
    */
-  history: {
-    name: string;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    serializedEditorState: any;
-    column: CellColumnId;
-    index: CellIndex;
-    isSetupCell: boolean;
-    config: CellConfig;
-  }[];
+  history: HistoryEntry[];
   /**
    * Key of cell to scroll to; typically set by actions that re-order the cell
    * array. Call the SCROLL_TO_TARGET action to scroll to the specified cell
@@ -155,6 +174,10 @@ export interface CreateNewCellAction {
   before: boolean;
   /** Initial code content for the new cell */
   code?: string;
+  /** Optional name for the new cell */
+  name?: string;
+  /** Optional cell configuration */
+  config?: CellConfig;
   /** The last executed code for the new cell */
   lastCodeRun?: string;
   /** Timestamp of the last execution */
@@ -174,6 +197,7 @@ export interface CreateNewCellAction {
  */
 const {
   reducer,
+  addMiddleware,
   createActions,
   useActions,
   valueAtom: notebookAtom,
@@ -183,11 +207,13 @@ const {
       cellId,
       before,
       code,
+      name,
+      config,
       lastCodeRun = null,
       lastExecutionTime = null,
       autoFocus = true,
       skipIfCodeExists = false,
-      hideCode = false,
+      hideCode = undefined,
     } = action;
 
     let columnId: CellColumnId;
@@ -230,8 +256,12 @@ const {
         [newCellId]: createCell({
           id: newCellId,
           code,
+          name,
           lastCodeRun,
-          config: createCellConfig({ hide_code: hideCode }),
+          config: createCellConfig({
+            ...config,
+            ...(hideCode != null && { hide_code: hideCode }),
+          }),
           lastExecutionTime,
           edited: Boolean(code) && code !== lastCodeRun,
         }),
@@ -245,9 +275,10 @@ const {
         [newCellId]: createRef(),
       },
       scrollKey: autoFocus ? newCellId : null,
-      untouchedNewCells: hideCode
-        ? new Set([...state.untouchedNewCells, newCellId])
-        : state.untouchedNewCells,
+      untouchedNewCells:
+        hideCode && !code
+          ? new Set([...state.untouchedNewCells, newCellId])
+          : state.untouchedNewCells,
     };
   },
   moveCell: (
@@ -334,6 +365,49 @@ const {
           scrollKey: cellId,
         };
   },
+  moveCellToIndex: (
+    state,
+    action: {
+      cellId: CellId;
+      columnId: CellColumnId;
+      index: number;
+    },
+  ) => {
+    const { cellId, columnId, index } = action;
+    const fromColumn = state.cellIds.findWithId(cellId);
+    const fromIndex = fromColumn.indexOfOrThrow(cellId);
+
+    const destinationColumn = state.cellIds.get(columnId);
+    if (!destinationColumn) {
+      return state;
+    }
+
+    const clampedIndex = Math.max(0, Math.min(index, destinationColumn.length));
+    const adjustedIndex =
+      fromColumn.id === columnId && fromIndex < clampedIndex
+        ? clampedIndex - 1
+        : clampedIndex;
+
+    if (fromColumn.id === columnId && fromIndex === adjustedIndex) {
+      return state;
+    }
+
+    const withoutCell = state.cellIds.deleteById(cellId);
+    const updatedColumn = withoutCell.get(columnId);
+    if (!updatedColumn) {
+      return state;
+    }
+
+    return {
+      ...state,
+      cellIds: withoutCell.insertId(
+        cellId,
+        columnId,
+        Math.max(0, Math.min(adjustedIndex, updatedColumn.length)),
+      ),
+      scrollKey: null,
+    };
+  },
   dropCellOverCell: (state, action: { cellId: CellId; overCellId: CellId }) => {
     const { cellId, overCellId } = action;
 
@@ -366,6 +440,40 @@ const {
         toColumn.id,
         overCellId,
       ),
+      scrollKey: null,
+    };
+  },
+  moveCellsRelativeTo: (
+    state,
+    action: {
+      cellIds: CellId[];
+      targetCellId: CellId;
+      position: "before" | "after";
+      previousPlacements?: Array<{ columnId: CellColumnId; index: CellIndex }>;
+    },
+  ) => {
+    const { cellIds, targetCellId, position, previousPlacements } = action;
+    if (cellIds.length === 0) {
+      return state;
+    }
+    const newCellIds = state.cellIds.moveCellsRelativeTo(
+      cellIds,
+      targetCellId,
+      position,
+    );
+    // Only record undo when caller provided full before-state
+    const canUndoMove =
+      previousPlacements && previousPlacements.length === cellIds.length;
+    const history = canUndoMove
+      ? [
+          ...state.history,
+          { type: "move" as const, cellIds, placements: previousPlacements },
+        ]
+      : state.history;
+    return {
+      ...state,
+      cellIds: newCellIds,
+      history,
       scrollKey: null,
     };
   },
@@ -575,7 +683,18 @@ const {
       return state;
     }
 
-    const column = state.cellIds.findWithId(cellId);
+    let column: CollapsibleTree<CellId>;
+    try {
+      column = state.cellIds.findWithId(cellId);
+    } catch (error) {
+      // Expected for kernel-only cells or out-of-order transactions.
+      Logger.warn("Skipping delete for missing cellId", {
+        cellId,
+        error,
+      });
+      return state;
+    }
+
     const cellIndex = column.indexOfOrThrow(cellId);
     const focusIndex = cellIndex === 0 ? 1 : cellIndex - 1;
     let scrollKey: CellId | null = null;
@@ -587,7 +706,9 @@ const {
     const serializedEditorState = editorView?.state.toJSON({
       history: historyField,
     });
-    serializedEditorState.doc = state.cellData[cellId].code;
+    if (serializedEditorState) {
+      serializedEditorState.doc = state.cellData[cellId].code;
+    }
 
     // release the granular atom(s) created for this cell
     releaseCellAtoms(cellId);
@@ -598,6 +719,7 @@ const {
       history: [
         ...state.history,
         {
+          type: "delete",
           name: prevData.name,
           serializedEditorState: serializedEditorState,
           column: column.id,
@@ -614,7 +736,29 @@ const {
       return state;
     }
 
-    const mostRecentlyDeleted = state.history[state.history.length - 1];
+    const last = state.history[state.history.length - 1];
+
+    if (last.type === "move") {
+      const { cellIds, placements } = last;
+      if (
+        cellIds.length === 0 ||
+        placements.length !== cellIds.length ||
+        cellIds.some((id) => !state.cellData[id])
+      ) {
+        return { ...state, history: state.history.slice(0, -1) };
+      }
+      const toRestore = cellIds.map((id, i) => ({
+        id,
+        columnId: placements[i].columnId,
+        index: placements[i].index,
+      }));
+      return {
+        ...state,
+        cellIds: state.cellIds.placeCells(toRestore),
+        history: state.history.slice(0, -1),
+        scrollKey: cellIds[0] ?? null,
+      };
+    }
 
     const {
       name,
@@ -623,7 +767,7 @@ const {
       index,
       isSetupCell,
       config,
-    } = mostRecentlyDeleted;
+    } = last;
 
     const cellId = isSetupCell ? SETUP_CELL_ID : CellId.create();
     const undoCell = createCell({
@@ -729,7 +873,7 @@ const {
       cellReducer: (cell) => {
         return {
           ...cell,
-          config: { ...cell.config, ...config },
+          config: createCellConfig({ ...cell.config, ...config }),
         };
       },
     });
@@ -756,13 +900,28 @@ const {
   },
   handleCellMessage: (state, message: CellMessage) => {
     const cellId = message.cell_id;
-    const nextState = updateCellRuntimeState({
+    let nextState = updateCellRuntimeState({
       state,
       cellId,
       cellReducer: (cell) => {
         return transitionCell(cell, message);
       },
     });
+    // When a cell is queued for execution, snapshot the current code
+    // as lastCodeRun. This clears staleness for cells executed by the
+    // kernel (e.g. via code_mode). If the user edits during execution,
+    // code !== lastCodeRun keeps the cell stale.
+    if (message.status === "queued") {
+      nextState = updateCellData({
+        state: nextState,
+        cellId,
+        cellReducer: (cell) => ({
+          ...cell,
+          lastCodeRun: cell.code.trim(),
+          edited: false,
+        }),
+      });
+    }
     return {
       ...nextState,
       cellLogs: [...nextState.cellLogs, ...getCellLogsForMessage(message)],
@@ -798,6 +957,24 @@ const {
       cellRuntime: nextCellRuntime,
       cellHandles: nextCellHandles,
     };
+  },
+  /**
+   * Rebuild the MultiColumn tree using each cell's `config.column` value.
+   *
+   * Used after a transaction whose `set-config` changes updated cells'
+   * column metadata without physically moving them in the tree. Cells with
+   * `config.column == null` inherit the column of the previous cell in the
+   * given order (see `MultiColumn.fromIdsAndColumns`), which lets the server
+   * send column changes only at column boundaries.
+   */
+  rebuildCellColumns: (state, action: { cellIds: CellId[] }) => {
+    const newCellIds = MultiColumn.fromIdsAndColumns(
+      action.cellIds.map((id) => [
+        id,
+        state.cellData[id]?.config.column ?? null,
+      ]),
+    );
+    return { ...state, cellIds: newCellIds };
   },
   setCellCodes: (
     state,
@@ -915,7 +1092,7 @@ const {
       cellReducer: (cell) => {
         const consoleOutputs = [...cell.consoleOutputs];
         const stdinOutput = consoleOutputs[outputIndex];
-        if (stdinOutput.channel !== "stdin") {
+        if (stdinOutput == null || stdinOutput.channel !== "stdin") {
           Logger.warn("Expected stdin output");
           return cell;
         }
@@ -939,8 +1116,20 @@ const {
   setCells: (state, cells: CellData[]) => {
     const cellData = Object.fromEntries(cells.map((cell) => [cell.id, cell]));
 
+    // WASM has no server-side SessionView to replay outputs, so the
+    // snapshot hydrated by notebookStateFromSession is the only source.
+    const preserveSnapshot = isWasm();
+    const runtimeFor = (cellId: CellId): CellRuntimeState => {
+      if (!preserveSnapshot) {
+        return createCellRuntimeState();
+      }
+      const prev = state.cellRuntime[cellId];
+      const hasSnapshot =
+        prev && (prev.output != null || prev.consoleOutputs.length > 0);
+      return hasSnapshot ? prev : createCellRuntimeState();
+    };
     const cellRuntime = Object.fromEntries(
-      cells.map((cell) => [cell.id, createCellRuntimeState()]),
+      cells.map((cell) => [cell.id, runtimeFor(cell.id)]),
     );
 
     return withScratchCell({
@@ -1206,7 +1395,7 @@ const {
           i--;
         }
 
-        const collapseRanges = reversedCollapseRanges.reverse();
+        const collapseRanges = reversedCollapseRanges.toReversed();
         return column.collapseAll(collapseRanges);
       }),
     };
@@ -1405,6 +1594,11 @@ const {
   },
 });
 
+// We apply the middleware here (rather than inline in createReducerAndAtoms)
+// so that the document transaction middleware can import CellActions and
+// strictly type the dispatched actions without creating a circular dependency.
+addMiddleware(documentTransactionMiddleware);
+
 function isCellCodeHidden(state: NotebookState, cellId: CellId): boolean {
   return (
     Boolean(state.cellData[cellId].config.hide_code) &&
@@ -1521,6 +1715,8 @@ export const hasEnabledCellsAtom = atom(
 export const canUndoDeletesAtom = atom((get) =>
   canUndoDeletes(get(notebookAtom)),
 );
+
+export const undoLabelAtom = atom((get) => getUndoLabel(get(notebookAtom)));
 
 export const needsRunAtom = atom((get) => notebookNeedsRun(get(notebookAtom)));
 
@@ -1789,8 +1985,10 @@ export function createTracebackInfoAtom(
  * Use this hook to dispatch cell actions. This hook will not cause a re-render
  * when cells change.
  */
-export function useCellActions(): CellActions {
-  return useActions();
+export function useCellActions(
+  options: { skipMiddleware?: boolean } = {},
+): CellActions {
+  return useActions(options);
 }
 
 /**

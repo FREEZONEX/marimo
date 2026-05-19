@@ -5,23 +5,29 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
+from inline_snapshot import snapshot
 
 from marimo._ai._tools.types import CodeExecutionResult
 from marimo._messaging.cell_output import CellChannel, CellOutput
-from marimo._messaging.errors import (
-    MarimoExceptionRaisedError,
-    MarimoSyntaxError,
+from marimo._messaging.errors import MarimoExceptionRaisedError
+from marimo._messaging.notification import (
+    CellNotification,
+    CompletedRunNotification,
 )
-from marimo._messaging.notification import CellNotification
 from marimo._runtime.scratch import SCRATCH_CELL_ID
 from marimo._server.scratchpad import (
     ScratchCellListener,
     _format_console,
     _format_sse,
     build_done_event,
-    build_timeout_event,
     extract_result,
 )
+
+_TEST_RUN_ID = "test-run-id"
+
+
+def _completed_run(run_id: str = _TEST_RUN_ID) -> CompletedRunNotification:
+    return CompletedRunNotification(run_id=run_id)
 
 
 def _make_session(
@@ -139,6 +145,26 @@ class TestExtractResult:
         assert len(result.errors) == 1
         assert "NameError" in result.errors[0]
 
+    def test_child_cell_errors_included(self) -> None:
+        """extract_result reports failure when listener saw child errors."""
+        notif = CellNotification(
+            cell_id=SCRATCH_CELL_ID,
+            output=CellOutput(
+                channel=CellChannel.OUTPUT,
+                mimetype="text/plain",
+                data="summary",
+            ),
+            console=None,
+            status="idle",
+        )
+        listener = ScratchCellListener(run_id=_TEST_RUN_ID)
+        listener.child_error_summaries.append(
+            "cell 'abc12345' raised ZeroDivisionError"
+        )
+        result = extract_result(_make_session(notif), listener)
+        assert result.success is False
+        assert result.errors == ["cell 'abc12345' raised ZeroDivisionError"]
+
     def test_none_console_entries_skipped(self) -> None:
         notif = CellNotification(
             cell_id=SCRATCH_CELL_ID,
@@ -236,10 +262,15 @@ class TestFormatConsole:
 
 
 class TestBuildDoneEvent:
+    # ``done`` shape is uniform ``{success, output}``. Failures always
+    # carry an empty output — the actual error detail was streamed via
+    # preceding ``stderr`` events.
+    _EMPTY = {"mimetype": "text/plain", "data": ""}
+
     def test_no_notification(self) -> None:
         event, data = _parse_sse(build_done_event(_make_session()))
         assert event == "done"
-        assert data == {"success": True}
+        assert data == snapshot({"success": True, "output": self._EMPTY})
 
     def test_success_with_output(self) -> None:
         notif = CellNotification(
@@ -252,9 +283,12 @@ class TestBuildDoneEvent:
             status="idle",
         )
         _, data = _parse_sse(build_done_event(_make_session(notif)))
-        assert data["success"] is True
-        assert data["output"]["mimetype"] == "text/plain"
-        assert data["output"]["data"] == "42"
+        assert data == snapshot(
+            {
+                "success": True,
+                "output": {"mimetype": "text/plain", "data": "42"},
+            }
+        )
 
     def test_success_with_dict_output(self) -> None:
         notif = CellNotification(
@@ -267,10 +301,16 @@ class TestBuildDoneEvent:
             status="idle",
         )
         _, data = _parse_sse(build_done_event(_make_session(notif)))
-        assert data["success"] is True
-        assert data["output"]["data"] == "value"
+        assert data == snapshot(
+            {
+                "success": True,
+                "output": {"mimetype": "text/plain", "data": "value"},
+            }
+        )
 
-    def test_error_with_exception(self) -> None:
+    def test_scratch_cell_error(self) -> None:
+        """Scratch cell's own MARIMO_ERROR marks the done event as failed;
+        the traceback itself is in preceding stderr events, not here."""
         err = MarimoExceptionRaisedError(
             msg="NameError: x is not defined",
             exception_type="NameError",
@@ -282,49 +322,45 @@ class TestBuildDoneEvent:
             status="idle",
         )
         _, data = _parse_sse(build_done_event(_make_session(notif)))
-        assert data["success"] is False
-        assert data["error"]["type"] == "MarimoExceptionRaisedError"
-        assert data["error"]["exception_type"] == "NameError"
-        assert "NameError" in data["error"]["msg"]
+        assert data == snapshot({"success": False, "output": self._EMPTY})
 
-    def test_error_without_exception_type(self) -> None:
-        err = MarimoSyntaxError(msg="invalid syntax", lineno=1)
+    def test_child_cell_error_reports_failure(self) -> None:
+        """done event reports failure when listener saw child errors."""
         notif = CellNotification(
             cell_id=SCRATCH_CELL_ID,
-            output=CellOutput.errors([err]),
+            output=CellOutput(
+                channel=CellChannel.OUTPUT,
+                mimetype="text/plain",
+                data="summary",
+            ),
             status="idle",
         )
-        _, data = _parse_sse(build_done_event(_make_session(notif)))
-        assert data["success"] is False
-        assert data["error"]["type"] == "MarimoSyntaxError"
-        assert "exception_type" not in data["error"]
-
-    @pytest.mark.parametrize(
-        "exception_type",
-        ["ModuleNotFoundError", "ImportError"],
-    )
-    def test_import_error_includes_install_hint(
-        self, exception_type: str
-    ) -> None:
-        err = MarimoExceptionRaisedError(
-            msg=f"{exception_type}: No module named 'pandas'",
-            exception_type=exception_type,
-            raising_cell=None,
+        listener = ScratchCellListener(run_id=_TEST_RUN_ID)
+        listener.child_error_summaries.append(
+            "cell 'abc12345' raised ZeroDivisionError"
         )
+        _, data = _parse_sse(build_done_event(_make_session(notif), listener))
+        assert data == snapshot({"success": False, "output": self._EMPTY})
+
+    def test_no_child_errors_still_succeeds(self) -> None:
+        """done event succeeds when listener has no child errors."""
+        listener = ScratchCellListener(run_id=_TEST_RUN_ID)
         notif = CellNotification(
             cell_id=SCRATCH_CELL_ID,
-            output=CellOutput.errors([err]),
+            output=CellOutput(
+                channel=CellChannel.OUTPUT,
+                mimetype="text/plain",
+                data="42",
+            ),
             status="idle",
         )
-        _, data = _parse_sse(build_done_event(_make_session(notif)))
-        assert data["success"] is False
-        assert "ctx.install_packages" in data["error"]["msg"]
-
-    def test_timeout(self) -> None:
-        _, data = _parse_sse(build_timeout_event(30.0))
-        assert data["success"] is False
-        assert data["error"]["type"] == "TimeoutError"
-        assert "30.0s" in data["error"]["msg"]
+        _, data = _parse_sse(build_done_event(_make_session(notif), listener))
+        assert data == snapshot(
+            {
+                "success": True,
+                "output": {"mimetype": "text/plain", "data": "42"},
+            }
+        )
 
 
 class TestScratchCellListener:
@@ -332,7 +368,7 @@ class TestScratchCellListener:
     async def test_stream_basic(self) -> None:
         from marimo._messaging.serde import serialize_kernel_message
 
-        listener = ScratchCellListener()
+        listener = ScratchCellListener(run_id=_TEST_RUN_ID)
         event_bus = MagicMock()
         session = MagicMock()
         listener.on_attach(session, event_bus)
@@ -344,7 +380,7 @@ class TestScratchCellListener:
         )
         idle = CellNotification(cell_id=SCRATCH_CELL_ID, status="idle")
 
-        for notif in [running, console, idle]:
+        for notif in [running, console, idle, _completed_run()]:
             listener.on_notification_sent(
                 session, serialize_kernel_message(notif)
             )
@@ -360,10 +396,46 @@ class TestScratchCellListener:
         assert payload["data"] == "hello\n"
 
     @pytest.mark.asyncio
-    async def test_ignores_other_cells(self) -> None:
+    async def test_ignores_unrelated_completed_run(self) -> None:
+        """CompletedRun with a different run_id must NOT fire the sentinel."""
+        import asyncio
+
         from marimo._messaging.serde import serialize_kernel_message
 
-        listener = ScratchCellListener()
+        listener = ScratchCellListener(run_id=_TEST_RUN_ID)
+        event_bus = MagicMock()
+        session = MagicMock()
+        listener.on_attach(session, event_bus)
+
+        # A CompletedRun from an unrelated command (e.g. session.instantiate)
+        listener.on_notification_sent(
+            session, serialize_kernel_message(_completed_run("other-run-id"))
+        )
+
+        # Consumer should still be blocked — no sentinel fired.
+        got_event = asyncio.Event()
+
+        async def consume() -> None:
+            async for _ in listener.stream():
+                got_event.set()
+
+        task = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(got_event.wait(), timeout=0.1)
+            raise AssertionError("listener exited on wrong run_id")
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
+    async def test_ignores_other_cell_status(self) -> None:
+        """Status-only notifications from non-scratch cells are ignored."""
+        from marimo._messaging.serde import serialize_kernel_message
+
+        listener = ScratchCellListener(run_id=_TEST_RUN_ID)
         event_bus = MagicMock()
         session = MagicMock()
         listener.on_attach(session, event_bus)
@@ -378,18 +450,50 @@ class TestScratchCellListener:
         assert listener._queue.empty()
 
     @pytest.mark.asyncio
+    async def test_captures_other_cell_console(self) -> None:
+        """Console output from non-scratch cells is captured."""
+        from marimo._messaging.serde import serialize_kernel_message
+
+        listener = ScratchCellListener(run_id=_TEST_RUN_ID)
+        event_bus = MagicMock()
+        session = MagicMock()
+        listener.on_attach(session, event_bus)
+
+        other_console = CellNotification(
+            cell_id="other_cell_id",
+            console=CellOutput.stderr("error trace\n"),
+        )
+        listener.on_notification_sent(
+            session, serialize_kernel_message(other_console)
+        )
+        assert not listener._queue.empty()
+
+        listener.on_notification_sent(
+            session, serialize_kernel_message(_completed_run())
+        )
+
+        events: list[str] = []
+        async for event in listener.stream():
+            events.append(event)
+
+        assert len(events) == 1
+        name, payload = _parse_sse(events[0])
+        assert name == "stderr"
+        assert payload["data"] == "error trace\n"
+
+    @pytest.mark.asyncio
     async def test_stream_cancelled_on_disconnect(self) -> None:
         """stream() can be cancelled externally (simulating client disconnect)."""
         import asyncio
 
         from marimo._messaging.serde import serialize_kernel_message
 
-        listener = ScratchCellListener()
+        listener = ScratchCellListener(run_id=_TEST_RUN_ID)
         event_bus = MagicMock()
         session = MagicMock()
         listener.on_attach(session, event_bus)
 
-        # Send one stdout event but no idle sentinel — stream would block forever
+        # Send one stdout event but no sentinel — stream would block forever
         console = CellNotification(
             cell_id=SCRATCH_CELL_ID,
             console=CellOutput.stdout("partial\n"),

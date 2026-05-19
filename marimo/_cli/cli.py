@@ -9,7 +9,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import click
 from click.core import ParameterSource
@@ -27,13 +27,15 @@ from marimo._cli.errors import (
 )
 from marimo._cli.export.commands import export
 from marimo._cli.files.file_path import validate_name
-from marimo._cli.help_formatter import ColoredGroup
+from marimo._cli.help_formatter import ColoredGroup, RunCommand
+from marimo._cli.pair.commands import pair
 from marimo._cli.parse_args import parse_args
 from marimo._cli.parser_ux import show_compact_usage_error
 from marimo._cli.print import bright_green, light_blue, red
 from marimo._cli.run_docker import (
     prompt_run_in_docker_container,
 )
+from marimo._cli.tips import choose_startup_tip
 from marimo._cli.upgrade import check_for_updates, print_latest_version
 from marimo._cli.utils import (
     check_app_correctness,
@@ -43,14 +45,18 @@ from marimo._cli.utils import (
 from marimo._config.settings import GLOBAL_SETTINGS
 from marimo._lint import run_check
 from marimo._mcp.setup import McpType
-from marimo._server.file_router import (
-    AppFileRouter,
-    LazyListOfFilesAppFileRouter,
-    flatten_files,
-)
 from marimo._server.files.directory_scanner import DirectoryScanner
 from marimo._server.models.home import MarimoFile
 from marimo._server.start import start
+from marimo._server.workspace import (
+    DirectoryWorkspace,
+    EmptyWorkspace,
+    FixedFilesWorkspace,
+    NotebookWorkspace,
+    SingleFileWorkspace,
+    flatten_files,
+    infer_workspace,
+)
 from marimo._session.model import SessionMode
 from marimo._tutorials import (
     Tutorial,
@@ -244,6 +250,8 @@ edit_help_msg = "\n".join(
     [
         "\b",
         "Create or edit notebooks.",
+        "\b",
+        "If NAME is a url, the notebook will be downloaded to a temporary file."
         "",
         _key_value_bullets(
             [
@@ -436,30 +444,30 @@ class _OptionalValueOption(click.Option):
 )
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def edit(
-    port: Optional[int],
+    port: int | None,
     host: str,
-    proxy: Optional[str],
+    proxy: str | None,
     headless: bool,
     token: bool,
-    token_password: Optional[str],
-    token_password_file: Optional[str],
+    token_password: str | None,
+    token_password_file: str | None,
     base_url: str,
-    allow_origins: Optional[tuple[str, ...]],
+    allow_origins: tuple[str, ...] | None,
     skip_update_check: bool,
-    sandbox: Optional[bool],
-    trusted: Optional[bool],
-    profile_dir: Optional[str],
+    sandbox: bool | None,
+    trusted: bool | None,
+    profile_dir: str | None,
     watch: bool,
     skew_protection: bool,
-    remote_url: Optional[str],
+    remote_url: str | None,
     convert: bool,
-    mcp: Optional[McpType],
+    mcp: McpType | None,
     mcp_allow_remote: bool,
-    server_startup_command: Optional[str],
-    asset_url: Optional[str],
-    timeout: Optional[float],
-    session_ttl: Optional[int],
-    name: Optional[str],
+    server_startup_command: str | None,
+    asset_url: str | None,
+    timeout: float | None,
+    session_ttl: int | None,
+    name: str | None,
     args: tuple[str, ...],
 ) -> None:
     from marimo._cli.sandbox import SandboxMode, resolve_sandbox_mode
@@ -577,8 +585,10 @@ def edit(
         # Check for version updates after preflight checks pass.
         check_for_updates(print_latest_version)
 
+    base_url = validators.check_proxy_base_url(proxy, base_url)
+
     start(
-        file_router=AppFileRouter.infer(name),
+        workspace=infer_workspace(name),
         development_mode=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
         quiet=GLOBAL_SETTINGS.QUIET,
         host=host,
@@ -607,6 +617,7 @@ def edit(
         asset_url=asset_url,
         timeout=timeout,
         sandbox_mode=sandbox_mode,
+        startup_tip=choose_startup_tip(click.get_current_context()),
     )
 
 
@@ -712,18 +723,18 @@ new_help_msg = "\n".join(
 )
 @click.argument("prompt", required=False)
 def new(
-    port: Optional[int],
+    port: int | None,
     host: str,
-    proxy: Optional[str],
+    proxy: str | None,
     headless: bool,
     token: bool,
-    token_password: Optional[str],
-    token_password_file: Optional[str],
+    token_password: str | None,
+    token_password_file: str | None,
     base_url: str,
-    sandbox: Optional[bool],
+    sandbox: bool | None,
     skew_protection: bool,
-    timeout: Optional[float],
-    prompt: Optional[str],
+    timeout: float | None,
+    prompt: str | None,
 ) -> None:
     if sandbox:
         from marimo._cli.sandbox import run_in_sandbox
@@ -732,7 +743,7 @@ def new(
         run_in_sandbox(sys.argv[1:], name=None, additional_features=["lsp"])
         return
 
-    file_router: Optional[AppFileRouter] = None
+    workspace: NotebookWorkspace | None = None
 
     if prompt is None:
         # We support unix-style prompting, cat prompt.txt | marimo new
@@ -760,7 +771,7 @@ def new(
                 suffix=".py", mode="w", encoding="utf-8", delete=False
             ) as temp_file:
                 temp_file.write(notebook_content)
-            file_router = AppFileRouter.infer(temp_file.name)
+            workspace = infer_workspace(temp_file.name)
 
             def _cleanup() -> None:
                 try:
@@ -777,14 +788,16 @@ def new(
                     pass
 
             raise click.ClickException(
-                f"Failed to generate notebook: {str(e)}"
+                f"Failed to generate notebook: {e!s}"
             ) from e
 
-    if file_router is None:
-        file_router = AppFileRouter.new_file()
+    if workspace is None:
+        workspace = EmptyWorkspace()
+
+    base_url = validators.check_proxy_base_url(proxy, base_url)
 
     start(
-        file_router=file_router,
+        workspace=workspace,
         development_mode=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
         quiet=GLOBAL_SETTINGS.QUIET,
         host=host,
@@ -806,6 +819,7 @@ def new(
         redirect_console_to_browser=True,
         ttl_seconds=None,
         timeout=timeout,
+        startup_tip=choose_startup_tip(click.get_current_context()),
     )
 
 
@@ -816,8 +830,19 @@ class _CollectedRunFiles:
 
 
 def _split_run_paths_and_args(
-    name: str, args: tuple[str, ...]
+    name: str,
+    args: tuple[str, ...],
+    args_after_separator: tuple[str, ...] | None = None,
 ) -> tuple[list[str], tuple[str, ...]]:
+    if (
+        args_after_separator
+        and args[-len(args_after_separator) :] == args_after_separator
+    ):
+        return [
+            name,
+            *args[: -len(args_after_separator)],
+        ], args_after_separator
+
     paths = [name]
     for index, arg in enumerate(args):
         if arg == "--":
@@ -896,12 +921,12 @@ def _collect_marimo_files(paths: list[str]) -> _CollectedRunFiles:
     return _CollectedRunFiles(files=files, root_dir=root_dir)
 
 
-def _create_run_file_router(
+def _create_run_workspace(
     validated_paths: list[str], *, watch: bool
-) -> AppFileRouter:
-    """Create the file router for `marimo run`.
+) -> NotebookWorkspace:
+    """Create the workspace for `marimo run`.
 
-    For `--watch` with a single directory, use a lazy directory router so the
+    For `--watch` with a single directory, use a directory workspace so the
     gallery index can reflect file additions/deletions on subsequent requests.
     For all other invocation shapes, preserve static snapshot behavior.
     """
@@ -910,25 +935,22 @@ def _create_run_file_router(
         and len(validated_paths) == 1
         and Path(validated_paths[0]).is_dir()
     ):
-        return LazyListOfFilesAppFileRouter(
-            validated_paths[0], include_markdown=True
-        )
+        return DirectoryWorkspace(validated_paths[0], include_markdown=True)
 
     has_directory = any(Path(path).is_dir() for path in validated_paths)
     is_multi = has_directory or len(validated_paths) > 1
     if is_multi:
         marimo_files = _collect_marimo_files(validated_paths)
-        return AppFileRouter.from_files(
+        return FixedFilesWorkspace(
             marimo_files.files,
             directory=marimo_files.root_dir,
-            allow_single_file_key=False,
-            allow_dynamic=False,
         )
 
-    return AppFileRouter.from_filename(MarimoPath(validated_paths[0]))
+    return SingleFileWorkspace.from_path(MarimoPath(validated_paths[0]))
 
 
 @main.command(
+    cls=RunCommand,
     help="""Run a notebook as an app in read-only mode.
 
 If NAME is a url, the notebook will be downloaded to a temporary file.
@@ -938,7 +960,7 @@ Example:
     marimo run notebook.py
     marimo run folder another_folder
     marimo run app.py -- --arg value
-"""
+""",
 )
 @click.option(
     "-p",
@@ -989,7 +1011,10 @@ Example:
     is_flag=True,
     default=False,
     type=bool,
-    help="Include notebook code in the app.",
+    help=(
+        "Send notebook source code to the client. "
+        "By default, code is not sent to the client and cannot be viewed in the browser."
+    ),
 )
 @click.option(
     "--session-ttl",
@@ -1070,6 +1095,13 @@ Example:
     hidden=True,
     help="Custom asset URL for loading static resources. Can include {version} placeholder.",
 )
+@click.option(
+    "--show-tracebacks/--no-show-tracebacks",
+    is_flag=True,
+    default=None,
+    type=bool,
+    help="Show detailed error tracebacks in a modal when exceptions occur.",
+)
 @click.pass_context
 @click.argument(
     "name",
@@ -1079,13 +1111,13 @@ Example:
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def run(
     ctx: click.Context,
-    port: Optional[int],
+    port: int | None,
     host: str,
-    proxy: Optional[str],
+    proxy: str | None,
     headless: bool,
     token: bool,
-    token_password: Optional[str],
-    token_password_file: Optional[str],
+    token_password: str | None,
+    token_password_file: str | None,
     include_code: bool,
     session_ttl: int,
     watch: bool,
@@ -1093,11 +1125,12 @@ def run(
     base_url: str,
     allow_origins: tuple[str, ...],
     redirect_console_to_browser: bool,
-    sandbox: Optional[bool],
+    sandbox: bool | None,
     check: bool,
-    trusted: Optional[bool],
-    server_startup_command: Optional[str],
-    asset_url: Optional[str],
+    trusted: bool | None,
+    server_startup_command: str | None,
+    asset_url: str | None,
+    show_tracebacks: bool | None,
     name: str,
     args: tuple[str, ...],
 ) -> None:
@@ -1107,7 +1140,18 @@ def run(
         run_in_sandbox,
     )
 
-    paths, notebook_args = _split_run_paths_and_args(name, args)
+    # click consumes `--` as an option terminator and does not pass it
+    # through to `args`. `RunCommand` records the raw tail so splitting
+    # logic can preserve "args after --" semantics without reading process-
+    # global argv state.
+    args_after_separator = ctx.meta.get("marimo_run_args_after_separator")
+    paths, notebook_args = _split_run_paths_and_args(
+        name,
+        args,
+        args_after_separator
+        if isinstance(args_after_separator, tuple)
+        else None,
+    )
 
     if len(paths) == 1 and prompt_run_in_docker_container(
         paths[0], trusted=trusted
@@ -1198,10 +1242,12 @@ def run(
                 "pyzmq",
             )
 
-    file_router = _create_run_file_router(validated_paths, watch=watch)
+    workspace = _create_run_workspace(validated_paths, watch=watch)
+
+    base_url = validators.check_proxy_base_url(proxy, base_url)
 
     start(
-        file_router=file_router,
+        workspace=workspace,
         development_mode=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
         quiet=GLOBAL_SETTINGS.QUIET,
         host=host,
@@ -1226,10 +1272,25 @@ def run(
         server_startup_command=server_startup_command,
         asset_url=asset_url,
         sandbox_mode=sandbox_mode,
+        startup_tip=choose_startup_tip(click.get_current_context()),
+        show_tracebacks=show_tracebacks,
     )
 
 
-@main.command(help="Recover a marimo notebook from JSON.")
+@main.command(
+    help="""Recover a marimo notebook from a JSON file.
+
+When the frontend loses its connection to the kernel, marimo auto-saves
+unsaved cell changes to a JSON recovery file. Use this command to convert
+that JSON file back into a marimo notebook (.py), printing the recovered
+source to stdout.
+
+Example:
+
+    \b
+    marimo recover notebook_recovery.json > recovered_notebook.py
+"""
+)
 @click.argument(
     "name",
     required=True,
@@ -1314,21 +1375,23 @@ Recommended sequence:
     type=click.Choice(tutorial_order),
 )
 def tutorial(
-    port: Optional[int],
+    port: int | None,
     host: str,
-    proxy: Optional[str],
+    proxy: str | None,
     headless: bool,
     token: bool,
-    token_password: Optional[str],
-    token_password_file: Optional[str],
+    token_password: str | None,
+    token_password_file: str | None,
     skew_protection: bool,
     name: Tutorial,
 ) -> None:
     temp_dir = tempfile.TemporaryDirectory()
     path = create_temp_tutorial_file(name, temp_dir)
 
+    base_url = validators.check_proxy_base_url(proxy, "")
+
     start(
-        file_router=AppFileRouter.from_filename(path),
+        workspace=SingleFileWorkspace.from_path(path),
         development_mode=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
         quiet=GLOBAL_SETTINGS.QUIET,
         host=host,
@@ -1346,8 +1409,10 @@ def tutorial(
             token_password=token_password,
             token_password_file=token_password_file,
         ),
+        base_url=base_url,
         redirect_console_to_browser=False,
         ttl_seconds=None,
+        startup_tip=choose_startup_tip(click.get_current_context()),
     )
 
 
@@ -1447,6 +1512,26 @@ def shell_completion() -> None:
     type=click.Choice(["full", "json"], case_sensitive=False),
     help="Output format for diagnostics.",
 )
+@click.option(
+    "--select",
+    "select_rules",
+    default=None,
+    type=str,
+    help=(
+        "Comma-separated rule codes/prefixes to enable, replacing config. "
+        "e.g. --select MB,MR001"
+    ),
+)
+@click.option(
+    "--ignore",
+    "ignore_rules",
+    default=None,
+    type=str,
+    help=(
+        "Comma-separated rule codes/prefixes to ignore. "
+        "e.g. --ignore MF004,MF007"
+    ),
+)
 @click.argument("files", nargs=-1, type=click.UNPROCESSED)
 def check(
     fix: bool,
@@ -1455,11 +1540,17 @@ def check(
     unsafe_fixes: bool,
     ignore_scripts: bool,
     formatter: str,
+    select_rules: str | None,
+    ignore_rules: str | None,
     files: tuple[str, ...],
 ) -> None:
     if not files:
         # If no files are provided, we lint the current directory
         files = ("**/*.py", "**/*.md", "**/*.qmd")
+
+    from marimo._lint import resolve_lint_config
+
+    lint_config = resolve_lint_config(select_rules, ignore_rules)
 
     # Pass click.echo directly as pipe for streaming output, or None for JSON
     pipe = click.echo if verbose and formatter != "json" else None
@@ -1470,6 +1561,7 @@ def check(
         unsafe_fixes=unsafe_fixes,
         ignore_scripts=ignore_scripts,
         formatter=formatter,
+        lint_config=lint_config,
     )
 
     if formatter == "json":
@@ -1498,3 +1590,4 @@ main.command()(convert)
 main.add_command(export)
 main.add_command(config)
 main.add_command(development)
+main.add_command(pair)

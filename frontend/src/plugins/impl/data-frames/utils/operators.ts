@@ -41,6 +41,7 @@ const createComparisonOperators = (schema: z.ZodType) => ({
   ">=": [schema],
   "<": [schema],
   "<=": [schema],
+  between: [z.object({ min: schema, max: schema })],
   is_null: [],
   is_not_null: [],
 });
@@ -59,6 +60,7 @@ export const STRING_OPERATORS = {
   ends_with: [Schema.string],
   in: [Schema.stringMultiColumnValues],
   not_in: [Schema.stringMultiColumnValues],
+  is_empty: [],
   is_null: [],
   is_not_null: [],
 };
@@ -194,7 +196,7 @@ export function isConditionValueValid(operator: string, value: unknown) {
   return possibleSchemas.some((schema) => schema.safeParse(value).success);
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+// oxlint-disable-next-line typescript/no-explicit-any
 const safeGet = (obj: any, key: string): [z.ZodType] | [] => {
   if (obj[key]) {
     return obj[key];

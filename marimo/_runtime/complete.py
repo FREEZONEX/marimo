@@ -11,8 +11,8 @@ from collections.abc import Collection, Mapping
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-import jedi  # type: ignore # noqa: F401
-import jedi.api  # type: ignore # noqa: F401
+import jedi  # type: ignore
+import jedi.api  # type: ignore
 
 from marimo import _loggers as loggers
 from marimo._dependencies.dependencies import DependencyManager
@@ -24,6 +24,7 @@ from marimo._output.md import _md
 from marimo._runtime import dataflow
 from marimo._runtime.commands import CodeCompletionCommand
 from marimo._session.queue import QueueType
+from marimo._types.ids import RequestId
 from marimo._utils.docs import MarimoConverter
 from marimo._utils.format_signature import format_signature
 from marimo._utils.rst_to_html import convert_rst_to_html
@@ -54,9 +55,8 @@ def _should_include_name(name: str, prefix: str) -> bool:
             return False
         elif not prefix.startswith("_"):
             return False
-        else:
-            # Only include dunder names when prefix starts with an underscore
-            return True
+        # Only include dunder names when prefix starts with an underscore
+        return True
     else:
         return True
 
@@ -278,15 +278,24 @@ def _get_completion_option(
     completion: jedi.api.classes.Completion,
     script: jedi.Script,
     compute_completion_info: bool,
+    compute_type: bool = True,
 ) -> CompletionOption:
     name = completion.name
+    # `completion.type` triggers jedi inference and can be surprisingly
+    # expensive on cold caches for heavy libraries (pandas, numpy, torch).
+    # When callers are already over budget they pass `compute_type=False`, in
+    # which case we also skip docstring computation — it re-triggers the same
+    # inference we just declined to pay for.
+    if not compute_type:
+        return CompletionOption(name=name, type="", completion_info="")
+
     kind = completion.type
 
     if compute_completion_info:
         # Choose whether the completion info should be from the name
         # or the enclosing function's signature, if any
         symbol_to_lookup = completion
-        if completion.type == "param":
+        if kind == "param":
             # Show the function/class docstring if available
             signatures = script.get_signatures()
             if len(signatures) == 1:
@@ -307,26 +316,25 @@ def _get_completion_options(
     limit: int,
     timeout: float,
 ) -> list[CompletionOption]:
-    if len(completions) > limit:
-        return [
-            _get_completion_option(
-                completion, script, compute_completion_info=False
-            )
-            for completion in completions
-            if _should_include_name(completion.name, prefix)
-        ]
+    # For large completion sets (e.g. `pd.`, ~140 attrs), building per-item
+    # docstrings costs seconds of jedi inference that the user will never read.
+    # Skip docstrings globally past `limit` and rely on the time budget to bail
+    # out of further type inference if we're already slow.
+    compute_docstrings = len(completions) <= limit
 
     completion_options: list[CompletionOption] = []
-    start_time = time.time()
+    deadline = time.monotonic() + timeout
     for completion in completions:
         if not _should_include_name(completion.name, prefix):
             continue
-        elapsed_time = time.time() - start_time
+        under_time_budget = time.monotonic() < deadline
         completion_options.append(
             _get_completion_option(
                 completion,
                 script,
-                compute_completion_info=elapsed_time < timeout,
+                compute_completion_info=compute_docstrings
+                and under_time_budget,
+                compute_type=under_time_budget,
             )
         )
     return completion_options
@@ -334,7 +342,7 @@ def _get_completion_options(
 
 def _write_completion_result(
     stream: Stream,
-    completion_id: str,
+    completion_id: RequestId,
     prefix_length: int,
     options: list[CompletionOption],
 ) -> None:
@@ -348,7 +356,7 @@ def _write_completion_result(
     )
 
 
-def _write_no_completions(stream: Stream, completion_id: str) -> None:
+def _write_no_completions(stream: Stream, completion_id: RequestId) -> None:
     _write_completion_result(stream, completion_id, 0, [])
 
 
@@ -416,10 +424,6 @@ def _isinstance_external(obj: Any, *, class_ref: str) -> bool:
     return isinstance(obj, target_class)
 
 
-class HasKeysMethod(Protocol):
-    def keys(self) -> Collection[Any]: ...
-
-
 class HasColumnsProperty(Protocol):
     @property
     def columns(self) -> Collection[Any]: ...
@@ -430,8 +434,9 @@ def _key_options_from_ipython_method(obj: Any) -> list[str]:
     return [str(key) for key in obj._ipython_key_completions_()]
 
 
-def _key_options_via_keys_method(obj: HasKeysMethod) -> list[str]:
-    return [str(key) for key in obj.keys()]
+def _key_options_via_keys_method(obj: Mapping[Any, Any]) -> list[str]:
+    """Completion keys from a mapping. Only used after ``isinstance(obj, Mapping)``."""
+    return [str(key) for key in obj]
 
 
 # TODO refactor to customize the `CompletionOption.info` with `"columns"`
@@ -449,9 +454,9 @@ def _key_options_dispatcher(obj: Any) -> list[str]:
         return _key_options_from_ipython_method(obj)
     elif isinstance(obj, Mapping):
         return _key_options_via_keys_method(obj)
-    elif _isinstance_external(obj, class_ref="pandas.DataFrame"):
-        return _key_options_via_columns_method(obj)
-    elif _isinstance_external(obj, class_ref="polars.DataFrame"):
+    elif _isinstance_external(
+        obj, class_ref="pandas.DataFrame"
+    ) or _isinstance_external(obj, class_ref="polars.DataFrame"):
         return _key_options_via_columns_method(obj)
 
     LOGGER.debug(
@@ -496,7 +501,7 @@ def _resolve_chained_key_path(obj_name: str, document: str) -> list[list[str]]:
 
         # if nodes directly after `obj_name` node are not key accessor `[""]`, exit
         # we expect to never hit this condition
-        if not node.type == "trailer":
+        if node.type != "trailer":
             break
 
         key_path.append(ast.literal_eval(node.get_code()))
@@ -630,7 +635,7 @@ def complete(
             graph.cells[cid].code
             for cid in dataflow.topological_sort(
                 graph,
-                set(graph.cells.keys()) - set([request.cell_id]),
+                set(graph.cells.keys()) - {request.cell_id},
             )
         ]
 

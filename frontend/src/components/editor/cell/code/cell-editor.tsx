@@ -13,6 +13,7 @@ import { useCellActions } from "@/core/cells/cells";
 import { usePendingDeleteService } from "@/core/cells/pending-delete-service";
 import type { CellData, CellRuntimeState } from "@/core/cells/types";
 import { setupCodeMirror } from "@/core/codemirror/cm";
+import { acceptCompletionOnEnterAtom } from "@/core/codemirror/completion/accept-on-enter-atom";
 import {
   getInitialLanguageAdapter,
   languageAdapterState,
@@ -47,7 +48,8 @@ import { useSplitCellCallback } from "../useSplitCell";
 import { LanguageToggles } from "./language-toggle";
 
 export interface CellEditorProps
-  extends Pick<CellRuntimeState, "status">,
+  extends
+    Pick<CellRuntimeState, "status">,
     Pick<CellData, "id" | "code" | "serializedEditorState" | "config"> {
   runCell: () => void;
   theme: Theme;
@@ -145,6 +147,7 @@ const CellEditorInternal = ({
   });
 
   const autoInstantiate = useAtomValue(autoInstantiateAtom);
+  const acceptCompletionOnEnter = useAtomValue(acceptCompletionOnEnterAtom);
   const afterToggleMarkdown = useEvent(() => {
     maybeAddMarimoImport({
       autoInstantiate,
@@ -185,7 +188,7 @@ const CellEditorInternal = ({
         deleteCell: handleDelete,
         saveNotebook: saveOrNameNotebook,
         createManyBelow: (cells) => {
-          for (const code of [...cells].reverse()) {
+          for (const code of cells.toReversed()) {
             cellActions.createNewCell({
               code,
               before: false,
@@ -211,6 +214,7 @@ const CellEditorInternal = ({
         },
       },
       completionConfig: userConfig.completion,
+      acceptCompletionOnEnter,
       keymapConfig: userConfig.keymap,
       lspConfig: userConfig.language_servers,
       theme,
@@ -260,11 +264,13 @@ const CellEditorInternal = ({
     return extensions;
   }, [
     cellId,
+    acceptCompletionOnEnter,
     userConfig.keymap,
     userConfig.completion,
     userConfig.language_servers,
     userConfig.display,
     userConfig.diagnostics,
+    userConfig.ai?.inline_tooltip,
     aiEnabled,
     theme,
     showPlaceholder,

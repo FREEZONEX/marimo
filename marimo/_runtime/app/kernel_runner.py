@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from marimo._ast.cell import CellImpl
 from marimo._config.config import DEFAULT_CONFIG
 from marimo._dependencies.dependencies import DependencyManager
+from marimo._messaging.types import KernelStreams
 from marimo._runtime.app.common import RunOutput
 from marimo._runtime.commands import (
     AppMetadata,
@@ -108,6 +109,13 @@ class AppKernelRunner:
         hooks.add_post_execution(cache_output)
         hooks.add_post_execution(_reset_matplotlib_context)
 
+        streams = KernelStreams(
+            stream=ctx.stream,
+            stdout=None,
+            stderr=None,
+            stdin=None,
+        )
+
         self._kernel = Kernel(
             cell_configs={},
             app_metadata=AppMetadata(
@@ -117,10 +125,7 @@ class AppKernelRunner:
                 filename=filename,
                 app_config=app.config,
             ),
-            stream=ctx.stream,
-            stdout=None,
-            stderr=None,
-            stdin=None,
+            streams=streams,
             module=create_main_module(
                 filename,
                 input_override=None,
@@ -137,10 +142,8 @@ class AppKernelRunner:
         self._runtime_context = create_kernel_context(
             kernel=self._kernel,
             app=app,
-            stream=ctx.stream,
-            stdout=None,
-            stderr=None,
-            virtual_files_supported=True,
+            streams=streams,
+            virtual_file_storage="shared_memory",
             mode=SessionMode.EDIT,
             parent=ctx,
         )
@@ -199,10 +202,15 @@ class AppKernelRunner:
         return self.outputs, self._kernel.globals
 
     async def set_ui_element_value(
-        self, request: UpdateUIElementCommand
+        self,
+        request: UpdateUIElementCommand,
+        *,
+        notify_frontend: bool,
     ) -> bool:
         with self._runtime_context.install():
-            return await self._kernel.set_ui_element_value(request)
+            return await self._kernel.set_ui_element_value(
+                request, notify_frontend=notify_frontend
+            )
 
     async def function_call(
         self, request: InvokeFunctionCommand

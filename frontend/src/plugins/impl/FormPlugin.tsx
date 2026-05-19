@@ -3,7 +3,7 @@
 import { Loader2Icon } from "lucide-react";
 import { type JSX, useEffect, useRef, useState } from "react";
 import { z } from "zod";
-import { Tooltip, TooltipProvider } from "@/components/ui/tooltip";
+import { Tooltip } from "@/components/ui/tooltip";
 import type { UIElementId } from "@/core/cells/ids";
 import {
   MarimoValueInputEvent,
@@ -44,7 +44,7 @@ interface Data {
  * is clicked, this plugin assumes the value of the associated plugin.
  */
 
-// eslint-disable-next-line @typescript-eslint/consistent-type-definitions
+// oxlint-disable-next-line typescript/consistent-type-definitions
 type Functions = {
   validate: (req: { value?: unknown }) => Promise<string | undefined | null>;
 };
@@ -72,16 +72,11 @@ export const FormPlugin = createPlugin("marimo-form")
       .output(z.string().nullish()),
   })
   .renderer(({ data, functions, ...rest }) => {
-    return (
-      <TooltipProvider>
-        <Form {...data} {...rest} {...functions} />
-      </TooltipProvider>
-    );
+    return <Form {...data} {...rest} {...functions} />;
   });
 
 export interface FormWrapperProps<T>
-  extends Omit<Data, "elementId">,
-    Functions {
+  extends Omit<Data, "elementId">, Functions {
   children: React.ReactNode;
   currentValue: T;
   newValue: T;

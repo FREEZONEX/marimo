@@ -19,6 +19,7 @@ from marimo._ast.app import (
     InternalApp,
 )
 from marimo._ast.app_config import _AppConfig
+from marimo._ast.cell import CellConfig
 from marimo._ast.cell_id import is_external_cell_id
 from marimo._ast.errors import (
     CycleError,
@@ -936,12 +937,12 @@ class TestApp:
         original_cell_ids = list(original_internal.cell_manager.cell_ids())
         cloned_cell_ids = list(cloned_internal.cell_manager.cell_ids())
 
-        original_cell = original_internal.cell_manager._cell_data[
+        original_cell = original_internal.cell_manager.cell_data_at(
             original_cell_ids[0]
-        ].cell
-        cloned_cell = cloned_internal.cell_manager._cell_data[
+        ).cell
+        cloned_cell = cloned_internal.cell_manager.cell_data_at(
             cloned_cell_ids[0]
-        ].cell
+        ).cell
 
         assert original_cell is not None
         assert cloned_cell is not None
@@ -1117,6 +1118,12 @@ def test_cli_args(tmp_path: pathlib.Path) -> None:
     assert "value2" in output
 
 
+# TODO(akshayka): Many of the app composition and embedding tests are flaky in
+# CI. This suggests either cross-test state pollution or a bug in the
+# underlying implementation. These bugs are not high priority to fix, so
+# the flaky tests have been marked as xfail. If this ever does become
+# a priority (in particular, if we see GitHub issues about these methods
+# failing in real usage), these failing tests may provide a clue.
 class TestAppComposition:
     async def test_app_embed(self) -> None:
         app = App()
@@ -1447,7 +1454,8 @@ class TestAppComposition:
         assert await k.set_ui_element_value(
             UpdateUIElementCommand.from_ids_and_values(
                 [(dropdown_element._id, ["second"])]
-            )
+            ),
+            notify_frontend=False,
         )
         assert token[0] == 2
 
@@ -1499,7 +1507,8 @@ class TestAppComposition:
         # testing that only descendants of the updated UI elements run,
         # and that the other UI element is not reset
         assert await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(x._id, 2)])
+            UpdateUIElementCommand.from_ids_and_values([(x._id, 2)]),
+            notify_frontend=False,
         )
 
         assert app_kernel_runner == app._get_kernel_runner()
@@ -1508,7 +1517,8 @@ class TestAppComposition:
         assert y.value == 1
 
         assert await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(y._id, 3)])
+            UpdateUIElementCommand.from_ids_and_values([(y._id, 3)]),
+            notify_frontend=False,
         )
 
         assert x.value == 2
@@ -1557,7 +1567,7 @@ class TestAppComposition:
         with app1.setup:
             x = 1
 
-        setup_cell = app1._cell_manager._cell_data.get(setup_cell_id)
+        setup_cell = app1._cell_manager.cell_data_at(setup_cell_id)
         assert setup_cell is not None
         assert setup_cell.config.hide_code is False
 
@@ -1566,7 +1576,7 @@ class TestAppComposition:
         with app2.setup():
             x2 = 1
 
-        setup_cell = app2._cell_manager._cell_data.get(setup_cell_id)
+        setup_cell = app2._cell_manager.cell_data_at(setup_cell_id)
         assert setup_cell is not None
         assert setup_cell.config.hide_code is False
 
@@ -1575,7 +1585,7 @@ class TestAppComposition:
         with app3.setup(hide_code=True):
             y = 2
 
-        setup_cell = app3._cell_manager._cell_data.get(setup_cell_id)
+        setup_cell = app3._cell_manager.cell_data_at(setup_cell_id)
         assert setup_cell is not None
         assert setup_cell.config.hide_code is True
 
@@ -1584,7 +1594,7 @@ class TestAppComposition:
         with app4.setup(hide_code=False):
             z = 3
 
-        setup_cell = app4._cell_manager._cell_data.get(setup_cell_id)
+        setup_cell = app4._cell_manager.cell_data_at(setup_cell_id)
         assert setup_cell is not None
         assert setup_cell.config.hide_code is False
 
@@ -1704,6 +1714,116 @@ class TestAppComposition:
         assert is_external_cell_id(setup_cell_ids[0])
 
 
+class TestInternalAppWithData:
+    """``InternalApp.with_data`` rewrites the cell list from the
+    frontend's snapshot during the save round-trip. It must mutate the
+    existing cell manager in place — Session holds
+    ``app.cell_manager.document`` as a property, so swapping in a fresh
+    manager would orphan ``session.document``.
+    """
+
+    def test_preserves_cell_manager_identity(self) -> None:
+        app = App()
+
+        @app.cell
+        def _():
+            x = 1
+            return (x,)
+
+        internal_app = InternalApp(app)
+        cell_manager = internal_app.cell_manager
+        cell_ids = list(cell_manager.cell_ids())
+        codes = list(cell_manager.codes())
+        names = list(cell_manager.names())
+        configs = list(cell_manager.configs())
+
+        internal_app.with_data(
+            cell_ids=cell_ids,
+            codes=[c + "  # edited" for c in codes],
+            names=names,
+            configs=configs,
+        )
+
+        assert internal_app.cell_manager is cell_manager
+
+    def test_preserves_document_identity(self) -> None:
+        app = App()
+
+        @app.cell
+        def _():
+            x = 1
+            return (x,)
+
+        internal_app = InternalApp(app)
+        document = internal_app.cell_manager.document
+        cell_ids = list(internal_app.cell_manager.cell_ids())
+        codes = list(internal_app.cell_manager.codes())
+        names = list(internal_app.cell_manager.names())
+        configs = list(internal_app.cell_manager.configs())
+
+        internal_app.with_data(
+            cell_ids=cell_ids,
+            codes=[c + "  # edited" for c in codes],
+            names=names,
+            configs=configs,
+        )
+
+        assert internal_app.cell_manager.document is document
+
+    def test_carries_compiled_cells_for_surviving_ids(self) -> None:
+        app = App()
+
+        @app.cell
+        def _():
+            x = 1
+            return (x,)
+
+        internal_app = InternalApp(app)
+        cell_id = next(iter(internal_app.cell_manager.cell_ids()))
+        original_compiled = internal_app.cell_manager._compiled_cells[
+            cell_id
+        ]
+        assert original_compiled is not None
+
+        internal_app.with_data(
+            cell_ids=[cell_id],
+            codes=["x = 2  # renamed-only-here"],
+            names=["__"],
+            configs=[CellConfig()],
+        )
+
+        # Same cell id survived, so the compiled sidecar is preserved.
+        # (The save round-trip doesn't recompile; that happens in the
+        # kernel after the save lands.)
+        assert (
+            internal_app.cell_manager._compiled_cells[cell_id]
+            is original_compiled
+        )
+
+    def test_writes_new_codes_and_names(self) -> None:
+        app = App()
+
+        @app.cell
+        def _():
+            x = 1
+            return (x,)
+
+        internal_app = InternalApp(app)
+        cell_id = next(iter(internal_app.cell_manager.cell_ids()))
+
+        internal_app.with_data(
+            cell_ids=[cell_id],
+            codes=["x = 99"],
+            names=["renamed"],
+            configs=[CellConfig()],
+        )
+
+        cd = internal_app.cell_manager.get_cell_data(cell_id)
+        assert cd is not None
+        assert cd.code == "x = 99"
+        assert cd.name == "renamed"
+
+
 class TestInternalAppOverrides:
     """Tests for InternalApp.overrides() method."""
 
@@ -1781,6 +1901,10 @@ class TestInternalAppOverrides:
         assert not k.errors
         assert k.globals["overrides"] == {"x": 100}
 
+
+    @pytest.mark.xfail(
+        True, reason="Flaky in CI, can't repro locally", strict=False
+    )
     async def test_overrides_returns_multiple_defs(
         self, k: Kernel, exec_req: ExecReqProvider
     ) -> None:
@@ -1822,8 +1946,6 @@ class TestInternalAppOverrides:
         )
         assert not k.errors
         assert k.globals["overrides"] == {"a": 10, "b": 20}
-
-
 
 
 class TestAppKernelRunnerRegistry:

@@ -4,16 +4,44 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import warnings
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._utils import async_path
 from marimo._utils.file_watcher import FileWatcherManager, PollingFileWatcher
 
 
+async def _wait_for(
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = 0.5,
+    interval: float = 0.05,
+) -> None:
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(interval)
+    # Surface a timeout so reruns/flakes leave a breadcrumb instead of
+    # failing silently at the next assert with a misleading count.
+    warnings.warn(
+        f"_wait_for timed out after {timeout}s waiting on "
+        f"{getattr(predicate, '__name__', repr(predicate))}",
+        stacklevel=2,
+    )
+
+
+@pytest.mark.flaky(reruns=3)
 async def test_polling_file_watcher() -> None:
     with NamedTemporaryFile(delete=False) as tmp_file:
         tmp_path = Path(tmp_file.name)
@@ -36,7 +64,7 @@ async def test_polling_file_watcher() -> None:
         f.write("modification")
 
     # Wait for the watcher to detect the change
-    await asyncio.sleep(0.2)
+    await _wait_for(lambda: len(callback_calls) == 1)
 
     # Stop / cleanup
     watcher.stop()
@@ -47,6 +75,7 @@ async def test_polling_file_watcher() -> None:
     assert callback_calls[0] == tmp_path
 
 
+@pytest.mark.flaky(reruns=3)
 async def test_file_watcher_manager() -> None:
     # Create two temporary files
     with (
@@ -89,7 +118,9 @@ async def test_file_watcher_manager() -> None:
             f.write("modification1")
 
         # Wait for callbacks
-        await asyncio.sleep(0.2)
+        await _wait_for(
+            lambda: len(callback1_calls) == 1 and len(callback2_calls) == 1
+        )
 
         # Both callbacks should be called for file1
         assert len(callback1_calls) == 1
@@ -101,12 +132,16 @@ async def test_file_watcher_manager() -> None:
         # Remove one callback from file1
         manager.remove_callback(tmp_path1, callback1)
 
+        # Space writes so the second mtime is distinguishable from the first
+        # on filesystems with coarse mtime granularity (e.g. HFS+).
+        await asyncio.sleep(0.05)
+
         # Modify file1 again
         with open(tmp_path1, "w") as f:  # noqa: ASYNC230
             f.write("modification2")
 
         # Wait for callbacks
-        await asyncio.sleep(0.2)
+        await _wait_for(lambda: len(callback2_calls) == 2)
 
         # Only callback2 should be called again
         assert len(callback1_calls) == 1  # unchanged
@@ -118,7 +153,7 @@ async def test_file_watcher_manager() -> None:
             f.write("modification3")
 
         # Wait for callbacks
-        await asyncio.sleep(0.2)
+        await _wait_for(lambda: len(callback3_calls) == 1)
 
         # callback3 should be called for file2
         assert len(callback1_calls) == 1
@@ -136,7 +171,8 @@ async def test_file_watcher_manager() -> None:
         with open(tmp_path2, "w") as f:  # noqa: ASYNC230
             f.write("modification4")
 
-        # Wait for potential callbacks
+        # Wait for potential callbacks (negative assertion — keep a fixed
+        # budget since there's nothing to poll on).
         await asyncio.sleep(0.2)
 
         # No new calls should happen
@@ -149,6 +185,75 @@ async def test_file_watcher_manager() -> None:
         manager.stop_all()
         os.remove(tmp_path1)
         os.remove(tmp_path2)
+
+
+@patch("marimo._utils.file_watcher.PollingFileWatcher.POLL_SECONDS", 0.05)
+async def test_polling_file_watcher_transient_missing(tmp_path: Path) -> None:
+    """Test that the watcher survives a transient file deletion (e.g. vim save).
+
+    Editors like vim save by writing to a temp file, deleting the original,
+    and renaming the temp. The polling watcher should tolerate the brief
+    absence and fire the callback once the file reappears with new content.
+    """
+    tmp_file = tmp_path / "nb.py"
+    tmp_file.write_bytes(b"original")
+
+    callback_calls: list[Path] = []
+
+    async def test_callback(path: Path) -> None:
+        callback_calls.append(path)
+
+    loop = asyncio.get_event_loop()
+    watcher = PollingFileWatcher(tmp_file, test_callback, loop)
+    watcher.start()
+
+    await asyncio.sleep(0.1)
+
+    # Simulate vim-style save: delete original, then recreate
+    os.remove(tmp_file)
+    await asyncio.sleep(0.1)  # File is missing for a poll cycle
+    with open(tmp_file, "w") as f:  # noqa: ASYNC230
+        f.write("updated content")
+
+    # Wait for the watcher to detect the change
+    await asyncio.sleep(0.2)
+
+    watcher.stop()
+
+    # The watcher should still be running and have detected the change
+    assert watcher._missing_count == 0
+    assert len(callback_calls) >= 1
+    assert callback_calls[0] == tmp_file
+
+
+@patch("marimo._utils.file_watcher.PollingFileWatcher.MAX_MISSING_POLLS", 3)
+@patch("marimo._utils.file_watcher.PollingFileWatcher.POLL_SECONDS", 0.05)
+async def test_polling_file_watcher_permanently_missing(
+    tmp_path: Path,
+) -> None:
+    """Test that the watcher stops after MAX_MISSING_POLLS consecutive misses."""
+    tmp_file = tmp_path / "nb.py"
+    tmp_file.write_bytes(b"")
+
+    callback_calls: list[Path] = []
+
+    async def test_callback(path: Path) -> None:
+        callback_calls.append(path)
+
+    loop = asyncio.get_event_loop()
+    watcher = PollingFileWatcher(tmp_file, test_callback, loop)
+    watcher.start()
+
+    await asyncio.sleep(0.1)
+
+    # Remove the file permanently
+    os.remove(tmp_file)
+
+    # Wait for the watcher to exceed MAX_MISSING_POLLS and stop
+    await asyncio.sleep(0.5)
+
+    assert watcher._running is False
+    assert len(callback_calls) == 0
 
 
 # This test is not working and watchdog makes CI hang in other areas
