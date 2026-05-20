@@ -20,7 +20,6 @@ import {
   MessageCircleIcon,
   NotebookText,
   PlusIcon,
-  SettingsIcon,
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import useEvent from "react-use-event-hook";
@@ -56,7 +55,6 @@ import { useRuntimeManager } from "@/core/runtime/config";
 import { ErrorBanner } from "@/plugins/impl/common/error-banner";
 import { cn } from "@/utils/cn";
 import { Logger } from "@/utils/Logger";
-import { AIModelDropdown } from "../ai/ai-model-dropdown";
 import { useOpenSettingsToTab } from "../app-config/state";
 import { PromptInput } from "../editor/ai/add-cell-with-ai";
 import {
@@ -65,7 +63,6 @@ import {
 } from "../editor/ai/completion-utils";
 import { PanelEmptyState } from "../editor/chrome/panels/empty-state";
 import { CopyClipboardIcon } from "../icons/copy-icon";
-import { MCPStatusIndicator } from "../mcp/mcp-status-indicator";
 import { Tooltip, TooltipProvider } from "../ui/tooltip";
 import {
   AddContextButton,
@@ -101,8 +98,6 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
   activeChatId,
   setActiveChat,
 }) => {
-  const { handleClick } = useOpenSettingsToTab();
-
   return (
     <div className="flex border-b px-2 py-1 justify-between shrink-0 items-center">
       <Tooltip content="New chat">
@@ -111,17 +106,6 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
         </Button>
       </Tooltip>
       <div className="flex items-center gap-2">
-        <MCPStatusIndicator />
-        <Tooltip content="AI Settings">
-          <Button
-            variant="text"
-            size="xs"
-            className="hover:bg-foreground/10 py-2"
-            onClick={() => handleClick("ai")}
-          >
-            <SettingsIcon className="h-4 w-4" />
-          </Button>
-        </Tooltip>
         <ChatHistoryPopover
           activeChatId={activeChatId}
           setActiveChat={setActiveChat}
@@ -318,13 +302,6 @@ const ChatInputFooter: React.FC<ChatInputFooterProps> = memo(
                 </SelectGroup>
               </SelectContent>
             </Select>
-            <AIModelDropdown
-              placeholder="Model"
-              triggerClassName="h-6 text-xs shadow-none! ring-0! bg-muted hover:bg-muted/30 rounded-sm"
-              iconSize="small"
-              showAddCustomModelDocs={true}
-              forRole="chat"
-            />
           </div>
           <div className="flex flex-row">
             <AddContextButton

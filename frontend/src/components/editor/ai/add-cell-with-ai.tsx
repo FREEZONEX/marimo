@@ -27,7 +27,6 @@ import {
 import { useMemo, useRef, useState } from "react";
 import useEvent from "react-use-event-hook";
 import { z } from "zod";
-import { AIModelDropdown } from "@/components/ai/ai-model-dropdown";
 import {
   AddContextButton,
   AttachFileButton,
@@ -263,12 +262,6 @@ export const AddCellWithAI: React.FC<{
   const footerComponent = (
     <div className="px-3 pt-1 flex flex-row items-center justify-between">
       <div className="flex items-center gap-2">
-        <AIModelDropdown
-          triggerClassName="h-7 text-xs max-w-64"
-          iconSize="small"
-          forRole="edit"
-          showAddCustomModelDocs={true}
-        />
         {languageDropdown}
       </div>
       <div className="flex flex-row items-center">

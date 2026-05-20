@@ -17,7 +17,6 @@ import "./merge-editor.css";
 import { storePrompt } from "@marimo-team/codemirror-ai";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { useAtom, useAtomValue } from "jotai";
-import { AIModelDropdown } from "@/components/ai/ai-model-dropdown";
 import {
   AddContextButton,
   SendButton,
@@ -334,13 +333,6 @@ export const AiCompletionEditor: React.FC<Props> = ({
                 <AddContextButton
                   handleAddContext={() => addContextCompletion(inputRef)}
                   isLoading={isLoading}
-                />
-                <AIModelDropdown
-                  triggerClassName="h-7 text-xs"
-                  iconSize="small"
-                  forRole="edit"
-                  displayIconOnly={true}
-                  placeholder="Edit model"
                 />
               </div>
               {completion && (
