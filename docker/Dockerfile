@@ -22,7 +22,7 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 WORKDIR /build
 
 # 复制所有需要的文件（包括 marimo 源码中的 schema）
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.json ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.json .oxfmtrc.json ./
 COPY frontend ./frontend
 COPY packages ./packages
 COPY patches ./patches
