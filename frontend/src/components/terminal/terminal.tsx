@@ -143,7 +143,7 @@ const TerminalComponent: React.FC<TerminalComponentProps> = ({
   const terminalRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  // eslint-disable-next-line react/hook-use-state
+  // oxlint-disable-next-line react/hook-use-state
   const [{ terminal, fitAddon, searchAddon }] = useState(() => {
     // Create a new terminal instance
     const term = new Terminal({
@@ -270,6 +270,22 @@ const TerminalComponent: React.FC<TerminalComponentProps> = ({
 
         const handleOpen = () => {
           updateReadyState();
+          // Send initial dimensions: the mount-time fit() may have fired
+          // before the WS was OPEN, dropping the resize message and leaving
+          // the PTY at its default 0x0 winsize.
+          fitAddon.fit();
+          if (terminal.cols > 0 && terminal.rows > 0) {
+            socket.send(
+              JSON.stringify({
+                type: "resize",
+                cols: terminal.cols,
+                rows: terminal.rows,
+              }),
+            );
+            // The fit() above may have triggered onResize → scheduled a
+            // debounced send. Cancel it; we just sent the same dims.
+            handleBackendResizeDebounced.cancel();
+          }
         };
 
         const handleDisconnect = () => {
@@ -300,7 +316,7 @@ const TerminalComponent: React.FC<TerminalComponentProps> = ({
     return () => {
       // noop
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [initialized]);
 
   // Process pending commands when terminal is ready
@@ -335,7 +351,7 @@ const TerminalComponent: React.FC<TerminalComponentProps> = ({
     }
 
     return;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [visible]);
 
   // On mount
@@ -373,7 +389,7 @@ const TerminalComponent: React.FC<TerminalComponentProps> = ({
     return () => {
       abortController.abort();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (

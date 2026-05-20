@@ -1,14 +1,24 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import platform
 import re
 from typing import Any
 
-from marimo._utils.toml import read_toml_string
+from marimo._utils.toml import toml_reader
 
 REGEX = (
     r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
 )
+
+
+def with_python_version_requirement(project: dict[str, Any]) -> dict[str, Any]:
+    # TODO(akshayka): consider locking the Python version for greater
+    # reproducibility, instead of returning a lowerbound
+    project = project.copy()
+    version_tuple = platform.python_version_tuple()
+    project["requires-python"] = f">={version_tuple[0]}.{version_tuple[1]}"
+    return project
 
 
 def read_pyproject_from_script(script: str) -> dict[str, Any] | None:
@@ -29,7 +39,7 @@ def read_pyproject_from_script(script: str) -> dict[str, Any] | None:
             for line in matches[0].group("content").splitlines(keepends=True)
         )
 
-        pyproject = read_toml_string(content)
+        pyproject = toml_reader.reads(content)
         return pyproject
     else:
         return None

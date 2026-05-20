@@ -44,7 +44,7 @@ import {
   type UserConfig,
   UserConfigSchema,
 } from "../../core/config/config-schema";
-import { getDirtyValues } from "../app-config/user-config-form";
+import { getDirtyValues } from "../app-config/get-dirty-values";
 import { Button } from "../ui/button";
 import {
   DropdownMenu,
@@ -76,6 +76,21 @@ function buildPackageSpecifier(name: string, extras: string[]): string {
   return `${name}[${extras.join(",")}]`;
 }
 
+const SourceBadge: React.FC<{ source?: "kernel" | "server" }> = ({
+  source,
+}) => {
+  if (source !== "server") {
+    return null;
+  }
+  return (
+    <Tooltip content="Installing into the server environment, not the notebook kernel">
+      <span className="ml-2 text-xs font-normal border border-current rounded px-1 py-0.5 opacity-60">
+        server
+      </span>
+    </Tooltip>
+  );
+};
+
 export const PackageAlert: React.FC = () => {
   const { packageAlert, packageLogs } = useAlerts();
   const { clearPackageAlert } = useAlertActions();
@@ -96,15 +111,16 @@ export const PackageAlert: React.FC = () => {
 
   if (isMissingPackageAlert(packageAlert)) {
     return (
-      <div className="flex flex-col gap-4 mb-5 fixed top-5 left-12 min-w-[400px] z-200 opacity-95 max-w-[600px]">
+      <div className="flex flex-col gap-4 mb-5 fixed top-5 left-12 min-w-[400px] z-200 opacity-95 max-w-[600px] pointer-events-none">
         <Banner
           kind="danger"
-          className="flex flex-col rounded py-3 px-5 animate-in slide-in-from-left overflow-auto max-h-[80vh] scrollbar-thin"
+          className="flex flex-col rounded py-3 px-5 animate-in slide-in-from-left overflow-auto max-h-[80vh] scrollbar-thin pointer-events-auto"
         >
           <div className="flex justify-between">
             <span className="font-bold text-lg flex items-center mb-2">
               <PackageXIcon className="w-5 h-5 inline-block mr-2" />
               Missing packages
+              <SourceBadge source={packageAlert.source} />
             </span>
             <Button
               variant="text"
@@ -174,6 +190,7 @@ export const PackageAlert: React.FC = () => {
                     })}
                     versions={desiredPackageVersions}
                     clearPackageAlert={() => clearPackageAlert(packageAlert.id)}
+                    source={packageAlert.source}
                   />
 
                   {!isWasm() && (
@@ -207,15 +224,16 @@ export const PackageAlert: React.FC = () => {
     }
 
     return (
-      <div className="flex flex-col gap-4 mb-5 fixed top-5 left-12 min-w-[400px] z-200 opacity-95 max-w-[600px] ">
+      <div className="flex flex-col gap-4 mb-5 fixed top-5 left-12 min-w-[400px] z-200 opacity-95 max-w-[600px] pointer-events-none">
         <Banner
           kind={status === "failed" ? "danger" : "info"}
-          className="flex flex-col rounded pt-3 pb-4 px-5 overflow-auto max-h-[80vh] scrollbar-thin"
+          className="flex flex-col rounded pt-3 pb-4 px-5 overflow-auto max-h-[80vh] scrollbar-thin pointer-events-auto"
         >
           <div className="flex justify-between">
             <span className="font-bold text-lg flex items-center mb-2">
               {titleIcon}
               {title}
+              <SourceBadge source={packageAlert.source} />
             </span>
             <Button
               variant="text"
@@ -323,11 +341,13 @@ const InstallPackagesButton = ({
   packages,
   versions,
   clearPackageAlert,
+  source,
 }: {
   manager: PackageManagerName;
   packages: string[];
   versions: Record<string, string>;
   clearPackageAlert: () => void;
+  source?: "kernel" | "server";
 }) => {
   const { sendInstallMissingPackages } = useRequestClient();
   return (
@@ -347,6 +367,7 @@ const InstallPackagesButton = ({
         await sendInstallMissingPackages({
           manager,
           versions: completePackages,
+          source,
         }).catch((error) => {
           Logger.error(error);
         });

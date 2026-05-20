@@ -3,25 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
 from http.client import HTTPResponse, HTTPSConnection
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Final,
-    Optional,
-    Union,
 )
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
-import starlette.status as status
+from starlette import status
 from starlette.authentication import (
     AuthCredentials,
     AuthenticationBackend,
     BaseUser,
     SimpleUser,
+    UnauthenticatedUser,
 )
 from starlette.background import BackgroundTask
 from starlette.middleware.base import (
@@ -37,7 +35,7 @@ from websockets import ClientConnection, ConnectionClosed, connect
 from marimo import _loggers
 from marimo._config.settings import GLOBAL_SETTINGS
 from marimo._dependencies.dependencies import DependencyManager
-from marimo._server.api.auth import validate_auth
+from marimo._server.api.auth import TOKEN_QUERY_PARAM, validate_auth
 from marimo._server.api.deps import AppState, AppStateBase
 from marimo._server.codes import WebSocketCodes
 from marimo._server.uvicorn_utils import close_uvicorn
@@ -88,7 +86,7 @@ class AuthBackend(AuthenticationBackend):
 
     async def authenticate(
         self, conn: HTTPConnection
-    ) -> Optional[tuple[AuthCredentials, BaseUser]]:
+    ) -> tuple[AuthCredentials, BaseUser] | None:
         # We may not need to authenticate. This can be disabled
         # because the user is running in a trusted environment
         # or authentication is handled by a layer above us
@@ -135,6 +133,9 @@ class SkewProtectionMiddleware:
         if request.headers.get("Content-Type", "").startswith(
             "application/x-www-form-urlencoded"
         ):
+            return await self.app(scope, receive, send)
+        # If /api/kernel/execute, skip (agent-only endpoint)
+        if request.url.path.rstrip("/").endswith("/api/kernel/execute"):
             return await self.app(scope, receive, send)
         # If ws, skip
         if request.url.path.startswith("/ws") or request.url.path.endswith(
@@ -201,9 +202,14 @@ class OpenTelemetryMiddleware(BaseHTTPMiddleware):
         if not GLOBAL_SETTINGS.TRACING:
             return await call_next(request)
 
+        from opentelemetry.propagate import extract
+
+        ctx = extract(carrier=request.headers)
+
         with server_tracer.start_as_current_span(
             f"{request.method} {request.url.path}",
             kind=self.trace.SpanKind.SERVER,
+            context=ctx,
             attributes={
                 "http.method": request.method,
                 "http.target": request.url.path or "",
@@ -337,7 +343,7 @@ class _AsyncHTTPClient:
         self, request: _URLRequest, stream: bool = False, max_retries: int = 2
     ) -> _AsyncHTTPResponse:
         del stream
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         body = await self._collect_body(request)
 
@@ -367,21 +373,49 @@ class ProxyMiddleware:
         self,
         app: ASGIApp,
         proxy_path: str,
-        target_url: Union[str, Callable[[str], str]],
+        target_url: str | Callable[[str], str],
         path_rewrite: Callable[[str], str] | None = None,
         connection_error_handler: Callable[
             [ConnectionRefusedError, str], Response
         ]
         | None = None,
+        *,
+        require_auth: bool = True,
     ) -> None:
         self.app = app
         self.path = proxy_path.rstrip("/")
         self.target_url = target_url
         self.path_rewrite = path_rewrite
+        self.require_auth = require_auth
         self.connection_error_handler = (
             connection_error_handler
             if connection_error_handler
             else _handle_proxy_connection_error
+        )
+
+    def _is_authenticated(self, scope: Scope) -> bool:
+        user = scope.get("user")
+        if user is None or isinstance(user, UnauthenticatedUser):
+            return False
+        return bool(getattr(user, "is_authenticated", False))
+
+    async def _reject_unauthenticated_http(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        response = JSONResponse(
+            {"detail": "Authorization header required"},
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            headers={"WWW-Authenticate": "Basic"},
+        )
+        await response(scope, receive, send)
+
+    async def _reject_unauthenticated_websocket(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        websocket = WebSocket(scope, receive=receive, send=send)
+        await websocket.close(
+            code=WebSocketCodes.UNAUTHORIZED,
+            reason="Unauthorized",
         )
 
     def _get_target_url(self, path: str) -> str:
@@ -391,12 +425,40 @@ class ProxyMiddleware:
 
         return self.target_url
 
+    def _is_lsp_path(self, scope: Scope) -> bool:
+        return "/lsp/" in scope.get("path", "")
+
+    async def _try_start_lsp_server(self, scope: Scope) -> bool:
+        if not self._is_lsp_path(scope):
+            return False
+
+        app = scope.get("app")
+        if app is None:
+            return False
+
+        try:
+            app_state = AppStateBase(app.state)
+            await app_state.session_manager.start_lsp_server()
+            return True
+        except Exception as e:
+            LOGGER.warning("Failed to start LSP server from proxy: %s", e)
+            return False
+
     async def __call__(
         self, scope: Scope, receive: Receive, send: Send
     ) -> None:
         if scope["type"] == "websocket":
             if not scope["path"].startswith(self.path):
                 return await self.app(scope, receive, send)
+
+            if self.require_auth and not self._is_authenticated(scope):
+                LOGGER.warning(
+                    "Rejecting unauthenticated websocket proxy request to %s",
+                    scope["path"],
+                )
+                return await self._reject_unauthenticated_websocket(
+                    scope, receive, send
+                )
 
             ws_target_url = self._get_target_url(scope["path"])
             ws_path = scope["path"]
@@ -424,6 +486,15 @@ class ProxyMiddleware:
             await self.app(scope, receive, send)
             return
 
+        if self.require_auth and not self._is_authenticated(scope):
+            LOGGER.warning(
+                "Rejecting unauthenticated http proxy request to %s",
+                scope["path"],
+            )
+            return await self._reject_unauthenticated_http(
+                scope, receive, send
+            )
+
         target_base = self._get_target_url(request.url.path)
         # Remove proxy path prefix for proxied request
         target_path = request.url.path
@@ -446,7 +517,7 @@ class ProxyMiddleware:
             content=request.stream(),
         )
 
-        response: Union[StreamingResponse, Response]
+        response: StreamingResponse | Response
         try:
             rp_resp = await client.send(rp_req, stream=True)
             response = StreamingResponse(
@@ -467,18 +538,49 @@ class ProxyMiddleware:
         self, scope: Scope, receive: Receive, send: Send, ws_url: str
     ) -> None:
         websocket = WebSocket(scope, receive=receive, send=send)
+
+        async def safe_close(
+            *,
+            code: int = WebSocketCodes.UNEXPECTED_ERROR,
+            reason: str | None = None,
+        ) -> None:
+            if websocket.client_state == WebSocketState.DISCONNECTED:
+                return
+            try:
+                await websocket.close(code=code, reason=reason)
+            except RuntimeError as e:
+                # Starlette may raise if close was already sent.
+                if (
+                    'Cannot call "send" once a close message has been sent.'
+                    in str(e)
+                ):
+                    return
+                raise
+
         try:
             original_params = websocket.query_params
             if original_params:
-                ws_url = f"{ws_url}?{'&'.join(f'{k}={v}' for k, v in original_params.items())}"
+                # Re-encode query params from Starlette's already-decoded
+                # values so spaces become %20 while preserving literal plus
+                # signs instead of incorrectly treating them as spaces.
+                # Strip the access_token param — it's only used by marimo
+                # for authentication and should not be forwarded to
+                # upstream LSP servers.
+                encoded_params = [
+                    (k, quote(v))
+                    for k, v in original_params.items()
+                    if k != TOKEN_QUERY_PARAM
+                ]
+                if encoded_params:
+                    ws_url = f"{ws_url}?{'&'.join(f'{k}={v}' for k, v in encoded_params)}"
             await websocket.accept()
 
             # Try to connect to the upstream WebSocket with retries
-            max_retries = 3
+            max_retries = 5
             exponential_backoff = 1.5
 
             async def get_client() -> ClientConnection:
-                retry_delay = 0.5  # seconds
+                retry_delay = 0.25  # seconds
 
                 for attempt in range(max_retries):
                     try:
@@ -489,6 +591,17 @@ class ProxyMiddleware:
                         LOGGER.info(
                             f"WebSocket connection attempt {attempt + 1}/{max_retries} failed for {ws_url}: {e}"
                         )
+
+                        # If this is an LSP proxy path, attempt to bring up the
+                        # LSP server on connection failures. This is retried in
+                        # case startup races with user-config persistence.
+                        if self._is_lsp_path(scope):
+                            started = await self._try_start_lsp_server(scope)
+                            if started:
+                                await asyncio.sleep(retry_delay)
+                                if attempt < max_retries - 1:
+                                    continue
+
                         if attempt < max_retries - 1:
                             await asyncio.sleep(retry_delay)
                             retry_delay *= exponential_backoff
@@ -496,16 +609,7 @@ class ProxyMiddleware:
                             LOGGER.error(
                                 f"Failed to connect to {ws_url} after {max_retries} attempts. Final error: {e}"
                             )
-                            # Close the client WebSocket with a meaningful error
-                            if (
-                                websocket.client_state
-                                != WebSocketState.DISCONNECTED
-                            ):
-                                await websocket.close(
-                                    code=WebSocketCodes.UNEXPECTED_ERROR,
-                                    reason="Failed to connect to LSP server",
-                                )
-                            raise e
+                            raise
 
                 raise ValueError("Failed to connect to LSP server")
 
@@ -562,14 +666,11 @@ class ProxyMiddleware:
                     await asyncio.gather(*relay_tasks)
                 except asyncio.CancelledError:
                     pass
-                except Exception as e:
-                    raise e
                 finally:
                     for task in relay_tasks:
                         if not task.done():
                             task.cancel()
-                    if websocket.client_state != WebSocketState.DISCONNECTED:
-                        await websocket.close()
+                    await safe_close()
                     await ws_client.close()
         except Exception as e:
             LOGGER.error(f"WebSocket proxy error for {ws_url}: {e}")
@@ -580,8 +681,7 @@ class ProxyMiddleware:
                 LOGGER.error(
                     f"LSP server appears to be down at {ws_url}. Check if the LSP server started successfully."
                 )
-            if websocket.client_state != WebSocketState.DISCONNECTED:
-                await websocket.close(code=WebSocketCodes.UNEXPECTED_ERROR)
+            await safe_close(code=WebSocketCodes.UNEXPECTED_ERROR)
             raise
 
 
@@ -600,7 +700,8 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
         self.app_state.timeout_tracker = time.time()
         self.timeout_duration_minutes = timeout_duration_minutes
 
-        asyncio.create_task(self.monitor())
+        # Hold a strong reference so the monitor task isn't GC'd.
+        self._monitor_task = asyncio.create_task(self.monitor())
 
     async def __call__(
         self, scope: Scope, receive: Receive, send: Send

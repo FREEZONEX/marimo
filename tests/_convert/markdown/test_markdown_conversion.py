@@ -63,7 +63,7 @@ def test_markdown_snapshots() -> None:
     sys.platform == "win32", reason="Failing on Windows CI due to emojis"
 )
 def test_idempotent_markdown_to_marimo() -> None:
-    for script in modules.keys():
+    for script in modules:
         with open(DIR_PATH + f"/snapshots/{script}.md.txt") as f:
             md = f.read()
         python_source = sanitized_version(md_to_py(md))
@@ -172,6 +172,35 @@ def test_markdown_just_frontmatter() -> None:
     assert app.cell_manager.cell_data_at(ids[0]).code == ""
 
 
+def test_markdown_frontmatter_metadata_roundtrip() -> None:
+    """Frontmatter metadata should survive md -> IR -> md roundtrip."""
+    script = dedent(
+        remove_empty_lines(
+            """
+    ---
+    title: "My Title"
+    author: "Marimo Team"
+    description: "A notebook description"
+    ---
+
+    ```python {.marimo}
+    x = 1
+    ```
+    """
+        )
+    )
+
+    notebook_ir = convert_from_md_to_marimo_ir(script)
+    roundtripped = MarimoConvert.from_ir(notebook_ir).to_markdown()
+    assert "author: Marimo Team" in roundtripped
+    # Description is preserved but YAML may use folded style (>-)
+    from marimo._convert.markdown.to_ir import extract_frontmatter
+
+    meta, _ = extract_frontmatter(roundtripped)
+    assert meta["description"] == "A notebook description"
+
+
+@pytest.mark.requires("duckdb")
 def test_markdown_with_sql() -> None:
     script = dedent(
         remove_empty_lines(

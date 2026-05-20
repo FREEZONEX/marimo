@@ -1,15 +1,16 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from marimo._output.hypertext import Html
 from marimo._output.md import md
 from marimo._output.rich_help import mddoc
+from marimo._utils.methods import getcallable
 
 
 @mddoc
-def doc(obj: Any) -> Optional[Html]:
+def doc(obj: Any) -> Html | None:
     """Get documentation about an object.
 
     If the object implements the `RichHelp` protocol, the documentation will be
@@ -22,11 +23,10 @@ def doc(obj: Any) -> Optional[Html]:
         Documentation as an `Html` object if the object implements `RichHelp`;
         otherwise, documentation is printed to console (and nothing is returned)
     """
-    if hasattr(obj, "_rich_help_"):
-        msg = obj._rich_help_()
+    if rich_help := getcallable(obj, "_rich_help_"):
+        msg = rich_help()
         return (
             md(msg) if msg is not None else md("No documentation available.")
         )
-    else:
-        help(obj)
-        return None
+    help(obj)
+    return None

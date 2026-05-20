@@ -6,9 +6,9 @@ import copy
 import functools
 import inspect
 import itertools
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, NoReturn, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar, cast
 
 from marimo._ast.cell import Cell
 from marimo._ast.fast_stack import fast_stack
@@ -53,7 +53,7 @@ def build_stub_fn(
 
     args = {arg.arg: arg for arg in func_body.args.args}
     if allowed is None:
-        allowed = [arg for arg in args.keys()]
+        allowed = [arg for arg in args]
     name = func_body.name
 
     # Typing checks for mypy - template structure is known
@@ -117,7 +117,7 @@ def wrap_fn_for_pytest(func: Fn, cell: Cell) -> Callable[..., Any]:
         )
 
     args = {arg.arg: arg for arg in func_body.args.args}
-    fixtures = [arg for arg in args.keys() if arg.endswith("_fixture")]
+    fixtures = [arg for arg in args if arg.endswith("_fixture")]
     reserved = set(args.keys()) - set(fixtures)
     # The remaining expected attributes are needed to ensure attribute count
     # matches.
@@ -147,12 +147,11 @@ def is_pytest_decorator(decorator: ast.AST) -> tuple[bool, str | None]:
         ):
             return True, None  # Nested attr, use eval
     # @pytest.fixture (no call)
-    if isinstance(decorator, ast.Attribute):
-        if (
-            isinstance(decorator.value, ast.Name)
-            and decorator.value.id == "pytest"
-        ):
-            return True, decorator.attr
+    if isinstance(decorator, ast.Attribute) and (
+        isinstance(decorator.value, ast.Name)
+        and decorator.value.id == "pytest"
+    ):
+        return True, decorator.attr
     return False, None
 
 
@@ -224,23 +223,43 @@ def _make_hook(
         | Awaitable[tuple[Any, Mapping[str, Any]]],
     ],
     use_wrapped: bool = False,
+    is_async: bool = False,
 ) -> Callable[..., Any]:
     """Single hook factory - handles both fixtures and tests."""
 
-    def _hook(*args: Any, **kwargs: Any) -> Any:
-        res = run()
-        if isinstance(res, Awaitable):
-            import asyncio
+    if is_async:
 
-            loop = asyncio.new_event_loop()
-            _, cell_defs = loop.run_until_complete(res)
-        else:
-            _, cell_defs = res
+        async def _async_hook(*args: Any, **kwargs: Any) -> Any:
+            res = run()
+            if isinstance(res, Awaitable):
+                _, cell_defs = await res
+            else:
+                _, cell_defs = res
 
-        target = cell_defs[var].__wrapped__ if use_wrapped else cell_defs[var]
-        return target(*args, **kwargs)
+            target = (
+                cell_defs[var].__wrapped__ if use_wrapped else cell_defs[var]
+            )
+            return await target(*args, **kwargs)
 
-    return _hook
+        return _async_hook
+    else:
+
+        def _hook(*args: Any, **kwargs: Any) -> Any:
+            res = run()
+            if isinstance(res, Awaitable):
+                import asyncio
+
+                loop = asyncio.new_event_loop()
+                _, cell_defs = loop.run_until_complete(res)
+            else:
+                _, cell_defs = res
+
+            target = (
+                cell_defs[var].__wrapped__ if use_wrapped else cell_defs[var]
+            )
+            return target(*args, **kwargs)
+
+        return _hook
 
 
 def _build_hook(
@@ -252,7 +271,8 @@ def _build_hook(
     is_fixture: bool = False,
 ) -> Callable[..., Any]:
     """Build hook for test or fixture function."""
-    hook = _make_hook(var, run, use_wrapped=is_fixture)
+    is_async = isinstance(test, ast.AsyncFunctionDef)
+    hook = _make_hook(var, run, use_wrapped=is_fixture, is_async=is_async)
 
     stub_fn = build_stub_fn(test, file)
     functools.wraps(stub_fn)(hook)
@@ -396,7 +416,7 @@ def build_test_class(
             "marimo-team/marimo/issues."
         )
 
-    attrs = {var: h for var in defs if (h := hook(var)) is not None}
+    attrs = {var: h for var in sorted(defs) if (h := hook(var)) is not None}
     return type(name, (MarimoTest,), attrs)
 
 

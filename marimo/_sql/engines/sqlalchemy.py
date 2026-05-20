@@ -1,8 +1,17 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import functools
 import os
-from typing import TYPE_CHECKING, Any, Literal, Optional, Union
+import re
+from contextlib import contextmanager
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    ParamSpec,
+    TypeVar,
+)
 
 from marimo import _loggers
 from marimo._data.models import (
@@ -24,47 +33,98 @@ from marimo._types.ids import VariableName
 
 LOGGER = _loggers.marimo_logger()
 
-_TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES = {
-    "supos_timeserial_long",
-    "supos_timeserial_double",
-    "supos_timeserial_string",
-    "supos_timeserial_integer",
-    "supos_timeserial_float",
-    "supos_timeserial_boolean",
-    "supos_timeserial_datetime",
-    "supos_timeserial_blob",
-    "pg_stat_statements_info",
-    "pg_stat_statements",
-}
-
-
-def _get_hidden_public_tables() -> set[str]:
-    hidden_tables = os.getenv("TIER0_HIDDEN_PUBLIC_TABLES")
-    if hidden_tables is None:
-        return _TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES
-
-    return {
-        item.strip()
-        for item in hidden_tables.split(",")
-        if item.strip()
-    }
-
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
     import pandas as pd
     import polars as pl
     from sqlalchemy import Engine, Inspector
     from sqlalchemy.engine.cursor import CursorResult
+    from sqlalchemy.engine.interfaces import ReflectedColumn, ReflectedIndex
     from sqlalchemy.sql.type_api import TypeEngine
+
+# Quote if the identifier contains anything other than letters, digits, underscores, or dollar signs.
+_SNOWFLAKE_NEEDS_QUOTING_RE = re.compile(r"[^A-Za-z0-9_$]")
+
+_TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES = frozenset(
+    {
+        "_timescaledb_catalog",
+        "_timescaledb_config",
+        "_timescaledb_internal",
+        "_timescaledb_cache",
+        "timescaledb_information",
+        "timescaledb_experimental",
+    }
+)
+
+
+def _get_hidden_public_tables() -> frozenset[str]:
+    configured = os.getenv("TIER0_HIDDEN_PUBLIC_TABLES")
+    if configured is None:
+        return _TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES
+    return frozenset(
+        name.strip() for name in configured.split(",") if name.strip()
+    )
+
+
+# ------------------------------------------------------------------ #
+#  Decorators                                                         #
+# ------------------------------------------------------------------ #
+
+
+T = TypeVar("T")
+P = ParamSpec("P")
+F = TypeVar("F")
+
+
+def safe_execute(
+    *,
+    fallback: F,
+    message: str = "Operation failed",
+    log_level: Literal["debug", "info", "warning", "error"] = "warning",
+    silent_exceptions: tuple[type[BaseException], ...] = (),
+) -> Callable[[Callable[P, T]], Callable[P, T | F]]:
+    """Catch exceptions, log them, and return a fallback value.
+
+    Args:
+        fallback: Value returned when the wrapped function raises.
+        message: Message written to the logger on failure.
+        log_level: Logger level – must be one of
+            ``'debug'``, ``'info'``, ``'warning'``, or ``'error'``.
+        silent_exceptions: Exception types that should return *fallback*
+            without any logging.  Useful for expected control-flow
+            exceptions like ``NotImplementedError``.
+    """
+
+    def decorator(func: Callable[P, T]) -> Callable[P, T | F]:
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> T | F:
+            try:
+                return func(*args, **kwargs)
+            except silent_exceptions:
+                return fallback
+            except Exception:
+                getattr(LOGGER, log_level)(message, exc_info=True)
+                return fallback
+
+        return wrapper
+
+    return decorator
+
+
+# ------------------------------------------------------------------ #
+#  SQLAlchemyEngine                                                   #
+# ------------------------------------------------------------------ #
 
 
 class SQLAlchemyEngine(SQLConnection["Engine"]):
     """SQLAlchemy engine."""
 
     def __init__(
-        self, connection: Engine, engine_name: Optional[VariableName] = None
+        self, connection: Engine, engine_name: VariableName | None = None
     ) -> None:
         super().__init__(connection, engine_name)
-        self.inspector: Optional[Inspector] = None
+        self.inspector: Inspector | None = None
 
         try:
             # May not exist in older versions of SQLAlchemy
@@ -77,6 +137,58 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
 
         self.default_database = self.get_default_database()
         self.default_schema = self.get_default_schema()
+
+    def _quote_identifier(self, identifier: str) -> str:
+        """Quote an identifier based on the SQL dialect's quoting rules."""
+        dialect_quoting: dict[str, tuple[re.Pattern[str], str, str]] = {
+            "snowflake": (_SNOWFLAKE_NEEDS_QUOTING_RE, '"', '"'),
+            "starrocks": (_SNOWFLAKE_NEEDS_QUOTING_RE, "`", "`"),
+        }
+
+        if self.dialect not in dialect_quoting:
+            return identifier
+
+        pattern, open_quote, close_quote = dialect_quoting[self.dialect]
+        if pattern.search(identifier) or identifier != identifier.lower():
+            escaped = identifier.replace(
+                close_quote, close_quote + close_quote
+            )
+            return f"{open_quote}{escaped}{close_quote}"
+        return identifier
+
+    @contextmanager
+    def _get_inspector(self, database: str) -> Iterator[Inspector | None]:
+        """Yield an appropriate SQLAlchemy Inspector for the given database.
+
+        For dialects that require a USE DATABASE command (e.g. Snowflake),
+        this opens a connection, executes the command, and yields an
+        inspector bound to that connection.
+
+        For all other dialects, it yields ``self.inspector`` (which may
+        be ``None``).
+
+        Usage::
+
+            with self._get_inspector(database) as inspector:
+                if inspector is None:
+                    return []
+                return inspector.get_schema_names()
+        """
+
+        from sqlalchemy import inspect, text
+
+        _use_database_dialect_command: dict[str, str] = {
+            "snowflake": f"USE DATABASE {self._quote_identifier(database)}",
+            "starrocks": f"SET CATALOG {self._quote_identifier(database)}",
+        }
+        dialect_command = _use_database_dialect_command.get(self.dialect)
+
+        if dialect_command is not None:
+            with self._connection.connect() as connection:
+                connection.execute(text(dialect_command))
+                yield inspect(connection)
+        else:
+            yield self.inspector
 
     @property
     def source(self) -> str:
@@ -134,12 +246,12 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
     @property
     def inference_config(self) -> InferenceConfig:
         return InferenceConfig(
-            auto_discover_schemas=True,
+            auto_discover_schemas="auto",
             auto_discover_tables="auto",
             auto_discover_columns=False,
         )
 
-    def get_default_database(self) -> Optional[str]:
+    def get_default_database(self) -> str | None:
         """Get the current database name.
 
         Returns:
@@ -160,11 +272,12 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
             LOGGER.warning("Connection URL is invalid", exc_info=True)
             return None
 
-        database_name: Optional[str] = None
+        database_name: str | None = None
         dialect_queries = {
             "postgresql": "SELECT current_database()",
             "mssql": "SELECT DB_NAME()",
             "timeplus": "SELECT current_database()",
+            "starrocks": "SELECT CATALOG()",
         }
 
         # Try to get the database name by querying the database directly
@@ -182,7 +295,7 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         # If database_name is None, the connection might be detached or invalid.
         # We check for existing schemas to verify the connection's validity.
         if database_name is None:
-            schemas_found = self._get_schemas(
+            schemas_found = self.get_schemas(
                 database=None,
                 include_tables=False,
                 include_table_details=False,
@@ -192,95 +305,191 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
 
         return database_name or ""
 
-    def get_default_schema(self) -> Optional[str]:
+    @safe_execute(
+        fallback=None,
+        message="Failed to get default schema name",
+        log_level="warning",
+    )
+    def get_default_schema(self) -> str | None:
         """Get the default schema name"""
         if self.inspector is None:
             return None
 
-        try:
-            default_schema_name = self.inspector.default_schema_name
-            # https://github.com/marimo-team/marimo/issues/6436.
-            # Upstream bug where default schema name is not a string.
-            if default_schema_name is None or not isinstance(
-                default_schema_name, str
-            ):
-                return None
-            return str(default_schema_name)
-        except Exception:
-            LOGGER.warning("Failed to get default schema name", exc_info=True)
+        default_schema_name = self.inspector.default_schema_name
+        # https://github.com/marimo-team/marimo/issues/6436.
+        # Upstream bug where default schema name is not a string.
+        if default_schema_name is None or not isinstance(
+            default_schema_name, str
+        ):
             return None
+        return str(default_schema_name)
+
+    # -------------------------------------------------------------- #
+    #  Databases resolution                                           #
+    # -------------------------------------------------------------- #
+
+    # Get database names for SNOWFLAKE
+    def _get_snowflake_database_names(self) -> list[str]:
+        """Get database names for Snowflake via 'SHOW DATABASES'.
+
+        If the default database exists in the results, return only that.
+        Otherwise, return all discovered databases.
+
+        Unquoted identifiers are normalized to lowercase for consistency.
+        Identifiers that need quoting are preserved as-is.
+        """
+        from sqlalchemy import text
+
+        with self._connection.connect() as connection:
+            result = connection.execute(text("SHOW DATABASES"))
+            columns = list(result.keys())
+
+            try:
+                name_col_index = columns.index("name")
+            except ValueError as err:
+                raise RuntimeError(
+                    "Unexpected SHOW DATABASES result: "
+                    f"'name' column not found in {columns}"
+                ) from err
+
+            database_names: list[str] = []
+            for row in result.fetchall():
+                raw_name = str(row[name_col_index])
+                if (
+                    _SNOWFLAKE_NEEDS_QUOTING_RE.search(raw_name)
+                    or raw_name != raw_name.upper()
+                ):
+                    database_names.append(raw_name)
+                else:
+                    database_names.append(raw_name.lower())
+
+        if self.default_database:
+            default_lower = self.default_database.lower()
+            for db in database_names:
+                if db.lower() == default_lower:
+                    return [db]
+
+        return database_names
+
+    def _get_starrocks_database_names(self) -> list[str]:
+        """Get catalog names for StarRocks via 'SHOW CATALOGS'.
+
+        StarRocks uses a three-level hierarchy (Catalog → Database → Table)
+        which maps to marimo's (Database → Schema → Table).
+        """
+        from sqlalchemy import text
+
+        with self._connection.connect() as connection:
+            result = connection.execute(text("SHOW CATALOGS"))
+            return [str(row[0]) for row in result.fetchall()]
+
+    @safe_execute(
+        fallback=[],
+        message="Failed to get database names",
+        log_level="warning",
+    )
+    def _get_database_names(self) -> list[str]:
+        """Get database names using dialect-specific queries.
+
+        Returns a single-element list with the default database when
+        the dialect has no dedicated discovery mechanism.
+        """
+        dialect = self.dialect.lower()
+        if dialect == "snowflake":
+            return self._get_snowflake_database_names()
+        if dialect == "starrocks":
+            return self._get_starrocks_database_names()
+
+        return [self.default_database] if self.default_database else []
 
     def get_databases(
         self,
         *,
-        include_schemas: Union[bool, Literal["auto"]],
-        include_tables: Union[bool, Literal["auto"]],
-        include_table_details: Union[bool, Literal["auto"]],
+        include_schemas: bool | Literal["auto"],
+        include_tables: bool | Literal["auto"],
+        include_table_details: bool | Literal["auto"],
     ) -> list[Database]:
         """Get all databases from the engine.
 
         Args:
-            include_schemas: Whether to include schema information. If False, databases will have empty schemas.
-            include_tables: Whether to include table information within schemas. If False, schemas will have empty tables.
-            include_table_details: Whether to include each table's detailed information. If False, tables will have empty columns, PK, indexes.
+            include_schemas: Include schema information per database.
+            include_tables: Include table information within each schema.
+            include_table_details: Include columns, PKs, and indexes
+                for each table.
 
         Returns:
             List of Database objects representing the database structure.
 
-        Note: This operation can be performance intensive when fetching full metadata.
+        Note:
+            This operation can be performance-intensive when fetching
+            full metadata.
         """
+        should_include_schemas = self._resolve_should_auto_discover(
+            include_schemas
+        )
+        should_include_tables = self._resolve_should_auto_discover(
+            include_tables
+        )
+        should_include_details = self._resolve_should_auto_discover(
+            include_table_details
+        )
+
         databases: list[Database] = []
 
-        if self.default_database is None:
-            return databases
-        database_name = self.default_database
+        for database_name in self._get_database_names():
+            schemas = (
+                self.get_schemas(
+                    database=database_name,
+                    include_tables=should_include_tables,
+                    include_table_details=should_include_details,
+                )
+                if should_include_schemas
+                else []
+            )
+            databases.append(
+                Database(
+                    name=database_name,
+                    dialect=self.dialect,
+                    schemas=schemas,
+                    engine=self._engine_name,
+                )
+            )
 
-        schemas = (
-            self._get_schemas(
-                database=database_name,
-                include_tables=self._resolve_should_auto_discover(
-                    include_tables
-                ),
-                include_table_details=self._resolve_should_auto_discover(
-                    include_table_details
-                ),
-            )
-            if self._resolve_should_auto_discover(include_schemas)
-            else []
-        )
-        databases.append(
-            Database(
-                name=database_name,
-                dialect=self.dialect,
-                schemas=schemas,
-                engine=self._engine_name,
-            )
-        )
         return databases
 
-    def _get_schemas(
+    # -------------------------------------------------------------- #
+    #  Schemas resolution                                            #
+    # -------------------------------------------------------------- #
+
+    @safe_execute(
+        fallback=[], message="Failed to get schema names", log_level="warning"
+    )
+    def _get_schema_names(self, database: str) -> list[str]:
+
+        with self._get_inspector(database) as inspector:
+            if inspector is None:
+                return []
+            return inspector.get_schema_names()
+
+    def get_schemas(
         self,
         *,
-        database: Optional[str],
+        database: str | None,
         include_tables: bool,
         include_table_details: bool,
     ) -> list[Schema]:
         """Get all schemas and optionally their tables. Keys are schema names."""
 
-        if self.inspector is None:
-            return []
-        try:
-            schema_names = self.inspector.get_schema_names()
-        except Exception:
-            LOGGER.warning("Failed to get schema names", exc_info=True)
-            return []
+        if database is None:
+            schema_names: list[str] = []
+        else:
+            schema_names = self._get_schema_names(database)
 
-        # Tier0 定制逻辑：基于多租户数据隔离安全需求，读取 TIER0_VISIBLE_SCHEMA 环境变量（由控制器下发）
-        # 执行 Schema 级别的强过滤。确保当前实例只能在左侧数据源面板中看到并操作被授权的 Schema，
-        # 从而防止越权浏览其他租户的表结构。
         visible_schema = os.getenv("TIER0_VISIBLE_SCHEMA")
         if visible_schema:
-            schema_names = [s for s in schema_names if s == visible_schema]
+            schema_names = [
+                schema for schema in schema_names if schema == visible_schema
+            ]
 
         schemas: list[Schema] = []
 
@@ -301,37 +510,52 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         dialect = self.dialect.lower()
         if dialect == "postgresql":
             return ["information_schema", "pg_catalog"]
+        if dialect == "starrocks":
+            return ["information_schema", "sys", "_statistics_"]
         return ["information_schema"]
+
+    # -------------------------------------------------------------- #
+    #  Tables resolution                                             #
+    # -------------------------------------------------------------- #
+
+    @safe_execute(
+        fallback=([], []),
+        message="Failed to get tables in schema",
+        log_level="warning",
+    )
+    def _get_table_names(
+        self, schema: str, database: str
+    ) -> tuple[list[str], list[str]]:
+
+        with self._get_inspector(database) as inspector:
+            if inspector is None:
+                return [], []
+            return inspector.get_table_names(
+                schema=schema
+            ), inspector.get_view_names(schema=schema)
 
     def get_tables_in_schema(
         self, *, schema: str, database: str, include_table_details: bool
     ) -> list[DataTable]:
         """Return all tables in a schema."""
-        _ = database
 
-        if self.inspector is None:
-            return []
-        try:
-            table_names = self.inspector.get_table_names(schema=schema)
-            view_names = self.inspector.get_view_names(schema=schema)
-        except Exception:
-            LOGGER.warning("Failed to get tables in schema", exc_info=True)
-            return []
-
-        if schema.lower() == "public":
-            hidden_public_tables = _get_hidden_public_tables()
-            table_names = [
-                name for name in table_names if name not in hidden_public_tables
-            ]
-            view_names = [
-                name for name in view_names if name not in hidden_public_tables
-            ]
+        table_names, view_names = self._get_table_names(
+            schema=schema, database=database
+        )
 
         tables: list[tuple[DataTableType, str]] = []
         for name in table_names:
             tables.append(("table", name))
         for name in view_names:
             tables.append(("view", name))
+
+        hidden_public_tables = _get_hidden_public_tables()
+        if schema == "public" and hidden_public_tables:
+            tables = [
+                (table_type, name)
+                for table_type, name in tables
+                if name not in hidden_public_tables
+            ]
 
         if not include_table_details:
             return [
@@ -362,47 +586,77 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
 
         return data_tables
 
+    # -------------------------------------------------------------- #
+    #  Table Details resolution                                      #
+    # -------------------------------------------------------------- #
+
+    @safe_execute(
+        fallback=None,
+        message="Failed to get table details",
+        log_level="warning",
+    )
+    def _get_columns(
+        self, table_name: str, schema: str, database: str
+    ) -> list[ReflectedColumn] | None:
+
+        with self._get_inspector(database) as inspector:
+            if inspector is None:
+                return None
+            return inspector.get_columns(table_name, schema=schema)
+
+    @safe_execute(fallback=[], message="Failed to get primary keys")
+    def _fetch_primary_keys(
+        self, table_name: str, schema: str, database: str
+    ) -> list[str]:
+
+        with self._get_inspector(database) as inspector:
+            if inspector is None:
+                return []
+            return inspector.get_pk_constraint(table_name, schema=schema).get(
+                "constrained_columns", []
+            )
+
+    @safe_execute(fallback=[], message="Failed to get indexes")
+    def _fetch_indexes(
+        self, table_name: str, schema: str, database: str
+    ) -> list[str]:
+
+        with self._get_inspector(database) as inspector:
+            if inspector is None:
+                return []
+            indexes = inspector.get_indexes(table_name, schema=schema)
+            return self._extract_index_columns(indexes)
+
+    @staticmethod
+    def _extract_index_columns(indexes: list[ReflectedIndex]) -> list[str]:
+        """Extract and deduplicate column names from a list of index definitions."""
+        index_columns: list[str] = []
+        seen: set[str] = set()
+        for index in indexes:
+            if index_cols := index.get("column_names"):
+                for col in index_cols:
+                    if col is not None and col not in seen:
+                        seen.add(col)
+                        index_columns.append(col)
+        return index_columns
+
     def get_table_details(
         self, *, table_name: str, schema_name: str, database_name: str
-    ) -> Optional[DataTable]:
+    ) -> DataTable | None:
         """Get a single table from the engine."""
-        _ = database_name
 
-        if self.inspector is None:
-            return None
-        try:
-            columns = self.inspector.get_columns(
-                table_name, schema=schema_name
-            )
-        except Exception:
-            LOGGER.warning(
-                f"Failed to get table {table_name} in schema {schema_name}",
-                exc_info=True,
-            )
+        columns = self._get_columns(
+            table_name, schema=schema_name, database=database_name
+        )
+        if columns is None:
             return None
 
-        primary_keys: list[str] = []
-        index_list: list[str] = []
-
-        try:
-            primary_keys = self.inspector.get_pk_constraint(
-                table_name, schema=schema_name
-            )["constrained_columns"]
-        except Exception:
-            pass
-
-        # TODO: Handle multi column PK and indexes
-        try:
-            indexes = self.inspector.get_indexes(
-                table_name, schema=schema_name
-            )
-            for index in indexes:
-                if index_cols := index["column_names"]:
-                    index_list.extend(
-                        col for col in index_cols if col is not None
-                    )
-        except Exception:
-            LOGGER.warning("Failed to get indexes", exc_info=True)
+        primary_keys = self._fetch_primary_keys(
+            table_name, schema_name, database_name
+        )
+        index_list = self._fetch_indexes(
+            table_name, schema_name, database_name
+        )
 
         cols: list[DataTableColumn] = []
         for col in columns:
@@ -435,33 +689,33 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
             indexes=index_list,
         )
 
+    @safe_execute(
+        fallback=None,
+        message="Failed to get column type",
+        log_level="warning",
+        silent_exceptions=(NotImplementedError,),
+    )
     def _get_python_type(
         self, engine_type: TypeEngine[Any]
     ) -> DataType | None:
-        try:
-            col_type = engine_type.python_type
-            return sql_type_to_data_type(str(col_type))
-        except NotImplementedError:
-            return None
-        except Exception:
-            LOGGER.debug("Failed to get python type", exc_info=True)
-            return None
+        col_type = engine_type.python_type
+        return sql_type_to_data_type(str(col_type))
 
+    @safe_execute(
+        fallback=None,
+        message="Failed to get generic type",
+        log_level="debug",
+        silent_exceptions=(NotImplementedError,),
+    )
     def _get_generic_type(
         self, engine_type: TypeEngine[Any]
     ) -> DataType | None:
-        try:
-            col_type = engine_type.as_generic()
-            return sql_type_to_data_type(str(col_type))
-        except NotImplementedError:
-            return None
-        except Exception:
-            LOGGER.debug("Failed to get generic type", exc_info=True)
-            return None
+        col_type = engine_type.as_generic()
+        return sql_type_to_data_type(str(col_type))
 
     def _resolve_should_auto_discover(
         self,
-        value: Union[bool, Literal["auto"]],
+        value: bool | Literal["auto"],
     ) -> bool:
         if value == "auto":
             return self._is_cheap_discovery()

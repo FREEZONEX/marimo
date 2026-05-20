@@ -2,12 +2,12 @@
 
 import { CommandList } from "cmdk";
 import { atom, useAtomValue, useSetAtom } from "jotai";
-import { sortBy } from "lodash-es";
-import { PlusIcon, PlusSquareIcon, RefreshCwIcon, XIcon } from "lucide-react";
+import { PlusIcon, PlusSquareIcon, XIcon } from "lucide-react";
 import React from "react";
 import { dbDisplayName } from "@/components/databases/display";
 import { EngineVariable } from "@/components/databases/engine-variable";
 import { DatabaseLogo } from "@/components/databases/icon";
+import { RefreshIconButton } from "@/components/editor/file-tree/tree-actions";
 import { CopyClipboardIcon } from "@/components/icons/copy-icon";
 import { Button } from "@/components/ui/button";
 import { Command, CommandInput, CommandItem } from "@/components/ui/command";
@@ -27,6 +27,7 @@ import {
   INTERNAL_SQL_ENGINES,
 } from "@/core/datasets/engines";
 import {
+  PreviewSQLSchemaList,
   PreviewSQLTable,
   PreviewSQLTableList,
 } from "@/core/datasets/request-registry";
@@ -47,6 +48,7 @@ import { useRequestClient } from "@/core/network/requests";
 import { variablesAtom } from "@/core/variables/state";
 import type { VariableName } from "@/core/variables/types";
 import { useAsyncData } from "@/hooks/useAsyncData";
+import { sortBy } from "@/utils/arrays";
 import { logNever } from "@/utils/assertNever";
 import { cn } from "@/utils/cn";
 import { Events } from "@/utils/events";
@@ -60,7 +62,7 @@ import { ErrorBoundary } from "../editor/boundary/ErrorBoundary";
 import { PythonIcon } from "../editor/cell/code/icons";
 import { useAddCodeToNewCell } from "../editor/cell/useAddCell";
 import { PanelEmptyState } from "../editor/chrome/panels/empty-state";
-import { AddDatabaseDialog } from "../editor/database/add-database-form";
+import { AddConnectionDialog } from "../editor/connections/add-connection-dialog";
 import { DatasetColumnPreview } from "./column-preview";
 import {
   ColumnName,
@@ -79,6 +81,7 @@ const INDENT = {
   database: "pl-4",
   schemaEmpty: "pl-8",
   schema: "pl-7",
+  schemaLoading: "pl-8",
   tableLoading: "pl-11",
   tableSchemaless: "pl-8",
   tableWithSchema: "pl-12",
@@ -160,12 +163,12 @@ export const DataSources: React.FC = () => {
         title="No tables found"
         description="Any datasets/dataframes in the global scope will be shown here."
         action={
-          <AddDatabaseDialog>
+          <AddConnectionDialog>
             <Button variant="outline" size="sm">
               Add database or catalog
               <PlusIcon className="h-4 w-4 ml-2" />
             </Button>
-          </AddDatabaseDialog>
+          </AddConnectionDialog>
         }
         icon={<DatabaseIcon />}
       />
@@ -201,7 +204,7 @@ export const DataSources: React.FC = () => {
           </button>
         )}
 
-        <AddDatabaseDialog>
+        <AddConnectionDialog>
           <Button
             variant="ghost"
             size="sm"
@@ -209,7 +212,7 @@ export const DataSources: React.FC = () => {
           >
             <PlusIcon className="h-4 w-4" />
           </Button>
-        </AddDatabaseDialog>
+        </AddConnectionDialog>
       </div>
 
       <CommandList className="flex flex-col">
@@ -265,15 +268,10 @@ const Engine: React.FC<{
   const engineName = internalEngine ? "In-Memory" : connection.name;
   const { previewDataSourceConnection } = useRequestClient();
 
-  const [isSpinning, setIsSpinning] = React.useState(false);
-
   const handleRefreshConnection = async () => {
-    setIsSpinning(true);
     await previewDataSourceConnection({
       engine: connection.name,
     });
-    // Artificially spin the icon if the request is really fast
-    setTimeout(() => setIsSpinning(false), 500);
   };
 
   return (
@@ -288,21 +286,12 @@ const Engine: React.FC<{
           (<EngineVariable variableName={engineName as VariableName} />)
         </span>
         {!internalEngine && (
-          <Tooltip content="Refresh connection">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="ml-auto hover:bg-transparent hover:shadow-none"
-              onClick={handleRefreshConnection}
-            >
-              <RefreshCwIcon
-                className={cn(
-                  "h-4 w-4 text-muted-foreground hover:text-foreground",
-                  isSpinning && "animate-[spin_0.5s]",
-                )}
-              />
-            </Button>
-          </Tooltip>
+          <RefreshIconButton
+            onClick={handleRefreshConnection}
+            tooltip="Refresh connection"
+            className="ml-auto h-4 p-0"
+            iconClassName="h-3.5 w-3.5"
+          />
         )}
       </DatasourceLabel>
       {hasChildren ? (
@@ -382,6 +371,49 @@ const SchemaList: React.FC<{
   hasSearch,
   searchValue,
 }) => {
+  const { addSchemaList } = useDataSourceActions();
+  const [schemasRequested, setSchemasRequested] = React.useState(false);
+
+  // Custom loading state, we need to wait for the data to propagate once requested
+  // useAsyncData's loading state may return false before data has propagated
+  const [schemasLoading, setSchemasLoading] = React.useState(false);
+
+  const { isPending, error } = useAsyncData(async () => {
+    if (schemas.length === 0 && engineName && !schemasRequested) {
+      setSchemasRequested(true);
+      setSchemasLoading(true);
+      try {
+        const previewSchemaList = await PreviewSQLSchemaList.request({
+          engine: engineName,
+          database: databaseName,
+        });
+
+        addSchemaList({
+          schemas: previewSchemaList.schemas ?? [],
+          sqlSchemaContext: {
+            engine: engineName,
+            database: databaseName,
+          },
+        });
+      } finally {
+        setSchemasLoading(false);
+      }
+    }
+  }, [schemas.length, engineName, databaseName, schemasRequested]);
+
+  if (isPending || schemasLoading) {
+    return (
+      <LoadingState
+        message="Loading schemas..."
+        className={INDENT.schemaLoading}
+      />
+    );
+  }
+
+  if (error) {
+    return <ErrorState error={error} className={INDENT.schemaLoading} />;
+  }
+
   if (schemas.length === 0) {
     return (
       <EmptyState

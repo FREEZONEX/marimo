@@ -12,9 +12,9 @@ from marimo._ipc.types import ConnectionInfo
 if typing.TYPE_CHECKING:
     from marimo._messaging.types import KernelMessage
     from marimo._runtime.commands import (
+        BatchableCommand,
         CodeCompletionCommand,
         CommandMessage,
-        UpdateUIElementCommand,
     )
     from marimo._session.queue import QueueType
 
@@ -43,8 +43,8 @@ class QueueManager:
         return self.conn.control.queue
 
     @property
-    def set_ui_element_queue(self) -> QueueType[UpdateUIElementCommand]:
-        """Queue for UI element value updates."""
+    def set_ui_element_queue(self) -> QueueType[BatchableCommand]:
+        """Queue for batchable commands (UI element updates and model commands)."""
         return self.conn.ui_element.queue
 
     @property
@@ -53,7 +53,7 @@ class QueueManager:
         return self.conn.completion.queue
 
     @property
-    def win32_interrupt_queue(self) -> typing.Union[QueueType[bool], None]:
+    def win32_interrupt_queue(self) -> QueueType[bool] | None:
         """Queue for Windows interrupt signals (None on non-Windows)."""
         return (
             self.conn.win32_interrupt.queue

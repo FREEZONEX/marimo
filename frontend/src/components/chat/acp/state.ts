@@ -2,16 +2,21 @@
 
 import { atom } from "jotai";
 import { atomWithStorage } from "jotai/utils";
-import { capitalize } from "lodash-es";
 import { isPlatformWindows } from "@/core/hotkeys/shortcuts";
 import { jotaiJsonStorage } from "@/utils/storage/jotai";
+import { capitalize } from "@/utils/strings";
 import type { TypedString } from "@/utils/typed";
 import { generateUUID } from "@/utils/uuid";
 import type { ExternalAgentSessionId, SessionSupportType } from "./types";
 
 // Types
 export type TabId = TypedString<"TabId">;
-export type ExternalAgentId = "claude" | "gemini" | "codex" | "opencode";
+export type ExternalAgentId =
+  | "claude"
+  | "gemini"
+  | "codex"
+  | "opencode"
+  | "cursor";
 
 // No agents support loading sessions, so we limit to 1, otherwise
 // this is confusing to the user when switching between sessions
@@ -221,11 +226,11 @@ export function getSessionsByAgent(
 ): AgentSession[] {
   return sessions
     .filter((session) => session.agentId === agentId)
-    .sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+    .toSorted((a, b) => b.lastUsedAt - a.lastUsedAt);
 }
 
 export function getAllAgentIds(): ExternalAgentId[] {
-  return ["claude", "gemini", "codex", "opencode"];
+  return ["claude", "gemini", "codex", "opencode", "cursor"];
 }
 
 export function getAgentDisplayName(agentId: ExternalAgentId): string {
@@ -233,39 +238,46 @@ export function getAgentDisplayName(agentId: ExternalAgentId): string {
 }
 
 export function getAgentWebSocketUrl(agentId: ExternalAgentId): string {
-  return AGENT_CONFIG[agentId].webSocketUrl;
+  const port = AGENT_CONFIG[agentId].port;
+  // Use the current page's hostname so the agent is reachable when
+  // marimo is accessed remotely (e.g. via direct IP or reverse proxy).
+  const hostname = window.location.hostname;
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${hostname}:${port}/message` as const;
 }
 
 interface AgentConfig {
   port: number;
   command: string;
-  webSocketUrl: string;
   sessionSupport: SessionSupportType;
+  /** One-time setup command the user must run before starting the agent. */
+  loginHint?: string;
 }
 
 const AGENT_CONFIG: Record<ExternalAgentId, AgentConfig> = {
   claude: {
     port: 3017,
     command: "npx @zed-industries/claude-code-acp",
-    webSocketUrl: "ws://localhost:3017/message",
     sessionSupport: "single",
   },
   gemini: {
     port: 3019,
     command: "npx @google/gemini-cli --experimental-acp",
-    webSocketUrl: "ws://localhost:3019/message",
     sessionSupport: "single",
   },
   codex: {
     port: 3021,
     command: "npx @zed-industries/codex-acp",
-    webSocketUrl: "ws://localhost:3021/message",
     sessionSupport: "single",
   },
   opencode: {
     port: 3023,
     command: "npx opencode-ai acp",
-    webSocketUrl: "ws://localhost:3023/message",
+    sessionSupport: "single",
+  },
+  cursor: {
+    port: 3025,
+    command: "agent acp",
     sessionSupport: "single",
   },
 };

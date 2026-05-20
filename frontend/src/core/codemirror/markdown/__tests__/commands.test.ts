@@ -9,6 +9,7 @@ import {
   test,
   vi,
 } from "vitest";
+import { MockModules } from "@/__mocks__/common";
 import { MockRequestClient } from "@/__mocks__/requests";
 import { requestClientAtom } from "@/core/network/requests";
 import { filenameAtom } from "@/core/saving/file-state";
@@ -25,9 +26,7 @@ import {
   insertUL,
 } from "../commands";
 
-vi.mock("@/components/ui/use-toast", () => ({
-  toast: vi.fn(),
-}));
+vi.mock("@/components/ui/use-toast", () => MockModules.toast());
 
 import { toast } from "@/components/ui/use-toast";
 
@@ -247,7 +246,7 @@ describe("insertImage", () => {
       path: "public",
       type: "file",
       name: "hello.png",
-      contents: "AQID",
+      file: expect.any(File),
     });
 
     expect(view.state.doc.toString()).toMatchInlineSnapshot(
@@ -292,7 +291,7 @@ describe("insertImage", () => {
       path: "nested/public", // store in public folder of notebook directory
       type: "file",
       name: "hello.png",
-      contents: "AQID",
+      file: expect.any(File),
     });
 
     expect(view.state.doc.toString()).toMatchInlineSnapshot(
@@ -338,7 +337,7 @@ describe("insertImage", () => {
       path: "/Users/user/Development/project/public",
       type: "file",
       name: "hello.png",
-      contents: "AQID",
+      file: expect.any(File),
     });
 
     // Should convert absolute path to relative path
@@ -383,6 +382,42 @@ describe("insertImage", () => {
     // Should convert absolute path to relative path
     expect(view.state.doc.toString()).toMatchInlineSnapshot(
       `"Hello, ![alt](public/image.png)world!"`,
+    );
+  });
+
+  test("normalizes Windows backslash paths to forward slashes in image URL", async () => {
+    view = createEditor("Hello, world!");
+    view.dispatch({
+      selection: { anchor: 7, head: 7 },
+    });
+
+    vi.spyOn(store, "get").mockImplementation((atom) => {
+      if (atom === filenameAtom) {
+        return "C:\\Users\\user\\project\\notebook.py";
+      }
+      if (atom === requestClientAtom) {
+        return mockRequestClient;
+      }
+    });
+
+    mockRequestClient.sendCreateFileOrFolder.mockResolvedValueOnce({
+      success: true,
+      message: null,
+      info: {
+        path: "C:\\Users\\user\\project\\public\\hello.png",
+        name: "hello.png",
+        children: [],
+        id: "",
+        isDirectory: false,
+        isMarimoFile: false,
+        lastModified: null,
+      },
+    });
+
+    await insertImage(view, mockPngFile());
+
+    expect(view.state.doc.toString()).toMatchInlineSnapshot(
+      `"Hello, ![alt](public/hello.png)world!"`,
     );
   });
 

@@ -23,19 +23,19 @@ class PixiPackageManager(CondaPackageManager):
     name = "pixi"
 
     def install_command(
-        self, package: str, *, upgrade: bool, dev: bool
+        self, package: str, *, upgrade: bool, group: str | None = None
     ) -> list[str]:
-        # The `dev` parameter is accepted for interface compatibility, but is ignored.
-        del dev
+        # The `group` parameter is accepted for interface compatibility, but is ignored.
+        del group
         return [
             "pixi",
             "upgrade" if upgrade else "add",
             *split_packages(package),
         ]
 
-    async def uninstall(self, package: str, dev: bool = False) -> bool:
-        # The `dev` parameter is accepted for interface compatibility, but is ignored.
-        del dev
+    async def uninstall(self, package: str, group: str | None = None) -> bool:
+        # The `group` parameter is accepted for interface compatibility, but is ignored.
+        del group
         return await self.run(
             ["pixi", "remove", *split_packages(package)], log_callback=None
         )

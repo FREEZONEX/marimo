@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Optional
 
 from marimo import _loggers
 from marimo._server.files.os_file_system import natural_sort_file
@@ -35,6 +34,10 @@ def is_marimo_app(full_path: str) -> bool:
 
     try:
         path = MarimoPath(full_path)
+
+        # Fast extension check to avoid I/O for unrelated files
+        if not path.is_python() and not path.is_markdown():
+            return False
 
         with open(full_path, "rb") as f:
             header = f.read(READ_LIMIT)
@@ -86,11 +89,16 @@ class DirectoryScanner:
         # Package management
         "node_modules",
         "site-packages",
+        # Portable Python distributions
+        "winpython",
+        # Conda / pixi environments
+        ".pixi",
         # Testing and tooling
         ".tox",
         ".nox",
         ".pytest_cache",
         ".mypy_cache",
+        ".ruff_cache",
         # Version control
         ".git",
     }
@@ -99,9 +107,9 @@ class DirectoryScanner:
         self,
         directory: str,
         include_markdown: bool = False,
-        max_files: Optional[int] = None,
-        max_depth: Optional[int] = None,
-        max_execution_time: Optional[int] = None,
+        max_files: int | None = None,
+        max_depth: int | None = None,
+        max_execution_time: int | None = None,
     ):
         """Initialize DirectoryScanner.
 
@@ -145,9 +153,7 @@ class DirectoryScanner:
         file_count = [0]  # Use list for closure mutability
         self.partial_results = []  # Reset partial results
 
-        def recurse(
-            directory: str, depth: int = 0
-        ) -> Optional[list[FileInfo]]:
+        def recurse(directory: str, depth: int = 0) -> list[FileInfo] | None:
             if depth > self.max_depth:
                 return None
 
@@ -162,7 +168,7 @@ class DirectoryScanner:
                 # Store accumulated results before raising timeout
                 raise HTTPException(
                     status_code=HTTPStatus.REQUEST_TIMEOUT,
-                    detail=f"Request timed out: Loading workspace files took too long. Showing first {file_count[0]} files.",  # noqa: E501
+                    detail=f"Request timed out: Loading workspace files took too long. Showing first {file_count[0]} files.",
                 )
 
             try:
@@ -179,46 +185,60 @@ class DirectoryScanner:
                 if entry.name.startswith("."):
                     continue
 
-                if entry.is_dir():
-                    if entry.name in self.SKIP_DIRS or depth == self.max_depth:
+                try:
+                    # Skip symlinks to avoid cycles and broken links
+                    if entry.is_symlink():
                         continue
-                    children = recurse(entry.path, depth + 1)
-                    if children:
-                        entry_path = Path(entry.path)
-                        relative_path = str(
-                            entry_path.relative_to(self.directory)
-                        )
-                        folders.append(
-                            FileInfo(
+
+                    if entry.is_dir():
+                        if (
+                            entry.name in self.SKIP_DIRS
+                            or entry.name.lower() in self.SKIP_DIRS
+                            or depth == self.max_depth
+                        ):
+                            continue
+                        children = recurse(entry.path, depth + 1)
+                        if children:
+                            entry_path = Path(entry.path)
+                            relative_path = str(
+                                entry_path.relative_to(self.directory)
+                            )
+                            folders.append(
+                                FileInfo(
+                                    id=relative_path,
+                                    path=relative_path,
+                                    name=entry.name,
+                                    is_directory=True,
+                                    is_marimo_file=False,
+                                    children=children,
+                                )
+                            )
+                    elif entry.name.endswith(self.allowed_extensions):
+                        if is_marimo_app(entry.path):
+                            file_count[0] += 1
+                            entry_path = Path(entry.path)
+                            relative_path = str(
+                                entry_path.relative_to(self.directory)
+                            )
+                            file_info = FileInfo(
                                 id=relative_path,
                                 path=relative_path,
                                 name=entry.name,
-                                is_directory=True,
-                                is_marimo_file=False,
-                                children=children,
+                                is_directory=False,
+                                is_marimo_file=True,
+                                last_modified=entry.stat().st_mtime,
                             )
-                        )
-                elif entry.name.endswith(self.allowed_extensions):
-                    if is_marimo_app(entry.path):
-                        file_count[0] += 1
-                        entry_path = Path(entry.path)
-                        relative_path = str(
-                            entry_path.relative_to(self.directory)
-                        )
-                        file_info = FileInfo(
-                            id=relative_path,
-                            path=relative_path,
-                            name=entry.name,
-                            is_directory=False,
-                            is_marimo_file=True,
-                            last_modified=entry.stat().st_mtime,
-                        )
-                        files.append(file_info)
-                        # Also add to partial results for timeout recovery
-                        self.partial_results.append(file_info)
-                        # Check if we've reached the limit
-                        if file_count[0] >= self.max_files:
-                            break
+                            files.append(file_info)
+                            # Also add to partial results for timeout recovery
+                            self.partial_results.append(file_info)
+                            # Check if we've reached the limit
+                            if file_count[0] >= self.max_files:
+                                break
+                except OSError as e:
+                    LOGGER.debug(
+                        "Error processing entry %s: %s", entry.path, e
+                    )
+                    continue
 
             # Sort folders then files, based on natural sort (alpha, then num)
             return sorted(folders, key=natural_sort_file) + sorted(

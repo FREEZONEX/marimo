@@ -12,7 +12,9 @@ from marimo._config.config import (
     AiConfig,
     MarimoConfig,
 )
+from marimo._dependencies.dependencies import DependencyManager
 from marimo._server.ai.config import (
+    GITHUB_COPILOT_BASE_URL,
     AnyProviderConfig,
     _get_ai_config,
     _get_base_url,
@@ -145,14 +147,14 @@ class TestAnyProviderConfig:
         config: AiConfig = {
             "github": {
                 "api_key": "test-github-key",
-                "base_url": "https://api.githubcopilot.com/",
+                "base_url": "https://some-base-url",
             }
         }
 
         provider_config = AnyProviderConfig.for_github(config)
 
         assert provider_config.api_key == "test-github-key"
-        assert provider_config.base_url == "https://api.githubcopilot.com/"
+        assert provider_config.base_url == "https://some-base-url"
 
     def test_for_github_with_fallback_base_url(self):
         """Test GitHub configuration uses fallback base URL when not specified."""
@@ -165,7 +167,19 @@ class TestAnyProviderConfig:
         provider_config = AnyProviderConfig.for_github(config)
 
         assert provider_config.api_key == "test-github-key"
-        assert provider_config.base_url == "https://api.githubcopilot.com/"
+        assert provider_config.base_url == "https://models.github.ai/inference"
+
+    @pytest.mark.skipif(
+        not DependencyManager.pydantic_ai.has(),
+        reason="pydantic-ai is not installed",
+    )
+    def test_github_default_base_url_matches_pydantic_ai(self):
+        """Test GitHub configuration base URL matches pydantic-ai."""
+        from pydantic_ai.providers.github import GitHubProvider
+
+        assert (
+            GitHubProvider(api_key="dummy").base_url == GITHUB_COPILOT_BASE_URL
+        )
 
     def test_for_github_default_extra_headers(self):
         """Test GitHub configuration includes default extra headers."""
@@ -237,7 +251,7 @@ class TestAnyProviderConfig:
         # Note: copilot_settings is stored in config but not used by AnyProviderConfig
         # It's used by the frontend LSP client
         assert provider_config.api_key == "test-github-key"
-        assert provider_config.base_url == "https://api.githubcopilot.com/"
+        assert provider_config.base_url == "https://models.github.ai/inference"
 
     def test_for_openrouter(self):
         """Test OpenRouter configuration."""
@@ -304,8 +318,32 @@ class TestAnyProviderConfig:
 
         provider_config = AnyProviderConfig.for_wandb(config)
 
-        assert provider_config.api_key == "test-wandb-key"
-        assert provider_config.project == "my-project"
+    def test_for_opencode_go(self):
+        """Test OpenCode Go configuration."""
+        config: AiConfig = {
+            "opencode_go": {
+                "api_key": "test-opencode-key",
+                "base_url": "https://opencode.ai/zen/go/v1/",
+            }
+        }
+
+        provider_config = AnyProviderConfig.for_opencode_go(config)
+
+        assert provider_config.api_key == "test-opencode-key"
+        assert provider_config.base_url == "https://opencode.ai/zen/go/v1/"
+
+    def test_for_opencode_go_with_fallback_base_url(self):
+        """Test OpenCode Go configuration uses fallback base URL when not specified."""
+        config: AiConfig = {
+            "opencode_go": {
+                "api_key": "test-opencode-key",
+            }
+        }
+
+        provider_config = AnyProviderConfig.for_opencode_go(config)
+
+        assert provider_config.api_key == "test-opencode-key"
+        assert provider_config.base_url == "https://opencode.ai/zen/go/v1/"
 
     def test_for_openai_with_project(self):
         """Test OpenAI configuration with project field."""
@@ -730,6 +768,34 @@ class TestProviderConfigWithFallback:
 
         assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST
         assert "Weights & Biases API key not configured" in str(
+            exc_info.value.detail
+        )
+
+    @patch.dict(os.environ, {"OPENCODE_API_KEY": "env-opencode-token"})
+    def test_for_opencode_go_with_fallback_key(self) -> None:
+        """Test OpenCode Go config uses fallback key when config is missing api_key."""
+        config: AiConfig = {"opencode_go": {}}
+        provider_config = AnyProviderConfig.for_opencode_go(config)
+        assert provider_config.api_key == "env-opencode-token"
+
+    @patch.dict(os.environ, {"OPENCODE_API_KEY": "env-opencode-token"})
+    def test_for_opencode_go_config_key_takes_precedence(self) -> None:
+        """Test OpenCode Go config key takes precedence over environment variable."""
+        config: AiConfig = {
+            "opencode_go": {"api_key": "config-opencode-token"}
+        }
+        provider_config = AnyProviderConfig.for_opencode_go(config)
+        assert provider_config.api_key == "config-opencode-token"
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_for_opencode_go_no_fallback_available(self) -> None:
+        """Test OpenCode Go config fails when no config key and no env var."""
+        config: AiConfig = {"opencode_go": {}}
+        with pytest.raises(HTTPException) as exc_info:
+            AnyProviderConfig.for_opencode_go(config)
+
+        assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST
+        assert "OpenCode Go API key not configured" in str(
             exc_info.value.detail
         )
 

@@ -1,5 +1,5 @@
 /* Copyright 2026 Marimo. All rights reserved. */
-/* eslint-disable @typescript-eslint/no-base-to-string */
+/* oxlint-disable typescript/no-base-to-string */
 import * as cql from "compassql/build/src";
 import { createStore, Provider, useAtomValue } from "jotai";
 import { ListFilterIcon } from "lucide-react";
@@ -13,9 +13,11 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useAsyncData } from "@/hooks/useAsyncData";
 import { useOnMount } from "@/hooks/useLifecycle";
 import { type ResolvedTheme, useTheme } from "@/theme/useTheme";
+import { cn } from "@/utils/cn";
 import { Objects } from "@/utils/objects";
 import { ErrorBanner } from "../common/error-banner";
 import { vegaLoadData } from "../vega/loader";
+import { getContainerWidth } from "../vega/utils";
 import { ColumnSummary } from "./components/column-summary";
 import { QueryForm } from "./components/query-form";
 import type { SpecificEncoding } from "./encoding";
@@ -141,8 +143,16 @@ export const DataExplorerComponent = ({
     const augmentedSpec = augmentSpecWithData(responsiveSpec, chartData);
 
     return (
-      <div className="flex overflow-y-auto justify-center items-center flex-1 w-[90%]">
-        <VegaEmbed spec={augmentedSpec} options={chartOptions(theme)} />
+      <div
+        className={cn(
+          "flex overflow-y-auto justify-center items-center flex-1 w-[90%]",
+        )}
+      >
+        <VegaEmbed
+          data-container-width={getContainerWidth(augmentedSpec)}
+          spec={augmentedSpec}
+          options={chartOptions(theme)}
+        />
       </div>
     );
   };
@@ -258,7 +268,7 @@ const HorizontalCarouselItem = ({
   );
 };
 // Make the plot responsive
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+// oxlint-disable-next-line typescript/no-explicit-any
 function makeResponsive(spec: any) {
   // NOTE: for row/column, this applies to the inner plot
   // so we tend to overflow due to the legends,

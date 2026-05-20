@@ -22,9 +22,15 @@ import React, { memo } from "react";
 import { useLocale } from "react-aria";
 
 import { Table } from "@/components/ui/table";
-import type { GetRowIds } from "@/plugins/impl/DataTablePlugin";
+import type {
+  CalculateTopKRows,
+  GetRowIds,
+} from "@/plugins/impl/DataTablePlugin";
 import { cn } from "@/utils/cn";
-import type { PanelType } from "../editor/chrome/panels/context-aware-panel/context-aware-panel";
+import {
+  PANEL_TYPES,
+  type PanelType,
+} from "../editor/chrome/panels/context-aware-panel/context-aware-panel";
 import { CellHoverTemplateFeature } from "./cell-hover-template/feature";
 import { CellHoverTextFeature } from "./cell-hover-text/feature";
 import { CellSelectionFeature } from "./cell-selection/feature";
@@ -34,29 +40,39 @@ import type { CellStyleState } from "./cell-styling/types";
 import { ColumnFormattingFeature } from "./column-formatting/feature";
 import { ColumnWrappingFeature } from "./column-wrapping/feature";
 import { CopyColumnFeature } from "./copy-column/feature";
-import type { DownloadActionProps } from "./download-actions";
+import type { ExportActionProps } from "./export-actions";
 import { FilterPills } from "./filter-pills";
 import { FocusRowFeature } from "./focus-row/feature";
 import { useColumnPinning } from "./hooks/use-column-pinning";
+import { useScrollContainerHeight } from "./hooks/use-scroll-container-height";
 import { CellSelectionProvider } from "./range-focus/provider";
 import { DataTableBody, renderTableHeader } from "./renderers";
-import { SearchBar } from "./SearchBar";
-import { TableActions } from "./TableActions";
-import type { DataTableSelection, TooManyRows } from "./types";
+import { TableBottomBar } from "./TableBottomBar";
+import { TableTopBar } from "./TableTopBar";
+import {
+  AUTO_WIDTH_MAX_COLUMNS,
+  type DataTableSelection,
+  MIN_ROWS_TO_VIRTUALIZE,
+  type TooManyRows,
+} from "./types";
 import { getStableRowId } from "./utils";
 
-interface DataTableProps<TData> extends Partial<DownloadActionProps> {
+interface DataTableProps<TData> extends Partial<ExportActionProps> {
   wrapperClassName?: string;
   className?: string;
   maxHeight?: number;
   columns: ColumnDef<TData>[];
   data: TData[];
+  rawData?: TData[]; // raw data for filtering/copying (present only if format_mapping is provided)
   // Sorting
   manualSorting?: boolean; // server-side sorting
   sorting?: SortingState; // controlled sorting
   setSorting?: OnChangeFn<SortingState>; // controlled sorting
   // Pagination
   totalRows: number | TooManyRows;
+  // JSON-serialized size of the currently-rendered data. Forwarded to
+  // ExportMenu so hosts can size-gate the Export button via downloadSizeLimitAtom.
+  sizeBytes?: number | null;
   totalColumns: number;
   pagination?: boolean;
   manualPagination?: boolean; // server-side pagination
@@ -79,6 +95,7 @@ interface DataTableProps<TData> extends Partial<DownloadActionProps> {
   showFilters?: boolean;
   filters?: ColumnFiltersState;
   onFiltersChange?: OnChangeFn<ColumnFiltersState>;
+  calculateTopKRows?: CalculateTopKRows;
   reloading?: boolean;
   // Columns
   freezeColumnsLeft?: string[];
@@ -89,11 +106,12 @@ interface DataTableProps<TData> extends Partial<DownloadActionProps> {
   onViewedRowChange?: OnChangeFn<number>;
   // Others
   showChartBuilder?: boolean;
+  isChartBuilderOpen?: boolean;
   showPageSizeSelector?: boolean;
-  showColumnExplorer?: boolean;
-  showRowExplorer?: boolean;
+  showTableExplorer?: boolean;
   togglePanel?: (panelType: PanelType) => void;
   isPanelOpen?: (panelType: PanelType) => boolean;
+  isAnyPanelOpen?: boolean;
 }
 
 const DataTableInternal = <TData,>({
@@ -102,9 +120,11 @@ const DataTableInternal = <TData,>({
   maxHeight,
   columns,
   data,
+  rawData,
   selection,
   totalColumns,
   totalRows,
+  sizeBytes,
   manualSorting = false,
   sorting,
   setSorting,
@@ -127,20 +147,21 @@ const DataTableInternal = <TData,>({
   showFilters = false,
   filters,
   onFiltersChange,
+  calculateTopKRows,
   reloading,
   freezeColumnsLeft,
   freezeColumnsRight,
   toggleDisplayHeader,
   showChartBuilder,
+  isChartBuilderOpen,
   showPageSizeSelector,
-  showColumnExplorer,
-  showRowExplorer,
+  showTableExplorer,
   togglePanel,
   isPanelOpen,
+  isAnyPanelOpen,
   viewedRowIdx,
   onViewedRowChange,
 }: DataTableProps<TData>) => {
-  const [isSearchEnabled, setIsSearchEnabled] = React.useState<boolean>(false);
   const [showLoadingBar, setShowLoadingBar] = React.useState<boolean>(false);
   const { locale } = useLocale();
 
@@ -195,6 +216,7 @@ const DataTableInternal = <TData,>({
     ],
     data,
     columns,
+    meta: { rawData },
     getCoreRowModel: getCoreRowModel(),
     // pagination
     rowCount: totalRows === "too_many" ? undefined : totalRows,
@@ -262,88 +284,71 @@ const DataTableInternal = <TData,>({
     },
   });
 
-  const rowViewerPanelOpen = isPanelOpen?.("row-viewer") ?? false;
+  const rowViewerPanelOpen = isPanelOpen?.(PANEL_TYPES.ROW_VIEWER) ?? false;
+  const virtualize = !pagination && data.length > MIN_ROWS_TO_VIRTUALIZE;
 
-  const tableRef = React.useRef<HTMLTableElement | null>(null);
-
-  // Why use a ref to set max-height on the wrapper?
-  // - position: sticky only works when the sticky element's nearest scrollable
-  //   ancestor is its immediate container. If max-height/overflow are applied
-  //   on a grandparent, sticky table headers (th) will not stick.
-  // - We keep the scroll wrapper colocated with the base Table component, but
-  //   derive the scroll boundary from maxHeight here to avoid coupling UI base
-  //   components to data-table specifics or expanding their API surface.
-  // - Setting styles on the table's direct wrapper ensures the header sticks
-  //   reliably across browsers without changing upstream components.
-  React.useEffect(() => {
-    if (!tableRef.current) {
-      return;
-    }
-    const wrapper = tableRef.current.parentElement as HTMLDivElement | null;
-    if (!wrapper) {
-      return;
-    }
-    if (maxHeight) {
-      wrapper.style.maxHeight = `${maxHeight}px`;
-      // Ensure wrapper scrolls
-      if (!wrapper.style.overflow) {
-        wrapper.style.overflow = "auto";
-      }
-    } else {
-      wrapper.style.removeProperty("max-height");
-    }
-  }, [maxHeight]);
+  const tableRef = useScrollContainerHeight({ maxHeight, virtualize });
 
   return (
     <div className={cn(wrapperClassName, "flex flex-col space-y-1")}>
-      <FilterPills filters={filters} table={table} />
-      <div className={cn(className || "rounded-md border overflow-hidden")}>
-        {onSearchQueryChange && enableSearch && (
-          <SearchBar
-            value={searchQuery || ""}
-            onHide={() => setIsSearchEnabled(false)}
-            handleSearch={onSearchQueryChange}
-            hidden={!isSearchEnabled}
+      <FilterPills
+        filters={filters}
+        table={table}
+        calculateTopKRows={calculateTopKRows}
+      />
+      <CellSelectionProvider>
+        <div
+          part="table-wrapper"
+          className={cn(className || "rounded-md border overflow-hidden")}
+        >
+          <TableTopBar
+            enableSearch={enableSearch}
+            searchQuery={searchQuery}
+            onSearchQueryChange={onSearchQueryChange}
             reloading={reloading}
+            showChartBuilder={showChartBuilder}
+            isChartBuilderOpen={isChartBuilderOpen}
+            toggleDisplayHeader={toggleDisplayHeader}
+            showTableExplorer={showTableExplorer}
+            togglePanel={togglePanel}
+            isAnyPanelOpen={isAnyPanelOpen}
+            downloadAs={downloadAs}
+            sizeBytes={sizeBytes}
           />
-        )}
-        <Table className="relative" ref={tableRef}>
-          {showLoadingBar && (
-            <thead className="absolute top-0 left-0 h-[3px] w-1/2 bg-primary animate-slide" />
-          )}
-          {renderTableHeader(table, Boolean(maxHeight))}
-          <CellSelectionProvider>
+          <Table
+            className={cn(
+              "relative",
+              columns.length <= AUTO_WIDTH_MAX_COLUMNS ? "w-auto" : "w-full",
+            )}
+            ref={tableRef}
+          >
+            {showLoadingBar && (
+              <thead className="absolute top-0 left-0 h-[3px] w-1/2 bg-primary animate-slide" />
+            )}
+            {renderTableHeader(table, virtualize || Boolean(maxHeight))}
             <DataTableBody
               table={table}
               columns={columns}
               rowViewerPanelOpen={rowViewerPanelOpen}
               getRowIndex={getPaginatedRowIndex}
               viewedRowIdx={viewedRowIdx}
+              virtualize={virtualize}
             />
-          </CellSelectionProvider>
-        </Table>
-      </div>
-      <TableActions
-        enableSearch={enableSearch}
-        totalColumns={totalColumns}
-        onSearchQueryChange={onSearchQueryChange}
-        isSearchEnabled={isSearchEnabled}
-        setIsSearchEnabled={setIsSearchEnabled}
-        pagination={pagination}
-        selection={selection}
-        onRowSelectionChange={onRowSelectionChange}
-        table={table}
-        downloadAs={downloadAs}
-        getRowIds={getRowIds}
-        toggleDisplayHeader={toggleDisplayHeader}
-        showChartBuilder={showChartBuilder}
-        showPageSizeSelector={showPageSizeSelector}
-        showColumnExplorer={showColumnExplorer}
-        showRowExplorer={showRowExplorer}
-        togglePanel={togglePanel}
-        isPanelOpen={isPanelOpen}
-        tableLoading={reloading}
-      />
+          </Table>
+          <TableBottomBar
+            part="table-footer"
+            className="pt-1.5 pb-0.5 border-t border-border"
+            totalColumns={totalColumns}
+            pagination={pagination}
+            selection={selection}
+            onRowSelectionChange={onRowSelectionChange}
+            table={table}
+            getRowIds={getRowIds}
+            showPageSizeSelector={showPageSizeSelector}
+            tableLoading={reloading}
+          />
+        </div>
+      </CellSelectionProvider>
     </div>
   );
 };

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import ast
-from typing import TYPE_CHECKING, Any, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal
 
 from marimo import _loggers
 from marimo._data.models import (
@@ -15,6 +15,7 @@ from marimo._data.models import (
 )
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._sql.engines.types import InferenceConfig, SQLConnection
+from marimo._sql.sql_quoting import quote_qualified_name
 from marimo._sql.utils import (
     raise_df_import_error,
     sql_type_to_data_type,
@@ -34,7 +35,7 @@ class RedshiftEngine(SQLConnection["Connection"]):
     def __init__(
         self,
         connection: Connection,
-        engine_name: Optional[VariableName] = None,
+        engine_name: VariableName | None = None,
     ):
         super().__init__(connection, engine_name)
 
@@ -145,7 +146,7 @@ class RedshiftEngine(SQLConnection["Connection"]):
                 return cursor_result.fetch_dataframe()
             return cursor_result
 
-    def get_default_database(self) -> Optional[str]:
+    def get_default_database(self) -> str | None:
         with self._connection.cursor() as cursor:
             try:
                 return str(cursor.cur_catalog())
@@ -153,7 +154,7 @@ class RedshiftEngine(SQLConnection["Connection"]):
                 LOGGER.debug("Failed to get default database. Reason: %s.", e)
                 return None
 
-    def get_default_schema(self) -> Optional[str]:
+    def get_default_schema(self) -> str | None:
         with self._connection.cursor() as cursor:
             try:
                 result = cursor.execute("SELECT current_schema()")
@@ -168,9 +169,9 @@ class RedshiftEngine(SQLConnection["Connection"]):
     def get_databases(
         self,
         *,
-        include_schemas: Union[bool, Literal["auto"]],
-        include_tables: Union[bool, Literal["auto"]],
-        include_table_details: Union[bool, Literal["auto"]],
+        include_schemas: bool | Literal["auto"],
+        include_tables: bool | Literal["auto"],
+        include_table_details: bool | Literal["auto"],
     ) -> list[Database]:
         """Get catalogs from the engine. Redshift only supports one catalog per connection.
 
@@ -198,7 +199,7 @@ class RedshiftEngine(SQLConnection["Connection"]):
             schemas: list[Schema] = []
             if include_schemas:
                 schemas = self.get_schemas(
-                    catalog=catalog,
+                    database=catalog,
                     include_tables=include_tables,
                     include_table_details=include_table_details,
                 )
@@ -217,11 +218,18 @@ class RedshiftEngine(SQLConnection["Connection"]):
     def get_schemas(
         self,
         *,
-        catalog: str,
+        database: str | None,
         include_tables: bool,
         include_table_details: bool,
     ) -> list[Schema]:
         """Get schemas from the engine."""
+
+        # Redshift doesn't use the concept of databases, just catalogs and schemas.
+        catalog = database
+
+        if catalog is None:
+            # Early return to avoid passing None or "" as catalog
+            return []
 
         output_schemas: list[Schema] = []
         with self._connection.cursor() as cursor:
@@ -321,7 +329,7 @@ class RedshiftEngine(SQLConnection["Connection"]):
 
     def get_table_details(
         self, *, table_name: str, schema_name: str, database_name: str
-    ) -> Optional[DataTable]:
+    ) -> DataTable | None:
         """Get detailed metadata for a given table in a database."""
 
         with self._connection.cursor() as cursor:
@@ -337,9 +345,10 @@ class RedshiftEngine(SQLConnection["Connection"]):
 
             table_type = self._resolve_table_type(table[0][3])
 
-            row_count = cursor.execute(
-                f"SELECT COUNT(*) FROM {database_name}.{schema_name}.{table_name}"
+            quoted_name = quote_qualified_name(
+                database_name, schema_name, table_name, dialect="redshift"
             )
+            row_count = cursor.execute(f"SELECT COUNT(*) FROM {quoted_name}")
             row = row_count.fetchone()
             if row is None or row[0] is None:
                 return None
@@ -348,7 +357,7 @@ class RedshiftEngine(SQLConnection["Connection"]):
             try:
                 # [[catalog, schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_scale, remarks]]
                 columns = cursor.execute(
-                    f"SHOW COLUMNS FROM TABLE {database_name}.{schema_name}.{table_name};"
+                    f"SHOW COLUMNS FROM TABLE {quoted_name};"
                 )
             except Exception as e:
                 LOGGER.debug(
@@ -396,7 +405,7 @@ class RedshiftEngine(SQLConnection["Connection"]):
     def _resolve_table_type(self, table_type: str) -> DataTableType:
         return "view" if table_type == "VIEW" else "table"
 
-    def _get_data_type(self, data_type: str) -> Optional[DataType]:
+    def _get_data_type(self, data_type: str) -> DataType | None:
         data_type = data_type.lower()
         if "cardinal_number" in data_type:
             return "number"
@@ -405,7 +414,7 @@ class RedshiftEngine(SQLConnection["Connection"]):
         return None
 
     def _resolve_should_auto_discover(
-        self, value: Union[bool, Literal["auto"]]
+        self, value: bool | Literal["auto"]
     ) -> bool:
         # Opt to not auto-discover for now
         if value == "auto":

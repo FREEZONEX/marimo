@@ -1,7 +1,15 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
+import type { Table } from "@tanstack/react-table";
 import { describe, expect, it } from "vitest";
-import { getPageIndexForRow } from "../utils";
+import {
+  detectSentinel,
+  getClipboardContent,
+  getPageIndexForRow,
+  getRawValue,
+  splitLeadingTrailingWhitespace,
+  stringifyUnknownValue,
+} from "../utils";
 
 describe("getPageIndexForRow", () => {
   it("should return null when row is on current page", () => {
@@ -75,5 +83,361 @@ describe("getPageIndexForRow", () => {
     expect(getPageIndexForRow(1009, 100, 10)).toBeNull();
     expect(getPageIndexForRow(1010, 100, 10)).toBe(101);
     expect(getPageIndexForRow(999, 100, 10)).toBe(99);
+  });
+});
+
+describe("stringifyUnknownValue", () => {
+  it("should stringify primitives", () => {
+    expect(stringifyUnknownValue({ value: "hello" })).toBe("hello");
+    expect(stringifyUnknownValue({ value: 42 })).toBe("42");
+    expect(stringifyUnknownValue({ value: true })).toBe("true");
+    expect(stringifyUnknownValue({ value: null })).toBe("null");
+    expect(stringifyUnknownValue({ value: undefined })).toBe("undefined");
+  });
+
+  it("should stringify null as empty string when flag is set", () => {
+    expect(
+      stringifyUnknownValue({ value: null, nullAsEmptyString: true }),
+    ).toBe("");
+  });
+
+  it("should JSON-stringify plain objects", () => {
+    expect(stringifyUnknownValue({ value: { x: 1 } })).toBe('{"x":1}');
+  });
+});
+
+describe("getClipboardContent", () => {
+  it("should use rawValue for text when it differs from displayedValue", () => {
+    const displayed = {
+      _serialized_mime_bundle: {
+        mimetype: "text/html",
+        data: '<a href="https://example.com">42</a>',
+      },
+    };
+    const result = getClipboardContent(42, displayed);
+    expect(result.text).toBe("42");
+    expect(result.html).toBe('<a href="https://example.com">42</a>');
+  });
+
+  it("should strip html for text when rawValue equals displayedValue", () => {
+    const mimeBundle = {
+      _serialized_mime_bundle: {
+        mimetype: "text/html",
+        data: "<b>bold</b>",
+      },
+    };
+    const result = getClipboardContent(mimeBundle, mimeBundle);
+    expect(result.text).toBe("bold");
+    expect(result.html).toBe("<b>bold</b>");
+  });
+
+  it("should handle undefined rawValue", () => {
+    const displayed = {
+      _serialized_mime_bundle: {
+        mimetype: "text/html",
+        data: "<b>hello</b>",
+      },
+    };
+    const result = getClipboardContent(undefined, displayed);
+    expect(result.text).toBe("hello");
+    expect(result.html).toBe("<b>hello</b>");
+  });
+
+  it("should return no html for plain values", () => {
+    const result = getClipboardContent(undefined, "plain text");
+    expect(result.text).toBe("plain text");
+    expect(result.html).toBeUndefined();
+  });
+
+  it("should treat text/markdown as html since mo.md() data is rendered html", () => {
+    const displayed = {
+      _serialized_mime_bundle: {
+        mimetype: "text/markdown",
+        data: '<span class="markdown"><strong>Hello</strong></span>',
+      },
+    };
+    const result = getClipboardContent(undefined, displayed);
+    expect(result.text).toBe("Hello");
+    expect(result.html).toBe(
+      '<span class="markdown"><strong>Hello</strong></span>',
+    );
+  });
+
+  it("should return no html for non-html mime bundles", () => {
+    const displayed = {
+      _serialized_mime_bundle: {
+        mimetype: "text/plain",
+        data: "just text",
+      },
+    };
+    const result = getClipboardContent(undefined, displayed);
+    expect(result.text).toBe("just text");
+    expect(result.html).toBeUndefined();
+  });
+
+  it("should handle null rawValue as a real value", () => {
+    const displayed = {
+      _serialized_mime_bundle: {
+        mimetype: "text/html",
+        data: "<i>N/A</i>",
+      },
+    };
+    const result = getClipboardContent(null, displayed);
+    expect(result.text).toBe("null");
+    expect(result.html).toBe("<i>N/A</i>");
+  });
+});
+
+describe("detectSentinel", () => {
+  it("should detect null and undefined", () => {
+    expect(detectSentinel(null, undefined)).toEqual({
+      type: "null",
+      value: null,
+    });
+    expect(detectSentinel(undefined, undefined)).toEqual({
+      type: "null",
+      value: undefined,
+    });
+  });
+
+  it("should detect empty string", () => {
+    expect(detectSentinel("", "string")).toEqual({
+      type: "empty-string",
+      value: "",
+    });
+  });
+
+  it("should detect whitespace-only strings", () => {
+    expect(detectSentinel(" ", "string")).toEqual({
+      type: "whitespace",
+      value: " ",
+    });
+    expect(detectSentinel("   ", "string")).toEqual({
+      type: "whitespace",
+      value: "   ",
+    });
+    expect(detectSentinel("\t", "string")).toEqual({
+      type: "whitespace",
+      value: "\t",
+    });
+    expect(detectSentinel("\n", "string")).toEqual({
+      type: "whitespace",
+      value: "\n",
+    });
+    expect(detectSentinel("\t \n", "string")).toEqual({
+      type: "whitespace",
+      value: "\t \n",
+    });
+  });
+
+  it("should detect NaN", () => {
+    expect(detectSentinel(Number.NaN, "number")).toEqual({
+      type: "nan",
+      value: Number.NaN,
+    });
+  });
+
+  it("should detect Infinity", () => {
+    expect(detectSentinel(Number.POSITIVE_INFINITY, "number")).toEqual({
+      type: "positive-infinity",
+      value: Number.POSITIVE_INFINITY,
+    });
+    expect(detectSentinel(Number.NEGATIVE_INFINITY, "number")).toEqual({
+      type: "negative-infinity",
+      value: Number.NEGATIVE_INFINITY,
+    });
+  });
+
+  it("should return null for normal values", () => {
+    expect(detectSentinel("hello", "string")).toBeNull();
+    expect(detectSentinel(42, "number")).toBeNull();
+    expect(detectSentinel(0, "number")).toBeNull();
+    expect(detectSentinel(-1.5, "number")).toBeNull();
+    expect(detectSentinel(true, "boolean")).toBeNull();
+    expect(detectSentinel(false, "boolean")).toBeNull();
+    expect(detectSentinel({}, "unknown")).toBeNull();
+    expect(detectSentinel([], "unknown")).toBeNull();
+  });
+
+  it("should not match literal null-like strings", () => {
+    expect(detectSentinel("null", "string")).toBeNull();
+    expect(detectSentinel("NULL", "string")).toBeNull();
+    expect(detectSentinel("None", "string")).toBeNull();
+  });
+
+  it("should not match string NaN/Infinity in non-numeric columns", () => {
+    expect(detectSentinel("NaN", "string")).toBeNull();
+    expect(detectSentinel("Infinity", "string")).toBeNull();
+    expect(detectSentinel("-Infinity", "string")).toBeNull();
+  });
+
+  it("should match string NaN/Infinity in numeric columns", () => {
+    expect(detectSentinel("NaN", "number")).toEqual({
+      type: "nan",
+      value: "NaN",
+    });
+    expect(detectSentinel("Infinity", "number")).toEqual({
+      type: "positive-infinity",
+      value: "Infinity",
+    });
+    expect(detectSentinel("-Infinity", "number")).toEqual({
+      type: "negative-infinity",
+      value: "-Infinity",
+    });
+    expect(detectSentinel("inf", "number")).toEqual({
+      type: "positive-infinity",
+      value: "inf",
+    });
+    expect(detectSentinel("-inf", "number")).toEqual({
+      type: "negative-infinity",
+      value: "-inf",
+    });
+  });
+
+  it("should still not match normal strings in numeric columns", () => {
+    expect(detectSentinel("hello", "number")).toBeNull();
+    expect(detectSentinel("42", "number")).toBeNull();
+  });
+
+  it("should not match NaT in non-temporal columns", () => {
+    expect(detectSentinel("NaT", "string")).toBeNull();
+  });
+
+  it("should match NaT in temporal columns", () => {
+    expect(detectSentinel("NaT", "datetime")).toEqual({
+      type: "nat",
+      value: "NaT",
+    });
+    expect(detectSentinel("NaT", "date")).toEqual({
+      type: "nat",
+      value: "NaT",
+    });
+  });
+});
+
+function createMockTableWithMeta<TData>(rawData?: TData[]): Table<TData> {
+  return {
+    options: {
+      meta: { rawData },
+    },
+  } as unknown as Table<TData>;
+}
+
+describe("getRawValue", () => {
+  it("should return raw value when rawData is available", () => {
+    const table = createMockTableWithMeta([
+      { a: 10, b: 20 },
+      { a: 30, b: 40 },
+    ]);
+    expect(getRawValue(table, 0, "a")).toBe(10);
+    expect(getRawValue(table, 1, "b")).toBe(40);
+  });
+
+  it("should return undefined when rawData is not set", () => {
+    const table = createMockTableWithMeta(undefined);
+    expect(getRawValue(table, 0, "a")).toBeUndefined();
+  });
+
+  it("should return undefined when row index is out of bounds", () => {
+    const table = createMockTableWithMeta([{ a: 1 }]);
+    expect(getRawValue(table, 5, "a")).toBeUndefined();
+  });
+});
+
+describe("splitLeadingTrailingWhitespace", () => {
+  it("returns all empty for empty string", () => {
+    expect(splitLeadingTrailingWhitespace("")).toEqual({
+      leading: "",
+      middle: "",
+      trailing: "",
+    });
+  });
+
+  it("returns value as middle when no edge whitespace", () => {
+    expect(splitLeadingTrailingWhitespace("abc")).toEqual({
+      leading: "",
+      middle: "abc",
+      trailing: "",
+    });
+  });
+
+  it("preserves inner whitespace in middle", () => {
+    expect(splitLeadingTrailingWhitespace("abc d ef")).toEqual({
+      leading: "",
+      middle: "abc d ef",
+      trailing: "",
+    });
+  });
+
+  it("splits leading whitespace only", () => {
+    expect(splitLeadingTrailingWhitespace("   abc")).toEqual({
+      leading: "   ",
+      middle: "abc",
+      trailing: "",
+    });
+  });
+
+  it("splits trailing whitespace only", () => {
+    expect(splitLeadingTrailingWhitespace("abc   ")).toEqual({
+      leading: "",
+      middle: "abc",
+      trailing: "   ",
+    });
+  });
+
+  it("splits both leading and trailing whitespace", () => {
+    expect(splitLeadingTrailingWhitespace("  abc  ")).toEqual({
+      leading: "  ",
+      middle: "abc",
+      trailing: "  ",
+    });
+  });
+
+  it("handles mixed whitespace types at edges", () => {
+    expect(splitLeadingTrailingWhitespace("\t\n abc \r\t")).toEqual({
+      leading: "\t\n ",
+      middle: "abc",
+      trailing: " \r\t",
+    });
+  });
+
+  it("preserves inner whitespace when edges have whitespace", () => {
+    expect(splitLeadingTrailingWhitespace("  a b c  ")).toEqual({
+      leading: "  ",
+      middle: "a b c",
+      trailing: "  ",
+    });
+  });
+
+  it("handles Unicode whitespace (NBSP) at edges", () => {
+    expect(splitLeadingTrailingWhitespace("\u00a0abc\u00a0")).toEqual({
+      leading: "\u00a0",
+      middle: "abc",
+      trailing: "\u00a0",
+    });
+  });
+
+  it("puts whitespace-only string in leading (caller should handle sentinel first)", () => {
+    expect(splitLeadingTrailingWhitespace("   ")).toEqual({
+      leading: "   ",
+      middle: "",
+      trailing: "",
+    });
+  });
+
+  it("handles single whitespace char", () => {
+    expect(splitLeadingTrailingWhitespace(" ")).toEqual({
+      leading: " ",
+      middle: "",
+      trailing: "",
+    });
+  });
+
+  it("handles single non-whitespace char", () => {
+    expect(splitLeadingTrailingWhitespace("a")).toEqual({
+      leading: "",
+      middle: "a",
+      trailing: "",
+    });
   });
 });

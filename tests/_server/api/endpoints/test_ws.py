@@ -4,64 +4,37 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from marimo._config.config import ExperimentalConfig
 from marimo._config.manager import UserConfigManager
-from marimo._messaging.msgspec_encoder import asdict
-from marimo._messaging.notification import (
-    KernelCapabilitiesNotification,
-    KernelReadyNotification,
+from marimo._messaging.notification import KernelReadyNotification
+from marimo._server.api.endpoints.ws.ws_connection_validator import (
+    ConnectionParams,
 )
 from marimo._server.codes import WebSocketCodes
 from marimo._server.session_manager import SessionManager
-from marimo._session.model import SessionMode
+from marimo._server.workspace import serialize_file_key
+from marimo._session.model import ConnectionState, SessionMode
 from marimo._utils.parse_dataclass import parse_raw
-from tests._server.conftest import (
-    get_kernel_tasks,
-    get_session_manager,
-    get_user_config_manager,
+from tests._server.api.endpoints.ws_helpers import (
+    HEADERS,
+    assert_kernel_ready_response,
+    assert_parse_ready_response,
+    create_response,
+    headers,
 )
-from tests._server.mocks import token_header
+from tests._server.conftest import get_kernel_tasks, get_user_config_manager
+from tests._server.mocks import get_session_manager
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from starlette.testclient import TestClient, WebSocketTestSession
-
-
-def create_response(
-    partial_response: dict[str, Any],
-) -> dict[str, Any]:
-    response: dict[str, Any] = {
-        "cell_ids": ["Hbol"],
-        "codes": ["import marimo as mo"],
-        "names": ["__"],
-        "layout": None,
-        "resumed": False,
-        "ui_values": {},
-        "last_executed_code": {},
-        "last_execution_time": {},
-        "kiosk": False,
-        "configs": [{"disabled": False, "hide_code": False}],
-        "app_config": {"width": "full"},
-        "capabilities": asdict(KernelCapabilitiesNotification()),
-    }
-    response.update(partial_response)
-    return response
-
-
-HEADERS = {
-    **token_header("fake-token"),
-}
-
-
-def headers(session_id: str) -> dict[str, str]:
-    return {
-        "Marimo-Session-Id": session_id,
-        **token_header("fake-token"),
-    }
 
 
 def _create_ws_url(session_id: str) -> str:
@@ -70,30 +43,6 @@ def _create_ws_url(session_id: str) -> str:
 
 WS_URL = _create_ws_url("123")
 OTHER_WS_URL = _create_ws_url("456")
-
-
-def assert_kernel_ready_response(
-    raw_data: dict[str, Any], response: Optional[dict[str, Any]] = None
-) -> None:
-    if response is None:
-        response = create_response({})
-    data = parse_raw(raw_data["data"], KernelReadyNotification)
-    expected = parse_raw(response, KernelReadyNotification)
-    assert data.cell_ids == expected.cell_ids
-    assert data.codes == expected.codes
-    assert data.names == expected.names
-    assert data.layout == expected.layout
-    assert data.resumed == expected.resumed
-    assert data.ui_values == expected.ui_values
-    assert data.configs == expected.configs
-    assert data.app_config == expected.app_config
-    assert data.kiosk == expected.kiosk
-    assert data.capabilities == expected.capabilities
-
-
-def assert_parse_ready_response(raw_data: dict[str, Any]) -> None:
-    data = parse_raw(raw_data["data"], KernelReadyNotification)
-    assert data is not None
 
 
 def test_ws(client: TestClient) -> None:
@@ -215,13 +164,16 @@ async def test_file_watcher_calls_reload(client: TestClient) -> None:
     with client.websocket_connect(WS_URL) as websocket:
         data = websocket.receive_json()
         assert_kernel_ready_response(data)
-        filename = session_manager.file_router.get_unique_file_key()
-        assert filename
+        file_key = session_manager.workspace.get_unique_file_key()
+        assert file_key
+        filename = serialize_file_key(file_key)
         with open(filename, "a") as f:  # noqa: ASYNC230
             f.write("\n# test")
             f.close()
         assert session_manager._watcher_manager._watchers
-        watcher = list(session_manager._watcher_manager._watchers.values())[0]
+        watcher = next(
+            iter(session_manager._watcher_manager._watchers.values())
+        )
         await watcher.callback(Path(filename))
         # Drain messages until we get the reload message
         # (other messages like 'variables' may arrive first)
@@ -299,6 +251,40 @@ async def test_cannot_connect_kiosk_with_run_session(
         assert exc_info.value.reason == "MARIMO_KIOSK_NOT_ALLOWED"
 
 
+async def test_kernel_ready_sends_names_but_not_code_when_include_code_false(
+    client: TestClient,
+) -> None:
+    """Cell names are sent in kernel-ready even when include_code=False.
+
+    This ensures data-cell-name attributes are populated in the DOM when
+    running with marimo run (without --include-code).
+
+    The 4 fields from _extract_cell_data (ws_kernel_ready.py) behave as:
+      - codes    -> blanked ("") to hide source code
+      - names    -> preserved (needed for data-cell-name DOM attribute)
+      - configs  -> preserved (needed for cell rendering)
+      - cell_ids -> preserved (needed for cell identity)
+    """
+    session_manager = get_session_manager(client)
+    session_manager.mode = SessionMode.RUN
+    session_manager.include_code = False
+    with client.websocket_connect(WS_URL) as websocket:
+        data = websocket.receive_json()
+        assert_kernel_ready_response(
+            data,
+            create_response(
+                {
+                    "codes": [""],  # hidden
+                    "names": ["__"],  # preserved
+                    "configs": [
+                        {"disabled": False, "hide_code": False}
+                    ],  # preserved
+                    "cell_ids": ["Hbol"],  # preserved
+                }
+            ),
+        )
+
+
 async def test_connects_to_existing_session_with_same_file(
     client: TestClient,
     temp_marimo_file: str,
@@ -322,7 +308,7 @@ async def test_connects_to_existing_session_with_same_file(
             # This can/may change if implementation changes, but this is a snapshot to
             # make sure it doesn't change when we don't expect it to
             assert len(messages1) == 14
-            assert messages1[0]["op"] == "variables"
+            assert messages1[0]["op"] == "notebook-document-transaction"
 
             # Connect second client - should connect to same session
             with client.websocket_connect(ws_2) as websocket2:
@@ -335,10 +321,10 @@ async def test_connects_to_existing_session_with_same_file(
                 assert_parse_ready_response(data2)
                 assert data2["data"]["resumed"] is True
 
-                messages2 = flush_messages(websocket2, at_least=4)
+                messages2 = flush_messages(websocket2, at_least=3)
                 # This can/may change if implementation changes, but this is a snapshot to
                 # make sure it doesn't change when we don't expect it to
-                assert len(messages2) == 4
+                assert len(messages2) == 3
                 assert messages2[0]["op"] == "variables"
 
 
@@ -470,6 +456,119 @@ async def test_reconnection_cancels_close_handle(client: TestClient) -> None:
             assert session is not None
 
 
+async def test_ttl_close_does_not_kill_session_owned_by_new_consumer(
+    client: TestClient,
+) -> None:
+    """Regression: old handler's TTL timer must not kill a session that has
+    been taken over by a new consumer (same session_id).
+
+    Sequence:
+      1. Consumer A connects → session created
+      2. Consumer A disconnects → TTL timer scheduled
+      3. Consumer B connects with same session_id → takes over session
+      4. TTL timer fires → must NOT close the session
+    """
+    session_manager = get_session_manager(client)
+    session_manager.mode = SessionMode.RUN
+    session_manager.ttl_seconds = 120  # enable TTL (run mode default)
+
+    # Step 1: Consumer A connects
+    with client.websocket_connect(WS_URL) as ws_a:
+        data = ws_a.receive_json()
+        assert_kernel_ready_response(data)
+
+        session = session_manager.get_session("123")
+        assert session is not None
+
+        # Override session TTL to a very short value for the test
+        session.ttl_seconds = 0.3
+
+    # Consumer A has disconnected — _on_disconnect schedules _close() in 0.3s
+    # Step 2: Consumer B connects immediately (before TTL fires)
+    with client.websocket_connect(WS_URL) as ws_b:
+        data = ws_b.receive_json()
+        assert data["op"] == "reconnected", (
+            f"Expected reconnected, got {data.get('op')} — "
+            "session may have been closed before Consumer B connected"
+        )
+
+        # Step 3: Wait for Consumer A's TTL timer to fire
+        # (Unit test test_ttl_close_skips_when_session_has_active_consumer
+        # verifies the fix; integration timing may vary with TestClient)
+        await asyncio.sleep(0.4)
+
+        # Session must still be alive — Consumer B is actively connected
+        # (Without the fix, the old handler's TTL timer would have killed it)
+        session = session_manager.get_session("123")
+        assert session is not None, (
+            "Session was killed by old handler's TTL timer "
+            "despite having an active consumer"
+        )
+        assert session.connection_state() == ConnectionState.OPEN
+
+
+def test_ttl_close_skips_when_session_has_active_consumer() -> None:
+    """Unit test: _close() must not kill session when another consumer has taken over.
+
+    Patches call_later to fire the TTL callback immediately after setup,
+    simulating the bug scenario where Consumer A's timer fires while
+    Consumer B owns the session.
+    """
+    from marimo._server.api.endpoints.ws_endpoint import WebSocketHandler
+
+    captured_callback: list[tuple[float, Callable[[], None]]] = []
+
+    def capture_call_later(
+        delay: float, callback: Callable[[], None]
+    ) -> MagicMock:
+        captured_callback.append((delay, callback))
+        return MagicMock()
+
+    # Session with active consumer (Consumer B has taken over)
+    session_with_consumer = MagicMock()
+    session_with_consumer.connection_state.return_value = ConnectionState.OPEN
+    session_with_consumer.ttl_seconds = 0.1
+
+    manager = MagicMock(spec=SessionManager)
+    manager.ttl_seconds = 120
+    manager.get_session.return_value = session_with_consumer
+    manager.close_session = MagicMock()
+
+    params = ConnectionParams(
+        session_id="123",
+        file_key="test.py",
+        kiosk=False,
+        auto_instantiate=False,
+        rtc_enabled=False,
+    )
+
+    handler = WebSocketHandler(
+        websocket=MagicMock(),
+        manager=manager,
+        params=params,
+        mode=SessionMode.RUN,
+    )
+    handler.status = ConnectionState.CLOSED  # Consumer A disconnected
+
+    cleanup_fn = MagicMock()
+
+    with patch(
+        "marimo._server.api.endpoints.ws_endpoint.asyncio.get_running_loop"
+    ) as mock_loop:
+        mock_loop.return_value.call_later = capture_call_later
+        handler._on_disconnect(Exception("disconnect"), cleanup_fn)
+
+    assert len(captured_callback) == 1
+    _, ttl_callback = captured_callback[0]
+
+    # Fire the TTL callback (simulates timer firing)
+    ttl_callback()
+
+    # With the fix: session has active consumer, so close_session must NOT be called
+    manager.close_session.assert_not_called()
+    cleanup_fn.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("mode", "manager_ttl"),
     [
@@ -478,6 +577,10 @@ async def test_reconnection_cancels_close_handle(client: TestClient) -> None:
             120,
         ),  # RUN mode always uses TTL which has to be integer: default 120.
         (SessionMode.EDIT, 120),  # EDIT mode with --session-ttl
+        (
+            SessionMode.RUN,
+            None,
+        ),  # RUN mode with manager TTL=None (create_asgi_app default)
     ],
 )
 async def test_session_ttl_expiration(
@@ -510,6 +613,67 @@ async def test_session_ttl_expiration(
         # is restored correctly.
         for task in kernel_tasks:
             task.join()
+
+
+def test_run_mode_ttl_close_with_manager_ttl_none() -> None:
+    """Unit test: RUN mode must schedule TTL cleanup even when
+    manager.ttl_seconds is None (the default for create_asgi_app).
+
+    This was a regression from #7863 where the condition only checked
+    manager.ttl_seconds, causing ASGI sessions to never be cleaned up.
+    """
+    from marimo._server.api.endpoints.ws_endpoint import WebSocketHandler
+
+    captured_callback: list[tuple[float, Callable[[], None]]] = []
+
+    def capture_call_later(
+        delay: float, callback: Callable[[], None]
+    ) -> MagicMock:
+        captured_callback.append((delay, callback))
+        return MagicMock()
+
+    # Session exists but no active consumer (disconnected)
+    session = MagicMock()
+    session.connection_state.return_value = ConnectionState.ORPHANED
+    session.ttl_seconds = 120
+
+    manager = MagicMock(spec=SessionManager)
+    manager.ttl_seconds = None  # ASGI default
+    manager.get_session.return_value = session
+
+    params = ConnectionParams(
+        session_id="123",
+        file_key="test.py",
+        kiosk=False,
+        auto_instantiate=False,
+        rtc_enabled=False,
+    )
+
+    handler = WebSocketHandler(
+        websocket=MagicMock(),
+        manager=manager,
+        params=params,
+        mode=SessionMode.RUN,
+    )
+    handler.status = ConnectionState.CLOSED
+
+    cleanup_fn = MagicMock()
+
+    with patch(
+        "marimo._server.api.endpoints.ws_endpoint.asyncio.get_running_loop"
+    ) as mock_loop:
+        mock_loop.return_value.call_later = capture_call_later
+        handler._on_disconnect(Exception("disconnect"), cleanup_fn)
+
+    # Must schedule TTL cleanup even though manager.ttl_seconds is None
+    assert len(captured_callback) == 1
+    delay, ttl_callback = captured_callback[0]
+    assert delay == 120  # session.ttl_seconds
+
+    # Fire the callback — session has no active consumer, so it should close
+    ttl_callback()
+    manager.close_session.assert_called_once_with("123")
+    cleanup_fn.assert_called_once()
 
 
 async def test_edit_mode_without_session_ttl_no_delayed_cleanup(
@@ -548,7 +712,7 @@ async def test_edit_mode_without_session_ttl_no_delayed_cleanup(
 def test_missing_file_key_closes_connection(client: TestClient) -> None:
     """Test that missing file key causes connection to close.
 
-    This can happen when file_router.get_unique_file_key() returns None.
+    This can happen when workspace.get_unique_file_key() returns None.
     """
     from unittest.mock import patch
 
@@ -556,7 +720,7 @@ def test_missing_file_key_closes_connection(client: TestClient) -> None:
 
     # Mock get_unique_file_key to return None
     with patch.object(
-        session_manager.file_router,
+        session_manager.workspace,
         "get_unique_file_key",
         return_value=None,
     ):

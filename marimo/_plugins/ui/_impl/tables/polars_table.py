@@ -4,7 +4,7 @@ from __future__ import annotations
 import functools
 import io
 from functools import cached_property
-from typing import Any, Optional, Union
+from typing import Any
 
 import narwhals.stable.v2 as nw
 
@@ -42,9 +42,7 @@ class PolarsTableManagerFactory(TableManagerFactory):
         ):
             type = "polars"
 
-            def __init__(
-                self, data: Union[pl.DataFrame, pl.LazyFrame]
-            ) -> None:
+            def __init__(self, data: pl.DataFrame | pl.LazyFrame) -> None:
                 self._original_data = data
                 super().__init__(nw.from_native(data))
 
@@ -72,11 +70,15 @@ class PolarsTableManagerFactory(TableManagerFactory):
             # nested data types.
             def to_csv_str(
                 self,
-                format_mapping: Optional[FormatMapping] = None,
+                format_mapping: FormatMapping | None = None,
+                separator: str | None = None,
             ) -> str:
+                resolved_separator = (
+                    separator if separator is not None else ","
+                )
                 _data = self.apply_formatting(format_mapping).collect()
                 try:
-                    return _data.write_csv()
+                    return _data.write_csv(separator=resolved_separator)
                 except pl.exceptions.ComputeError:
                     # Likely CSV format does not support nested data or objects
                     # Try to convert columns to json or strings
@@ -105,11 +107,11 @@ class PolarsTableManagerFactory(TableManagerFactory):
                             result = self._convert_time_to_string(
                                 result, column
                             )
-                    return result.write_csv()
+                    return result.write_csv(separator=resolved_separator)
 
             def to_json_str(
                 self,
-                format_mapping: Optional[FormatMapping] = None,
+                format_mapping: FormatMapping | None = None,
                 strict_json: bool = False,
                 ensure_ascii: bool = True,
             ) -> str:
@@ -227,7 +229,7 @@ class PolarsTableManagerFactory(TableManagerFactory):
                     return self._cast_object_to_string(df, column)
 
             def apply_formatting(
-                self, format_mapping: Optional[FormatMapping]
+                self, format_mapping: FormatMapping | None
             ) -> PolarsTableManager:
                 if not format_mapping:
                     return self
@@ -275,11 +277,9 @@ class PolarsTableManagerFactory(TableManagerFactory):
                 if not expressions:
                     return self
 
-                or_expr = expressions[0]
-                for expr in expressions[1:]:
-                    or_expr = or_expr | expr
-
-                filtered = self._original_data.filter(or_expr)
+                filtered = self._original_data.filter(
+                    pl.any_horizontal(expressions)
+                )
                 return PolarsTableManager(filtered)
 
             # We override the default implementation to use polars's
@@ -314,9 +314,7 @@ class PolarsTableManagerFactory(TableManagerFactory):
                     return ("time", dtype_string)
                 elif dtype == pl.Duration:
                     return ("number", dtype_string)
-                elif dtype == pl.Datetime:
-                    return ("datetime", dtype_string)
-                elif dtype.is_temporal():
+                elif dtype == pl.Datetime or dtype.is_temporal():
                     return ("datetime", dtype_string)
                 else:
                     return ("unknown", dtype_string)

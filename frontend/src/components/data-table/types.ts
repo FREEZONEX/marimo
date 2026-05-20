@@ -1,7 +1,31 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
+import type { RowData } from "@tanstack/react-table";
 import type { DataType } from "@/core/kernel/messages";
-import { Objects } from "@/utils/objects";
+
+declare module "@tanstack/react-table" {
+  interface TableMeta<TData extends RowData> {
+    rawData?: TData[]; // raw data for filtering/copying (present only if format_mapping is provided)
+  }
+}
+
+// Pixel heights derived from Tailwind classes applied to table elements.
+// row: h-6 = 24px (TableRow in renderers.tsx)
+// header: min-h-10 = 40px (TableHead in renderers.tsx)
+export const TABLE_ROW_HEIGHT_PX = 24;
+export const TABLE_HEADER_HEIGHT_PX = 40;
+
+// Below this column count, the table uses w-auto with a filler column
+// to prevent columns from stretching unnecessarily
+export const AUTO_WIDTH_MAX_COLUMNS = 4;
+
+// Default number of visible rows when virtualizing without an explicit maxHeight.
+export const DEFAULT_VIRTUAL_ROWS = 15;
+
+// Minimum row count before virtualization kicks in. Below this threshold the
+// DOM overhead is negligible and the virtualizer's measurement cost isn't
+// worth it. Must be greater than DEFAULT_VIRTUAL_ROWS.
+export const MIN_ROWS_TO_VIRTUALIZE = 100;
 
 export type ColumnName = string;
 
@@ -31,16 +55,19 @@ export type FieldTypesWithExternalType = [
   columnName: string,
   [dataType: DataType, externalType: string],
 ][];
-export type FieldTypes = Record<string, DataType>;
+// Ordered map of column name -> data type.
+//
+// `Map` (not `Record`) because JS objects reorder integer-string keys
+// to the front in numeric order per `OrdinaryOwnPropertyKeys`; a
+// DataFrame with a `"2010"` column alongside `"here"` would otherwise
+// lose its column order on iteration (#9269). `Map` preserves insertion
+// order for all keys.
+export type FieldTypes = Map<string, DataType>;
 
 export function toFieldTypes(
   fieldTypes: FieldTypesWithExternalType,
 ): FieldTypes {
-  return Objects.collect(
-    fieldTypes,
-    ([columnName]) => columnName,
-    ([, [type]]) => type,
-  );
+  return new Map(fieldTypes.map(([columnName, [type]]) => [columnName, type]));
 }
 
 interface BinValue {
@@ -69,6 +96,29 @@ export type DataTableSelection =
   | "single-cell"
   | "multi-cell"
   | null;
+
+export type CellValueSentinel =
+  | { type: "null"; value: null | undefined }
+  | { type: "empty-string"; value: string }
+  | { type: "whitespace"; value: string }
+  | { type: "nan"; value: number | string }
+  | { type: "positive-infinity"; value: number | string }
+  | { type: "negative-infinity"; value: number | string }
+  | { type: "nat"; value: string };
+
+export type CellValueSentinelType = CellValueSentinel["type"];
+
+export function isNumericType(
+  dataType: DataType | undefined,
+): dataType is "number" | "integer" {
+  return dataType === "number" || dataType === "integer";
+}
+
+export function isTemporalType(
+  dataType: DataType | undefined,
+): dataType is "date" | "datetime" | "time" {
+  return dataType === "date" || dataType === "datetime" || dataType === "time";
+}
 
 export function extractTimezone(dtype: string | undefined): string | undefined {
   if (!dtype) {

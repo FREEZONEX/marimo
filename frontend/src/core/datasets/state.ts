@@ -66,7 +66,7 @@ const {
       return true;
     });
 
-    const sortedTables = dedupedTables.sort((a, b) => {
+    const sortedTables = dedupedTables.toSorted((a, b) => {
       return a.name.localeCompare(b.name);
     });
 
@@ -83,7 +83,7 @@ const {
       if (!table.variable_name) {
         return true;
       }
-      return names.has(table.variable_name as VariableName);
+      return names.has(table.variable_name);
     });
     return { ...state, tables };
   },

@@ -7,12 +7,15 @@ and websocket for bidirectional communication.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+import asyncio
+import contextlib
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from marimo import _loggers
 from marimo._cli.sandbox import SandboxMode
 from marimo._config.manager import MarimoConfigManager, ScriptConfigManager
+from marimo._messaging.notebook.document import NotebookDocument
 from marimo._messaging.notification import (
     NotificationMessage,
 )
@@ -29,6 +32,7 @@ from marimo._runtime.commands import (
 from marimo._session.consumer import SessionConsumer
 from marimo._session.events import SessionEventBus
 from marimo._session.extensions.extensions import (
+    CacheMode,
     CachingExtension,
     HeartbeatExtension,
     LoggingExtension,
@@ -37,7 +41,11 @@ from marimo._session.extensions.extensions import (
     ReplayExtension,
     SessionViewExtension,
 )
-from marimo._session.extensions.types import SessionExtension
+from marimo._session.extensions.types import (
+    ExtensionRegistry,
+    SessionExtension,
+)
+from marimo._session.kernel_exit import classify_kernel_exit
 from marimo._session.managers import (
     KernelManagerImpl,
     QueueManagerImpl,
@@ -47,6 +55,7 @@ from marimo._session.notebook import AppFileManager
 from marimo._session.room import Room
 from marimo._session.state.session_view import SessionView
 from marimo._session.types import (
+    KernelExitInfo,
     KernelManager,
     KernelState,
     QueueManager,
@@ -56,9 +65,11 @@ from marimo._types.ids import ConsumerId
 from marimo._utils.repr import format_repr
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
+    from marimo._runtime.virtual_file import VirtualFileStorageType
     from marimo._server.models.models import InstantiateNotebookRequest
+    from marimo._session.app_host import AppHostContext
 
 LOGGER = _loggers.marimo_logger()
 
@@ -84,12 +95,13 @@ class SessionImpl(Session):
         app_metadata: AppMetadata,
         app_file_manager: AppFileManager,
         config_manager: MarimoConfigManager,
-        virtual_files_supported: bool,
+        virtual_file_storage: VirtualFileStorageType | None,
         redirect_console_to_browser: bool,
         auto_instantiate: bool,
-        ttl_seconds: Optional[int],
+        ttl_seconds: int | None,
         extensions: list[SessionExtension] | None = None,
         sandbox_mode: SandboxMode | None = None,
+        app_host_context: AppHostContext | None = None,
     ) -> Session:
         """
         Create a new session.
@@ -103,10 +115,38 @@ class SessionImpl(Session):
         configs = app_file_manager.app.cell_manager.config_map()
 
         # Create kernel manager
-        # SandboxMode.MULTI uses IPC kernels with per-notebook sandboxed venvs
+        # AppHost path handles multi-app run mode (both sandbox and non-sandbox).
+        # SandboxMode.MULTI falls through to IPC kernels only in edit mode.
         queue_manager: QueueManager
         kernel_manager: KernelManager
-        if sandbox_mode is SandboxMode.MULTI:
+        if app_host_context is not None and mode == SessionMode.RUN:
+            from marimo._session.managers.app_host import (
+                AppHostKernelManager,
+                AppHostQueueManager,
+            )
+
+            file_path = app_file_manager.path
+            if file_path is None:
+                raise ValueError(
+                    "App host isolation requires a file-backed notebook"
+                )
+            app_host = app_host_context.pool.get_or_create(file_path)
+            queue_manager = AppHostQueueManager(
+                app_host, app_host_context.session_id
+            )
+            kernel_manager = AppHostKernelManager(
+                app_host=app_host,
+                session_id=app_host_context.session_id,
+                queue_manager=queue_manager,
+                mode=mode,
+                configs=configs,
+                app_metadata=app_metadata,
+                config_manager=config_manager,
+                redirect_console_to_browser=redirect_console_to_browser,
+            )
+        elif sandbox_mode is SandboxMode.MULTI:
+            # IPC kernel path — edit mode with sandbox
+            # (AppHostPool is never created in edit mode)
             from marimo._ipc import QueueManager as IPCQueueManager
             from marimo._session.managers import (
                 IPCKernelManagerImpl,
@@ -122,7 +162,6 @@ class SessionImpl(Session):
                 configs=configs,
                 app_metadata=app_metadata,
                 config_manager=config_manager,
-                virtual_files_supported=virtual_files_supported,
                 redirect_console_to_browser=redirect_console_to_browser,
             )
         else:
@@ -137,16 +176,26 @@ class SessionImpl(Session):
                 configs=configs,
                 app_metadata=app_metadata,
                 config_manager=config_manager,
-                virtual_files_supported=virtual_files_supported,
+                virtual_file_storage=virtual_file_storage,
                 redirect_console_to_browser=redirect_console_to_browser,
             )
+
+        if mode == SessionMode.EDIT:
+            cache_enabled = not auto_instantiate
+            cache_mode = CacheMode.READ_WRITE
+        else:
+            cache_enabled = config_manager.get_config()["runtime"].get(
+                "serve_cached_sessions_in_apps", False
+            )
+            cache_mode = CacheMode.READ
 
         extensions = [
             *(extensions or []),
             LoggingExtension(),
             HeartbeatExtension(),
             CachingExtension(
-                enabled=not auto_instantiate and mode == SessionMode.EDIT
+                enabled=cache_enabled,
+                mode=cache_mode,
             ),
             NotificationListenerExtension(
                 kernel_manager=kernel_manager, queue_manager=queue_manager
@@ -173,7 +222,7 @@ class SessionImpl(Session):
         kernel_manager: KernelManager,
         app_file_manager: AppFileManager,
         config_manager: MarimoConfigManager,
-        ttl_seconds: Optional[int],
+        ttl_seconds: int | None,
         extensions: list[SessionExtension],
     ) -> None:
         """Initialize kernel and client connection to it."""
@@ -189,7 +238,9 @@ class SessionImpl(Session):
         )
         self.session_view = SessionView()
         self.config_manager = config_manager
-        self.extensions = extensions
+        self.extensions = ExtensionRegistry()
+        self.extensions.add(*extensions)
+        self.scratchpad_lock = asyncio.Lock()
 
         self._kernel_manager.start_kernel()
         self._event_bus = SessionEventBus()
@@ -201,6 +252,19 @@ class SessionImpl(Session):
         # Connect the main consumer after attaching extensions,
         # to avoid calling on_attach on the main consumer twice.
         self.connect_consumer(session_consumer, main=True)
+
+    @property
+    def document(self) -> NotebookDocument:
+        """The notebook document this session reflects.
+
+        Derived from ``self.app_file_manager.app.cell_manager.document``
+        rather than stored, so any code path that swaps the underlying
+        ``CellManager`` or ``app`` (save round-trip, file-watch reload,
+        export reload) is automatically picked up — no rebinding needed
+        at the call sites. Read-only by design: the document's identity
+        belongs to the cell manager.
+        """
+        return self.app_file_manager.app.cell_manager.document
 
     def _attach_extensions(self) -> None:
         """Attach all extensions to the session."""
@@ -228,6 +292,21 @@ class SessionImpl(Session):
                 )
                 continue
 
+    @contextlib.contextmanager
+    def scoped(
+        self,
+        extension: SessionExtension,
+    ) -> Iterator[SessionExtension]:
+        """Attach an extension for the duration of the context."""
+        self.extensions.add(extension)
+        extension.on_attach(self, self._event_bus)
+        try:
+            yield extension
+        finally:
+            extension.on_detach()
+            if extension in self.extensions:
+                self.extensions.remove(extension)
+
     @property
     def consumers(self) -> Mapping[SessionConsumer, ConsumerId]:
         """Get the consumers in the session."""
@@ -235,12 +314,9 @@ class SessionImpl(Session):
 
     def flush_messages(self) -> None:
         """Flush any pending messages."""
-        # HACK: Ideally we don't need to reach into this extension directly
-        for extension in self.extensions:
-            if isinstance(extension, NotificationListenerExtension):
-                if extension.distributor is not None:
-                    extension.distributor.flush()
-                return
+        ext = self.extensions.get(NotificationListenerExtension)
+        if ext is not None:
+            ext.flush()
 
     async def rename_path(self, new_path: str) -> None:
         """Rename the path of the session."""
@@ -264,10 +340,20 @@ class SessionImpl(Session):
         """Get the PID of the kernel."""
         return self._kernel_manager.pid
 
+    def kernel_exit_info(self) -> KernelExitInfo | None:
+        """Describe how the kernel exited."""
+        task = self._kernel_manager.kernel_task
+        if task is None or task.is_alive():
+            return None
+        # ``exitcode`` is provided by multiprocessing.Process; threads don't
+        # have one, so we treat absence as "unknown".
+        exitcode = getattr(task, "exitcode", None)
+        return classify_kernel_exit(exitcode)
+
     def put_control_request(
         self,
         request: commands.CommandMessage,
-        from_consumer_id: Optional[ConsumerId],
+        from_consumer_id: ConsumerId | None,
     ) -> None:
         """Put a control request in the control queue."""
         self._event_bus.emit_received_command(self, request, from_consumer_id)
@@ -303,7 +389,7 @@ class SessionImpl(Session):
         an exception is raised.
         """
         # Consumers are also extensions, so we want to attach them to the session
-        self.extensions.append(session_consumer)
+        self.extensions.add(session_consumer)
         session_consumer.on_attach(self, self._event_bus)
         self.room.add_consumer(
             session_consumer,
@@ -326,13 +412,14 @@ class SessionImpl(Session):
     def notify(
         self,
         operation: NotificationMessage | KernelMessage,
-        from_consumer_id: Optional[ConsumerId],
+        from_consumer_id: ConsumerId | None,
     ) -> None:
-        """Write an operation to the session consumer and the session view."""
+        """Broadcast a notification to session consumers."""
         if isinstance(operation, bytes):
             notification = operation
         else:
             notification = serialize_kernel_message(operation)
+
         self.room.broadcast(notification, except_consumer=from_consumer_id)
         self._event_bus.emit_notification_sent(self, notification)
 
@@ -357,16 +444,15 @@ class SessionImpl(Session):
         self,
         request: InstantiateNotebookRequest,
         *,
-        http_request: Optional[HTTPRequest],
+        http_request: HTTPRequest | None,
     ) -> None:
         """Instantiate the app."""
+        app = self.app_file_manager.app
 
         # If codes are provided, use them instead of the file codes
         # This is used when the frontend has local edits that should be
         # used instead of the stored file (e.g. local editing before connecting).
-        codes = (
-            request.codes or self.app_file_manager.app.cell_manager.code_map()
-        )
+        codes = request.codes or app.cell_manager.code_map()
 
         execution_requests = tuple(
             ExecuteCellCommand(
@@ -380,6 +466,7 @@ class SessionImpl(Session):
         self.put_control_request(
             CreateNotebookCommand(
                 execution_requests=execution_requests,
+                cell_ids=tuple(app.cell_manager.cell_ids()),
                 set_ui_element_value_request=UpdateUIElementCommand(
                     object_ids=request.object_ids,
                     values=request.values,

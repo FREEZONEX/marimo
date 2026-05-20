@@ -5,14 +5,15 @@ import asyncio
 import os
 import sys
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Literal, Optional, cast
+from functools import cached_property
+from typing import TYPE_CHECKING, Literal, cast
 
 from marimo import _loggers
 from marimo._ast.app import InternalApp
 from marimo._ast.errors import CycleError, MultipleDefinitionError
 from marimo._ast.load import load_app
 from marimo._cli.print import echo
-from marimo._config.config import RuntimeConfig
+from marimo._config.config import DisplayConfig, RuntimeConfig
 from marimo._config.manager import (
     get_default_config_manager,
 )
@@ -28,28 +29,54 @@ from marimo._messaging.serde import deserialize_kernel_message
 from marimo._messaging.types import KernelMessage
 from marimo._output.hypertext import patch_html_for_non_interactive_output
 from marimo._runtime.commands import AppMetadata, SerializedCLIArgs
+from marimo._runtime.patches import extract_docstring_from_header
 from marimo._schemas.serialization import NotebookSerialization
+from marimo._server.export._status import emit_pdf_export_status
 from marimo._server.export.exporter import Exporter
-from marimo._server.file_router import AppFileRouter
-from marimo._server.models.export import ExportAsHTMLRequest
+from marimo._server.models.export import (
+    ExportAsHTMLRequest,
+    ExportPDFPreset,
+)
 from marimo._server.models.models import InstantiateNotebookRequest
 from marimo._session.model import ConnectionState, SessionMode
-from marimo._session.notebook import AppFileManager
+from marimo._session.notebook import AppFileManager, load_notebook
 from marimo._types.ids import ConsumerId
+from marimo._utils.inline_script_metadata import (
+    pin_pep723_dependencies_for_wasm,
+)
 from marimo._utils.marimo_path import MarimoPath
 
 LOGGER = _loggers.marimo_logger()
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from marimo._server.export._pdf_raster import PDFRasterizationOptions
+    from marimo._server.export._status import PDFExportStatusCallback
     from marimo._session.state.session_view import SessionView
     from marimo._session.types import Session
+    from marimo._types.ids import CellId_t
 
 
 @dataclass
 class ExportResult:
-    contents: str
+    contents: bytes | str
     download_filename: str
     did_error: bool
+
+    @cached_property
+    def bytez(self) -> bytes:
+        """Return UTF-8 encoded bytes (cached)."""
+        if isinstance(self.contents, bytes):
+            return self.contents
+        return self.contents.encode("utf-8")
+
+    @cached_property
+    def text(self) -> str:
+        """Return UTF-8 decoded text (cached)."""
+        if isinstance(self.contents, str):
+            return self.contents
+        return self.contents.decode("utf-8")
 
 
 def _as_ir(path: MarimoPath) -> NotebookSerialization:
@@ -90,7 +117,7 @@ def export_as_ipynb(
     app = load_app(path.absolute_name)
     if app is None:
         return ExportResult(
-            contents="",
+            contents=b"",
             download_filename=get_download_filename(path.short_name, "ipynb"),
             did_error=True,
         )
@@ -125,12 +152,12 @@ def export_as_wasm(
     path: MarimoPath,
     mode: Literal["edit", "run"],
     show_code: bool,
-    asset_url: Optional[str] = None,
+    asset_url: str | None = None,
 ) -> ExportResult:
     _app = load_app(path.absolute_name)
     if _app is None:
         return ExportResult(
-            contents="",
+            contents=b"",
             download_filename=get_download_filename(
                 path.short_name, "wasm.html"
             ),
@@ -157,16 +184,28 @@ def export_as_wasm(
     )
 
 
+def notebook_uses_slides_layout(filepath: MarimoPath) -> bool:
+    """Return whether a notebook declares the slides layout."""
+    try:
+        file_manager = load_notebook(filepath.absolute_name)
+        layout_config = file_manager.read_layout_config()
+        return layout_config is not None and layout_config.type == "slides"
+    except Exception as e:
+        LOGGER.debug(
+            "Unable to infer notebook layout for %s: %s",
+            filepath.absolute_name,
+            e,
+        )
+        return False
+
+
 async def run_app_then_export_as_ipynb(
     filepath: MarimoPath,
     sort_mode: Literal["top-down", "topological"],
     cli_args: SerializedCLIArgs,
     argv: list[str] | None,
 ) -> ExportResult:
-    file_router = AppFileRouter.from_filename(filepath)
-    file_key = file_router.get_unique_file_key()
-    assert file_key is not None
-    file_manager = file_router.get_file_manager(file_key)
+    file_manager = load_notebook(filepath.absolute_name)
 
     with patch_html_for_non_interactive_output():
         # Use quiet=True to suppress runtime stdout/stderr since outputs
@@ -190,22 +229,110 @@ async def run_app_then_export_as_ipynb(
     )
 
 
+async def run_app_then_export_as_pdf(
+    filepath: MarimoPath,
+    *,
+    include_outputs: bool,
+    webpdf: bool,
+    cli_args: SerializedCLIArgs,
+    argv: list[str] | None,
+    export_as: ExportPDFPreset | None,
+    include_inputs: bool = True,
+    rasterization_options: PDFRasterizationOptions | None = None,
+    status_callback: PDFExportStatusCallback | None = None,
+) -> tuple[bytes | None, bool]:
+    file_manager = load_notebook(filepath.absolute_name)
+
+    session_view: SessionView | None = None
+    png_fallbacks: Mapping[CellId_t, str] | None = None
+    did_error = False
+
+    if include_outputs:
+        emit_pdf_export_status(
+            status_callback,
+            phase="execute",
+            message="executing notebook...",
+        )
+        with patch_html_for_non_interactive_output():
+            # Using quiet=True to suppress runtime stdout/stderr since outputs
+            # are captured in the session_view and will be included in the PDF
+            (session_view, did_error) = await run_app_until_completion(
+                file_manager,
+                cli_args,
+                argv,
+                quiet=True,
+            )
+        emit_pdf_export_status(
+            status_callback,
+            phase="execute_complete",
+            message="notebook execution finished.",
+        )
+
+        if (
+            session_view is not None
+            and rasterization_options is not None
+            and rasterization_options.enabled
+        ):
+            from marimo._server.export._pdf_raster import (
+                collect_pdf_png_fallbacks,
+            )
+
+            png_fallbacks = await collect_pdf_png_fallbacks(
+                app=file_manager.app,
+                session_view=session_view,
+                filename=filepath.short_name,
+                filepath=filepath.absolute_name,
+                argv=argv,
+                options=rasterization_options,
+                status_callback=status_callback,
+            )
+    emit_pdf_export_status(
+        status_callback,
+        phase="prepare",
+        message="serializing notebook for PDF rendering...",
+    )
+    exporter = Exporter()
+    if export_as == "slides":
+        pdf_data = await exporter.export_as_slides_pdf(
+            app=file_manager.app,
+            session_view=session_view,
+            png_fallbacks=png_fallbacks,
+            include_inputs=include_inputs,
+            status_callback=status_callback,
+        )
+    else:
+        pdf_data = exporter.export_as_pdf(
+            app=file_manager.app,
+            session_view=session_view,
+            png_fallbacks=png_fallbacks,
+            include_inputs=include_inputs,
+            webpdf=webpdf,
+            status_callback=status_callback,
+        )
+    if pdf_data is not None:
+        emit_pdf_export_status(
+            status_callback,
+            phase="complete",
+            message="done.",
+        )
+    return pdf_data, did_error
+
+
 async def run_app_then_export_as_html(
     path: MarimoPath,
     include_code: bool,
     cli_args: SerializedCLIArgs,
     argv: list[str],
+    *,
+    asset_url: str | None = None,
 ) -> ExportResult:
-    # Create a file router and file manager
-    file_router = AppFileRouter.from_filename(path)
-    file_key = file_router.get_unique_file_key()
-    assert file_key is not None
-    file_manager = file_router.get_file_manager(file_key)
+    file_manager = load_notebook(path.absolute_name)
 
     # Inline the layout file, if it exists
     file_manager.app.inline_layout_file()
 
     config = get_default_config_manager(current_path=file_manager.path)
+    display_config = cast(DisplayConfig, config.get_config()["display"])
     session_view, did_error = await run_app_until_completion(
         file_manager,
         cli_args,
@@ -216,17 +343,114 @@ async def run_app_then_export_as_html(
         filename=file_manager.filename,
         app=file_manager.app,
         session_view=session_view,
-        display_config=config.get_config()["display"],
+        display_config=display_config,
         request=ExportAsHTMLRequest(
             include_code=include_code,
             download=False,
             files=[],
+            asset_url=asset_url,
         ),
     )
     return ExportResult(
         contents=html,
         download_filename=filename,
         did_error=did_error,
+    )
+
+
+async def run_app_then_export_as_wasm(
+    path: MarimoPath,
+    mode: Literal["edit", "run"],
+    show_code: bool,
+    cli_args: SerializedCLIArgs,
+    argv: list[str],
+    *,
+    asset_url: str | None = None,
+) -> ExportResult:
+    """Execute notebook and export as WASM HTML with embedded session."""
+    from marimo._session.state.serialize import (
+        serialize_notebook,
+        serialize_session_view,
+    )
+
+    file_manager = load_notebook(path.absolute_name)
+    file_manager.app.inline_layout_file()
+
+    config = get_default_config_manager(current_path=file_manager.path)
+    display_config = cast(DisplayConfig, config.get_config()["display"])
+
+    session_view, did_error = await run_app_until_completion(
+        file_manager,
+        cli_args,
+        argv=argv,
+    )
+
+    session_snapshot = serialize_session_view(
+        session_view,
+        cell_ids=file_manager.app.cell_manager.cell_ids(),
+        drop_virtual_file_outputs=True,
+    )
+    notebook_snapshot = serialize_notebook(
+        session_view, file_manager.app.cell_manager
+    )
+
+    code = pin_pep723_dependencies_for_wasm(file_manager.app.to_py(), path)
+
+    html, filename = Exporter().export_as_wasm(
+        filename=file_manager.filename,
+        app=file_manager.app,
+        display_config=display_config,
+        code=code,
+        mode=mode,
+        show_code=show_code,
+        asset_url=asset_url,
+        session_snapshot=session_snapshot,
+        notebook_snapshot=notebook_snapshot,
+    )
+    return ExportResult(
+        contents=html,
+        download_filename=filename,
+        did_error=did_error,
+    )
+
+
+async def export_as_html_without_execution(
+    path: MarimoPath,
+    include_code: bool,
+    *,
+    asset_url: str | None = None,
+) -> ExportResult:
+    """Export a notebook to HTML without executing its cells."""
+    from marimo._session.state.session_view import SessionView
+
+    file_manager = load_notebook(path.absolute_name)
+
+    # Inline the layout file, if it exists.
+    file_manager.app.inline_layout_file()
+
+    view = SessionView()
+    for cell_data in file_manager.app.cell_manager.cell_data():
+        view.last_executed_code[cell_data.cell_id] = cell_data.code
+
+    config = get_default_config_manager(current_path=file_manager.path)
+    display_config = cast(DisplayConfig, config.get_config()["display"])
+
+    html, filename = Exporter().export_as_html(
+        filename=file_manager.filename,
+        app=file_manager.app,
+        session_view=view,
+        display_config=display_config,
+        request=ExportAsHTMLRequest(
+            include_code=include_code,
+            download=False,
+            files=[],
+            asset_url=asset_url,
+        ),
+    )
+    return ExportResult(
+        contents=html,
+        download_filename=filename,
+        did_error=False,
     )
 
 
@@ -255,6 +479,7 @@ async def run_app_until_completion(
     cli_args: SerializedCLIArgs,
     argv: list[str] | None,
     quiet: bool = False,
+    persist_session: bool = True,
 ) -> tuple[SessionView, bool]:
     from marimo._session.consumer import SessionConsumer
     from marimo._session.events import SessionEventBus
@@ -351,10 +576,13 @@ async def run_app_until_completion(
             cli_args=cli_args,
             argv=argv,
             app_config=file_manager.app.config,
+            docstring=extract_docstring_from_header(
+                file_manager.app._app._header
+            ),
         ),
         app_file_manager=file_manager,
         config_manager=config_manager,
-        virtual_files_supported=False,
+        virtual_file_storage=None,
         redirect_console_to_browser=False,
         ttl_seconds=None,
         auto_instantiate=True,
@@ -376,6 +604,25 @@ async def run_app_until_completion(
     # Hack: yield to give the session view a chance to process the incoming
     # console operations.
     await asyncio.sleep(0.1)
+
+    if persist_session:
+        from marimo._server.export._session_cache import (
+            persist_session_view_to_cache,
+        )
+
+        try:
+            persist_session_view_to_cache(
+                view=session.session_view,
+                notebook_path=file_manager.path,
+                cell_ids=file_manager.app.cell_manager.cell_ids(),
+            )
+        except Exception as e:
+            LOGGER.warning(
+                "Failed to persist session snapshot for %s: %s",
+                file_manager.path,
+                e,
+            )
+
     # Stop distributor, terminate kernel process, etc -- all information is
     # captured by the session view.
     session.close()

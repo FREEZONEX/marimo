@@ -5,10 +5,10 @@ import json
 import os
 import urllib.error
 from datetime import datetime
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, cast
 
-import marimo._utils.requests as requests
 from marimo import _loggers
+from marimo._cli.install_hints import get_upgrade_commands
 from marimo._cli.print import echo, green, orange
 from marimo._config.cli_state import (
     MarimoCLIState,
@@ -16,7 +16,11 @@ from marimo._config.cli_state import (
     write_cli_state,
 )
 from marimo._tracer import server_tracer
+from marimo._utils import requests
 from marimo._version import __version__ as current_version
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 FETCH_TIMEOUT = 3
 
@@ -26,8 +30,14 @@ LOGGER = _loggers.marimo_logger()
 def print_latest_version(current_version: str, state: MarimoCLIState) -> None:
     message = f"Update available {current_version} → {state.latest_version}"
     echo(orange(message))
-    install_cmd = "uv add" if _is_in_uv() else "pip install"
-    echo(f"Run {green(f'{install_cmd} --upgrade marimo')} to upgrade.")
+    upgrade_commands = get_upgrade_commands("marimo")
+    if upgrade_commands:
+        if len(upgrade_commands) == 1:
+            echo(f"Run {green(upgrade_commands[0])} to upgrade.")
+        else:
+            primary_command = green(upgrade_commands[0])
+            fallback_command = green(upgrade_commands[1])
+            echo(f"Run {primary_command} or {fallback_command} to upgrade.")
 
     if state.notices:
         echo()
@@ -36,15 +46,6 @@ def print_latest_version(current_version: str, state: MarimoCLIState) -> None:
             echo(f"• {notice}")
 
     echo()
-
-
-def _is_in_uv() -> bool:
-    try:
-        import psutil
-    except Exception:
-        # No warning, since this is just used for cosmetics.
-        return False
-    return psutil.Process(os.getppid()).name() == "uv"
 
 
 @server_tracer.start_as_current_span("check_for_updates")
@@ -56,7 +57,6 @@ def check_for_updates(
     except Exception as e:
         LOGGER.warning("Failed to check for updates", exc_info=e)
         # Don't want to crash the CLI on any errors.
-        pass
 
 
 def _check_for_updates_internal(
@@ -179,10 +179,9 @@ def update_notices(response: dict[str, Any]) -> list[str]:
             break
 
         # Add notice if version is greater than current but <= latest
-        if current_ver < notice_version <= latest_ver:
-            if notice_text:
-                collected_notices.insert(
-                    0, notice_text
-                )  # Add to front (reverse order)
+        if current_ver < notice_version <= latest_ver and notice_text:
+            collected_notices.insert(
+                0, notice_text
+            )  # Add to front (reverse order)
 
     return collected_notices

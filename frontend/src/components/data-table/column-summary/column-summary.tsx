@@ -45,6 +45,7 @@ export const TableColumnSummary = <TData, TValue>({
         <Suspense fallback={skeleton}>
           <LazyVegaEmbed
             spec={spec}
+            data-container-width="container"
             options={{
               width: 80,
               height: 30,
@@ -74,7 +75,7 @@ export const TableColumnSummary = <TData, TValue>({
   };
 
   const renderStats = () => {
-    if (!stats) {
+    if (!stats || type === undefined) {
       return null;
     }
 

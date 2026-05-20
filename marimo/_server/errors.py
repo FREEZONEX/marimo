@@ -35,10 +35,7 @@ def _is_api_request(request: Request) -> bool:
 
     # Check Accept header for application/json (case-insensitive)
     accept = request.headers.get("accept", "")
-    if "application/json" in accept.lower():
-        return True
-
-    return False
+    return "application/json" in accept.lower()
 
 
 # Convert exceptions to JSON responses
@@ -88,17 +85,23 @@ async def handle_error(request: Request, response: Any) -> Any:
             ):
                 if isinstance(response, ManyModulesNotFoundError):
                     packages = response.package_names
+                    source = response.source
                 elif isinstance(response, ModuleNotFoundError):
                     if not response.name:
                         return JSONResponse(
                             {"detail": str(response)}, status_code=500
                         )
                     packages = [response.name]
+                    source = "server"
+                # TODO(dmadisetti): Consider checking if the server is in a virtual environment
+                # and if so, set isolated to False.
+                isolated = True if source == "server" else is_python_isolated()
                 send_message_to_consumer(
                     session=session,
                     operation=MissingPackageAlertNotification(
                         packages=packages,
-                        isolated=is_python_isolated(),
+                        isolated=isolated,
+                        source=source,
                     ),
                     consumer_id=ConsumerId(session_id),
                 )

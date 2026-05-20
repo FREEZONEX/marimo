@@ -2,14 +2,25 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from marimo import _loggers
 from marimo._ast import load
 from marimo._ast.app import App, InternalApp
 from marimo._ast.app_config import overloads_from_env
 from marimo._ast.cell import CellConfig
+from marimo._messaging.notebook.changes import (
+    CreateCell,
+    DeleteCell,
+    DocumentChange,
+    ReorderCells,
+    SetCode,
+    SetConfig,
+    SetName,
+    Transaction,
+)
 from marimo._runtime.layout.layout import (
     LayoutConfig,
     read_layout_config,
@@ -25,10 +36,15 @@ from marimo._session.notebook.storage import (
 from marimo._types.ids import CellId_t
 from marimo._utils.http import HTTPException, HTTPStatus
 from marimo._utils.marimo_path import MarimoPath
+from marimo._utils.scripts import with_python_version_requirement
 
 LOGGER = _loggers.marimo_logger()
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from marimo._ast.cell_manager import CellManager
+    from marimo._messaging.notebook.document import NotebookCell
     from marimo._server.models.models import (
         CopyNotebookRequest,
         SaveNotebookRequest,
@@ -53,10 +69,10 @@ class AppFileManager:
 
     def __init__(
         self,
-        filename: Optional[str | Path],
+        filename: str | Path | None,
         *,
-        storage: Optional[StorageInterface] = None,
-        defaults: Optional[AppDefaults] = None,
+        storage: StorageInterface | None = None,
+        defaults: AppDefaults | None = None,
     ) -> None:
         self._filename = _maybe_path(filename)
 
@@ -69,65 +85,96 @@ class AppFileManager:
         self.app = self._load_app(self.path)
 
         # Track the last saved content to avoid reloading our own writes
-        self._last_saved_content: Optional[str] = None
+        self._last_saved_content: str | None = None
+
+        # Serializes concurrent writers. Reentrant so public entry points
+        # can wrap the full "mutate app + _save_file" sequence while
+        # ``_save_file`` re-acquires for any direct caller.
+        self._save_lock = threading.RLock()
+        # Foreground writes supersede queued autosaves.
+        self._autosave_generation = 0
 
     @property
-    def filename(self) -> Optional[str]:
+    def filename(self) -> str | None:
         """Get the current filename as a Path object."""
         return str(self._filename) if self._filename is not None else None
 
     @filename.setter
-    def filename(self, value: Optional[str | Path]) -> None:
+    def filename(self, value: str | Path | None) -> None:
         """Set the filename, automatically converting strings to Path objects."""
         self._filename = _maybe_path(value)
 
     @staticmethod
-    def from_app(app: InternalApp) -> AppFileManager:
+    def from_app(
+        app: InternalApp,
+        filename: str | Path | None = None,
+    ) -> AppFileManager:
         """Create AppFileManager from an existing InternalApp.
 
         Args:
             app: The internal app to wrap
+            filename: Optional source path for the notebook. When set,
+                ``AppMetadata.filename`` (and therefore ``__file__`` /
+                ``mo.notebook_dir()`` inside cells) resolves to the source
+                file rather than the host process's ``__main__``.
 
         Returns:
             AppFileManager instance
         """
         manager = AppFileManager(None)
+        # Snapshot to an absolute path at assignment time so a later
+        # ``chdir`` cannot change which file ``self.path`` resolves to.
+        manager.filename = (
+            os.path.abspath(str(filename)) if filename is not None else None
+        )
         manager.app = app
         return manager
 
-    def reload(self) -> set[CellId_t]:
+    def reload(self) -> tuple[Transaction, set[CellId_t]]:
         """Reload the app from storage.
 
-        Detects changes by comparing cell IDs and code between the previous
-        and newly loaded versions.
+        Splices the existing ``CellManager`` into the freshly loaded
+        ``InternalApp`` so ``app.cell_manager`` and
+        ``app.cell_manager.document`` identity is preserved across reload.
+        The diff between old and new state is applied to the existing
+        document via ``apply()``, which advances ``_version`` monotonically
+        and stamps the returned transaction.
 
         Returns:
-            Set of cell IDs that were added, deleted, or modified
+            ``(transaction, changed_cell_ids)``. ``transaction`` is
+            stamped with the post-apply document version and is suitable
+            for broadcasting to consumers. ``changed_cell_ids`` are the
+            ids whose code, name, or config changed, plus all created
+            and deleted ids (reorder-only is excluded).
         """
-        prev_cell_manager = self.app.cell_manager
+        current_cell_manager = self.app.cell_manager
         new_app = self._load_app(self.path)
-        new_app.cell_manager.sort_cell_ids_by_similarity(prev_cell_manager)
-        # Only update self.app after successful reload
+        new_app.cell_manager.sort_cell_ids_by_similarity(current_cell_manager)
+
+        transaction, changed_cell_ids = _build_transaction(
+            prev=current_cell_manager, new=new_app.cell_manager
+        )
+        transaction = current_cell_manager.document.apply(transaction)
+
+        # Carry over CellManager state that NotebookDocument doesn't track.
+        # clear()+update() preserves dict identity, matching the invariant
+        # established by CellManager._replace_state_from.
+        current_cell_manager._compiled_cells.clear()
+        current_cell_manager._compiled_cells.update(
+            new_app.cell_manager._compiled_cells
+        )
+        current_cell_manager.unparsable = new_app.cell_manager.unparsable
+        current_cell_manager._cell_id_generator.seen_ids |= (
+            new_app.cell_manager._cell_id_generator.seen_ids
+        )
+
+        # Splice the preserved cell_manager into new_app, then swap the
+        # wrapper. App-level fields (_config, _header, _filename,
+        # _unparsable) come along automatically — no field enumeration.
+        new_app._app._cell_manager = current_cell_manager
         self.app = new_app
 
-        # Return the changed cell IDs
-        prev_cell_ids = set(prev_cell_manager.cell_ids())
-        current_cell_ids = set(self.app.cell_manager.cell_ids())
-
-        # Capture deleted cells
-        changed_cell_ids: set[CellId_t] = prev_cell_ids - current_cell_ids
-
-        # Check for added or modified cells
-        for cell_id in current_cell_ids:
-            if cell_id not in prev_cell_ids:
-                changed_cell_ids.add(cell_id)
-            else:
-                new_code = self.app.cell_manager.get_cell_code(cell_id)
-                prev_code = prev_cell_manager.get_cell_code(cell_id)
-                if new_code != prev_code:
-                    changed_cell_ids.add(cell_id)
-
-        return changed_cell_ids
+        return transaction, changed_cell_ids
 
     def _is_same_path(self, path: Path) -> bool:
         """Check if the given path is the same as the current filename.
@@ -163,9 +210,11 @@ class AppFileManager:
         *,
         notebook: NotebookSerializationV1,
         persist: bool,
-        previous_path: Optional[Path] = None,
+        previous_path: Path | None = None,
     ) -> str:
         """Save notebook to storage using appropriate format handler.
+
+        All file writes go through this method under ``_save_lock``.
 
         Args:
             path: Target file path
@@ -178,48 +227,55 @@ class AppFileManager:
         """
         LOGGER.debug("Saving app to %s", path)
 
-        # Get the header in case it was modified by the user (e.g. package installation)
-        handler = get_notebook_serializer(path)
-        header: Optional[str] = None
-        if previous_path and previous_path.exists():
-            header = handler.extract_header(previous_path)
-        elif path.exists():
-            header = handler.extract_header(path)
+        with self._save_lock:
+            # Get the header in case it was modified by the user (e.g. package installation)
+            handler = get_notebook_serializer(path)
+            header: str | None = None
+            if previous_path and previous_path.exists():
+                header = handler.extract_header(previous_path)
+            elif path.exists():
+                header = handler.extract_header(path)
 
-        # For new .py files in sandbox mode, generate header with marimo
-        if header is None and str(path).endswith(".py"):
-            from marimo._config.settings import GLOBAL_SETTINGS
+            # For new .py files in sandbox mode, generate header with marimo
+            if header is None and str(path).endswith(".py"):
+                from marimo._config.settings import GLOBAL_SETTINGS
 
-            if GLOBAL_SETTINGS.MANAGE_SCRIPT_METADATA:
-                from marimo._utils.scripts import write_pyproject_to_script
+                if GLOBAL_SETTINGS.MANAGE_SCRIPT_METADATA:
+                    from marimo._utils.scripts import (
+                        write_pyproject_to_script,
+                    )
 
-                header = write_pyproject_to_script(
-                    {"dependencies": ["marimo"]}
-                )
+                    header = write_pyproject_to_script(
+                        with_python_version_requirement(
+                            {
+                                "dependencies": ["marimo"],
+                            }
+                        )
+                    )
 
-        # Rewrap with header if relevant and set filename.
-        notebook = NotebookSerializationV1(
-            app=notebook.app,
-            header=Header(value=header) if header else notebook.header,
-            cells=notebook.cells,
-            violations=notebook.violations,
-            valid=notebook.valid,
-            filename=str(path),
-        )
-        contents = handler.serialize(notebook)
+            # Rewrap with header if relevant and set filename.
+            notebook = NotebookSerializationV1(
+                app=notebook.app,
+                header=Header(value=header) if header else notebook.header,
+                cells=notebook.cells,
+                violations=notebook.violations,
+                valid=notebook.valid,
+                filename=str(path),
+            )
+            contents = handler.serialize(notebook)
 
-        if persist:
-            self.storage.write(path, contents)
-            # Record the last saved content to avoid reloading our own writes
-            self._last_saved_content = contents.strip()
+            if persist:
+                self.storage.write(path, contents)
+                # Record the last saved content to avoid reloading our own writes
+                self._last_saved_content = contents.strip()
 
-        # If this is a new unnamed notebook, update the filename
-        if self._is_unnamed():
-            self._filename = path
+            # If this is a new unnamed notebook, update the filename
+            if self._is_unnamed():
+                self._filename = path
 
-        return contents
+            return contents
 
-    def _load_app(self, path: Optional[str]) -> InternalApp:
+    def _load_app(self, path: str | None) -> InternalApp:
         """Load app from storage.
 
         Args:
@@ -274,31 +330,33 @@ class AppFileManager:
         """
         new_path = Path(canonicalize_filename(str(new_filename)))
 
-        if self._is_same_path(new_path):
+        with self._save_lock:
+            if self._is_same_path(new_path):
+                return new_path.name
+
+            self._assert_path_does_not_exist(new_path)
+            self._invalidate_autosaves()
+
+            if self._filename is not None:
+                self.storage.rename(self._filename, new_path)
+            else:
+                # Create new file for unnamed notebooks
+                self.storage.write(new_path, "")
+
+            previous_filename = self._filename
+            self._filename = new_path
+            self.app._app._filename = str(new_path)
+
+            self._save_file(
+                new_path,
+                notebook=self.app.to_ir(),
+                persist=True,
+                previous_path=previous_filename,
+            )
+
             return new_path.name
 
-        self._assert_path_does_not_exist(new_path)
-
-        if self._filename is not None:
-            self.storage.rename(self._filename, new_path)
-        else:
-            # Create new file for unnamed notebooks
-            self.storage.write(new_path, "")
-
-        previous_filename = self._filename
-        self._filename = new_path
-        self.app._app._filename = str(new_path)
-
-        self._save_file(
-            new_path,
-            notebook=self.app.to_ir(),
-            persist=True,
-            previous_path=previous_filename,
-        )
-
-        return new_path.name
-
-    def read_layout_config(self) -> Optional[LayoutConfig]:
+    def read_layout_config(self) -> LayoutConfig | None:
         """Read layout configuration file.
 
         Returns:
@@ -311,7 +369,7 @@ class AppFileManager:
 
         return None
 
-    def read_css_file(self) -> Optional[str]:
+    def read_css_file(self) -> str | None:
         """Read custom CSS file.
 
         Returns:
@@ -322,7 +380,7 @@ class AppFileManager:
             return None
         return self.storage.read_related_file(self._filename, css_file)
 
-    def read_html_head_file(self) -> Optional[str]:
+    def read_html_head_file(self) -> str | None:
         """Read custom HTML head file.
 
         Returns:
@@ -334,7 +392,7 @@ class AppFileManager:
         return self.storage.read_related_file(self._filename, html_head_file)
 
     @property
-    def path(self) -> Optional[str]:
+    def path(self) -> str | None:
         """Get absolute path to notebook file as string.
 
         Returns:
@@ -353,14 +411,16 @@ class AppFileManager:
         Returns:
             Serialized notebook content
         """
-        self.app.update_config(config)
-        if self._filename is not None:
-            return self._save_file(
-                self._filename,
-                notebook=self.app.to_ir(),
-                persist=True,
-            )
-        return ""
+        with self._save_lock:
+            self.app.update_config(config)
+            if self._filename is not None:
+                self._invalidate_autosaves()
+                return self._save_file(
+                    self._filename,
+                    notebook=self.app.to_ir(),
+                    persist=True,
+                )
+            return ""
 
     def save(self, request: SaveNotebookRequest) -> str:
         """Save the notebook.
@@ -385,37 +445,94 @@ class AppFileManager:
 
         filename_path = Path(canonicalize_filename(filename))
 
-        # Update app with new cell data
-        self.app.with_data(
-            cell_ids=cell_ids,
-            codes=codes,
-            names=names,
-            configs=configs,
-        )
+        with self._save_lock:
+            # Update app with new cell data
+            self.app.with_data(
+                cell_ids=cell_ids,
+                codes=codes,
+                names=names,
+                configs=configs,
+            )
 
-        if self.is_notebook_named and not self._is_same_path(filename_path):
+            if self.is_notebook_named and not self._is_same_path(
+                filename_path
+            ):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="Save handler cannot rename files.",
+                )
+
+            # Save layout if provided
+            if layout is not None:
+                app_dir = filename_path.parent
+                app_name = filename_path.name
+                layout_filename = save_layout_config(
+                    app_dir, app_name, LayoutConfig(**layout)
+                )
+                self.app.update_config({"layout_file": layout_filename})
+            else:
+                # Remove the layout from the config
+                self.app.update_config({"layout_file": None})
+
+            if request.persist:
+                self._invalidate_autosaves()
+            return self._save_file(
+                filename_path,
+                notebook=self.app.to_ir(),
+                persist=request.persist,
+            )
+
+    def capture_autosave_target(self) -> tuple[Path | None, int]:
+        with self._save_lock:
+            return self._filename, self._autosave_generation
+
+    def save_from_cells(
+        self,
+        cells: Sequence[NotebookCell],
+        *,
+        expected_filename: Path | None = None,
+        expected_generation: int | None = None,
+    ) -> str:
+        """Persist the notebook from a snapshot of document cells.
+
+        Used by the server-side auto-save path for ``code_mode``
+        mutations. Unlike ``save()``, this takes cells directly — the
+        caller is responsible for snapshotting ``session.document.cells``
+        on a thread where the document is quiescent.
+
+        Raises:
+            HTTPException: If the notebook is unnamed or the write fails
+        """
+        if self._filename is None:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST,
-                detail="Save handler cannot rename files.",
+                detail="Cannot save an unnamed notebook",
             )
 
-        # Save layout if provided
-        if layout is not None:
-            app_dir = filename_path.parent
-            app_name = filename_path.name
-            layout_filename = save_layout_config(
-                app_dir, app_name, LayoutConfig(**layout)
-            )
-            self.app.update_config({"layout_file": layout_filename})
-        else:
-            # Remove the layout from the config
-            self.app.update_config({"layout_file": None})
+        with self._save_lock:
+            if expected_generation is not None:
+                if expected_generation != self._autosave_generation:
+                    return ""
+            if expected_filename is not None:
+                if self._filename is None or not self._is_same_path(
+                    expected_filename
+                ):
+                    return ""
 
-        return self._save_file(
-            filename_path,
-            notebook=self.app.to_ir(),
-            persist=request.persist,
-        )
+            self.app.with_data(
+                cell_ids=[cell.id for cell in cells],
+                codes=[cell.code for cell in cells],
+                names=[cell.name for cell in cells],
+                configs=[cell.config for cell in cells],
+            )
+            return self._save_file(
+                self._filename,
+                notebook=self.app.to_ir(),
+                persist=True,
+            )
+
+    def _invalidate_autosaves(self) -> None:
+        self._autosave_generation += 1
 
     def copy(self, request: CopyNotebookRequest) -> str:
         """Copy a notebook file.
@@ -520,7 +637,7 @@ class AppFileManager:
             return False
 
 
-def read_css_file(css_file: str, filename: Optional[str]) -> Optional[str]:
+def read_css_file(css_file: str, filename: str | None) -> str | None:
     """Read the contents of a CSS file.
 
     Args:
@@ -556,8 +673,8 @@ def read_css_file(css_file: str, filename: Optional[str]) -> Optional[str]:
 
 
 def read_html_head_file(
-    html_head_file: str, filename: Optional[str]
-) -> Optional[str]:
+    html_head_file: str, filename: str | None
+) -> str | None:
     """Read the contents of an HTML head file.
 
     Args:
@@ -586,10 +703,69 @@ def read_html_head_file(
         return None
 
 
-def _maybe_path(path: Optional[str | Path]) -> Optional[Path]:
+def _maybe_path(path: str | Path | None) -> Path | None:
     """Convert a string or Path to a Path object."""
     if path is None:
         return None
     if isinstance(path, Path):
         return path
     return Path(path)
+
+
+def _build_transaction(
+    *, prev: CellManager, new: CellManager
+) -> tuple[Transaction, set[CellId_t]]:
+    """Diff two CellManagers, returning ``(transaction, changed_cell_ids)``.
+
+    The transaction is unstamped; the caller applies it to the document
+    (which assigns ``version``). ``changed_cell_ids`` covers code, name,
+    or config changes plus all creates and deletes — reorder-only cells
+    are excluded.
+    """
+    prev_data = {cd.cell_id: cd for cd in prev.cell_data()}
+    prev_cell_ids = list(prev.cell_ids())
+    new_cell_ids = list(new.cell_ids())
+    deleted = set(prev_data) - set(new_cell_ids)
+
+    changes: list[DocumentChange] = []
+    changed_cell_ids: set[CellId_t] = set(deleted)
+    for cid in deleted:
+        changes.append(DeleteCell(cell_id=cid))
+
+    for cd in new.cell_data():
+        prev_cd = prev_data.get(cd.cell_id)
+        if prev_cd is None:
+            changes.append(
+                CreateCell(
+                    cell_id=cd.cell_id,
+                    code=cd.code,
+                    name=cd.name,
+                    config=cd.config,
+                )
+            )
+            changed_cell_ids.add(cd.cell_id)
+            continue
+        if cd.code != prev_cd.code:
+            changes.append(SetCode(cell_id=cd.cell_id, code=cd.code))
+            changed_cell_ids.add(cd.cell_id)
+        if cd.name != prev_cd.name:
+            changes.append(SetName(cell_id=cd.cell_id, name=cd.name))
+            changed_cell_ids.add(cd.cell_id)
+        if cd.config != prev_cd.config:
+            changes.append(
+                SetConfig(
+                    cell_id=cd.cell_id,
+                    column=cd.config.column,
+                    disabled=cd.config.disabled,
+                    hide_code=cd.config.hide_code,
+                )
+            )
+            changed_cell_ids.add(cd.cell_id)
+
+    if tuple(new_cell_ids) != tuple(prev_cell_ids):
+        changes.append(ReorderCells(cell_ids=tuple(new_cell_ids)))
+
+    return (
+        Transaction(changes=tuple(changes), source="file-watch"),
+        changed_cell_ids,
+    )

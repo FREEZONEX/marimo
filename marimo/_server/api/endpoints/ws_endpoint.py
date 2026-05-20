@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any
 
 from starlette.websockets import WebSocket, WebSocketState
 
@@ -55,6 +55,9 @@ from marimo._session.model import (
 )
 from marimo._types.ids import CellId_t, ConsumerId
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 LOGGER = _loggers.marimo_logger()
 
 LORO_ALLOWED = sys.version_info >= (3, 11)
@@ -62,6 +65,9 @@ LORO_ALLOWED = sys.version_info >= (3, 11)
 router = APIRouter()
 
 DOC_MANAGER = LoroDocManager()
+
+# Strong refs so fire-and-forget tasks aren't GC'd mid-flight.
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
 @router.websocket("/ws")
@@ -161,11 +167,11 @@ class WebSocketHandler(SessionConsumer):
         self.params = params
         self.mode = mode
         self.status: ConnectionState
-        self.cancel_close_handle: Optional[asyncio.TimerHandle] = None
+        self.cancel_close_handle: asyncio.TimerHandle | None = None
         # Messages from the kernel are put in this queue
         # to be sent to the frontend
         self.message_queue: asyncio.Queue[KernelMessage]
-        self.ws_future: Optional[asyncio.Task[None]] = None
+        self.ws_future: asyncio.Task[None] | None = None
         self._consumer_id = ConsumerId(params.session_id)
 
     @property
@@ -330,12 +336,29 @@ class WebSocketHandler(SessionConsumer):
         # When the websocket is closed, we wait session.ttl_seconds before
         # closing the session. This prevents the session from being closed
         # during intermittent network issues.
-        # In RUN mode, this always applies.
+        # In RUN mode, this always applies (sessions always have a default
+        # TTL even if the manager's ttl_seconds is None).
         # In EDIT mode, this only applies when --session-ttl is explicitly set.
-        if self.manager.ttl_seconds is not None:
+        should_ttl_close = (
+            self.manager.ttl_seconds is not None
+            or self.mode == SessionMode.RUN
+        )
+        if should_ttl_close:
 
             def _close() -> None:
                 if self.status != ConnectionState.OPEN:
+                    # Guard: if another consumer has taken over, the session
+                    # is alive.
+                    live = self.manager.get_session(self.params.session_id)
+                    if (
+                        live is not None
+                        and live.connection_state() == ConnectionState.OPEN
+                    ):
+                        LOGGER.debug(
+                            "Session %s has active consumer, skipping TTL close",
+                            self.params.session_id,
+                        )
+                        return
                     LOGGER.debug(
                         "Closing session %s (TTL EXPIRED)",
                         self.params.session_id,
@@ -345,9 +368,8 @@ class WebSocketHandler(SessionConsumer):
                     cleanup_fn()
                     self.manager.close_session(self.params.session_id)
 
-            session = self.manager.get_session(self.params.session_id)
             if session is not None:
-                cancellation_handle = asyncio.get_event_loop().call_later(
+                cancellation_handle = asyncio.get_running_loop().call_later(
                     session.ttl_seconds, _close
                 )
                 self.cancel_close_handle = cancellation_handle
@@ -430,10 +452,29 @@ class WebSocketHandler(SessionConsumer):
             return False
         return True
 
+    async def _safe_close(self, code: int, reason: str) -> None:
+        """Close the WebSocket, ignoring errors from uninitialized state.
+
+        uvicorn never calls websockets' ``connection_open()``, so internal
+        attributes like ``transfer_data_task`` are missing. Closing a
+        websocket in that state raises ``AttributeError``. The connection
+        is cleaned up when the handler returns regardless.
+        """
+        try:
+            await self.websocket.close(code, reason)
+        except AttributeError as e:
+            if "transfer_data_task" not in str(e):
+                raise
+            LOGGER.debug(
+                "Ignoring AttributeError during websocket close: "
+                "missing transfer_data_task",
+                exc_info=True,
+            )
+
     async def _close_already_connected(self) -> None:
         """Close the WebSocket with an 'already connected' error."""
         if self.websocket.application_state is WebSocketState.CONNECTED:
-            await self.websocket.close(
+            await self._safe_close(
                 WebSocketCodes.ALREADY_CONNECTED,
                 "MARIMO_ALREADY_CONNECTED",
             )
@@ -445,7 +486,7 @@ class WebSocketHandler(SessionConsumer):
             text = serialize_notification_for_websocket(notification)
             await self.websocket.send_text(text)
             # Then close with simple reason
-            await self.websocket.close(
+            await self._safe_close(
                 WebSocketCodes.UNEXPECTED_ERROR,
                 "MARIMO_KERNEL_STARTUP_ERROR",
             )
@@ -453,7 +494,7 @@ class WebSocketHandler(SessionConsumer):
     def on_attach(self, session: Session, event_bus: SessionEventBus) -> None:
         del session
         del event_bus
-        return None
+        return
 
     def on_detach(self) -> None:
         # If the websocket is open, send a close message
@@ -462,11 +503,13 @@ class WebSocketHandler(SessionConsumer):
             or self.status == ConnectionState.CONNECTING
         ) and self.websocket.application_state is WebSocketState.CONNECTED
         if is_connected:
-            asyncio.create_task(
-                self.websocket.close(
+            task = asyncio.create_task(
+                self._safe_close(
                     WebSocketCodes.NORMAL_CLOSE, "MARIMO_SHUTDOWN"
                 )
             )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
         if self.ws_future:
             self.ws_future.cancel()
@@ -499,7 +542,7 @@ class WebSocketHandler(SessionConsumer):
             release_url = "https://github.com/marimo-team/marimo/releases"
 
             # Build description with notices if present
-            description = f"Check out the <a class='underline' target='_blank' href='{release_url}'>latest release on GitHub.</a>"  # noqa: E501
+            description = f"Check out the <a class='underline' target='_blank' href='{release_url}'>latest release on GitHub.</a>"
 
             if state.notices:
                 notices_text = (

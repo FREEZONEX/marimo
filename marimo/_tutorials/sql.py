@@ -2,9 +2,12 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#     "altair==6.1.0",
 #     "duckdb==1.2.2",
 #     "marimo",
+#     "matplotlib==3.10.9",
 #     "pandas==2.2.3",
+#     "plotly==6.7.0",
 #     "polars==1.27.1",
 #     "pyarrow==19.0.1",
 #     "sqlglot==26.13.0",
@@ -13,7 +16,7 @@
 
 import marimo
 
-__generated_with = "0.18.4"
+__generated_with = "0.19.7"
 app = marimo.App(width="medium")
 
 
@@ -121,8 +124,8 @@ def _(mo):
     DataFrame (if you don't). One of them must be installed in order to
     interact with the SQL result.
 
-    The SQL statement itself is an formatted string (f-string), so this
-    means they can contain any valid Python code, such as the values of UI
+    The SQL statement itself is a formatted string (f-string), which
+    means it can contain any valid Python code, such as the values of UI
     elements. This means your SQL statement and results can be reactive! 🚀
     """)
     return
@@ -139,10 +142,10 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    /// Tip | "Data sources panel"
+    /// Tip | "Variables panel"
 
-        Click the database "barrel" icon in the left toolbar to see all dataframes and in-
-        memory tables that your notebook has access to.
+        Open the variables panel in the left toolbar to see all dataframes
+        and in-memory tables that your notebook has access to.
     ///
     """)
     return
@@ -343,6 +346,7 @@ def _(mo, result, token_prefix):
         import plotly.graph_objects as go
 
         return go.Figure(data=[go.Histogram(x=result["count"])])
+
     return (render_chart,)
 
 
@@ -370,7 +374,7 @@ def _(mo):
 
     With a bit of boilerplate, you can even read and write to **Postgres**, and join Postgres tables with dataframes in the same query. For a full list of supported data sources, check out the [duckdb extensions](https://duckdb.org/docs/extensions/overview) and our [example notebook on duckdb connections](https://github.com/marimo-team/marimo/blob/main/examples/sql/duckdb_connections.**py**).
 
-    For this example, we will query an HTTP endpoint of a csv.
+    For this example, we will query an HTTP endpoint for a CSV.
     """)
     return
 
@@ -438,12 +442,14 @@ def _(filtered_cars, mo):
 def _():
     import marimo as mo
     import random
+
     return (mo,)
 
 
 @app.cell(hide_code=True)
 def _():
     import string
+
     return (string,)
 
 

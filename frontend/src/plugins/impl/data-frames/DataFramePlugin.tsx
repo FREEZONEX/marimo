@@ -1,6 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-import { isEqual } from "lodash-es";
+import { dequal as isEqual } from "dequal";
 import { Code2Icon, DatabaseIcon, FunctionSquareIcon } from "lucide-react";
 import {
   type JSX,
@@ -29,8 +29,8 @@ import { LoadingDataTableComponent, TableProviders } from "../DataTablePlugin";
 import type { DataType } from "../vega/vega-loader";
 import { TransformPanel, type TransformPanelHandle } from "./panel";
 import {
-  ConditionSchema,
-  type ConditionType,
+  FilterGroupSchema,
+  type FilterGroupType,
   columnToFieldTypesSchema,
   type Transformations,
 } from "./schema";
@@ -48,12 +48,13 @@ type TableData<T> = T[] | CsvURL;
 interface Data {
   label?: string | null;
   columns: ColumnDataTypes;
+  dataframeName?: string;
   pageSize: number;
   showDownload: boolean;
   lazy: boolean;
 }
 
-// eslint-disable-next-line @typescript-eslint/consistent-type-definitions
+// oxlint-disable-next-line typescript/consistent-type-definitions
 type PluginFunctions = {
   get_dataframe: (req: {}) => Promise<{
     url: string;
@@ -63,6 +64,7 @@ type PluginFunctions = {
     column_types_per_step: FieldTypesWithExternalType[];
     python_code?: string | null;
     sql_code?: string | null;
+    size_bytes?: number | null;
   }>;
   get_column_values: (req: { column: string }) => Promise<{
     values: unknown[];
@@ -74,12 +76,13 @@ type PluginFunctions = {
       descending: boolean;
     }[];
     query?: string;
-    filters?: ConditionType[];
+    filters?: FilterGroupType;
     page_number: number;
     page_size: number;
   }) => Promise<{
     data: TableData<T>;
     total_rows: number;
+    size_bytes?: number | null;
   }>;
   download_as: DownloadAsArgs;
 };
@@ -93,6 +96,7 @@ export const DataFramePlugin = createPlugin<S>("marimo-dataframe")
       label: z.string().nullish(),
       pageSize: z.number().default(5),
       showDownload: z.boolean().default(true),
+      dataframeName: z.string().optional(),
       columns: z
         .array(z.tuple([z.string().or(z.number()), z.string(), z.string()]))
         .transform((value) => {
@@ -116,6 +120,7 @@ export const DataFramePlugin = createPlugin<S>("marimo-dataframe")
         column_types_per_step: z.array(columnToFieldTypesSchema),
         python_code: z.string().nullish(),
         sql_code: z.string().nullish(),
+        size_bytes: z.number().nullish(),
       }),
     ),
     get_column_values: rpc.input(z.object({ column: z.string() })).output(
@@ -136,7 +141,7 @@ export const DataFramePlugin = createPlugin<S>("marimo-dataframe")
             )
             .optional(),
           query: z.string().optional(),
-          filters: z.array(ConditionSchema).optional(),
+          filters: FilterGroupSchema.optional(),
           page_number: z.number(),
           page_size: z.number(),
         }),
@@ -145,6 +150,7 @@ export const DataFramePlugin = createPlugin<S>("marimo-dataframe")
         z.object({
           data: z.union([z.string(), z.array(z.object({}).passthrough())]),
           total_rows: z.number(),
+          size_bytes: z.number().nullish(),
         }),
       ),
     download_as: DownloadAsSchema,
@@ -176,6 +182,7 @@ const EMPTY: Transformations = {
 export const DataFrameComponent = memo(
   ({
     columns,
+    dataframeName,
     pageSize,
     showDownload,
     lazy,
@@ -200,6 +207,7 @@ export const DataFrameComponent = memo(
       column_types_per_step,
       python_code,
       sql_code,
+      size_bytes,
     } = data || {};
 
     const totalColumns = field_types?.length;
@@ -319,6 +327,7 @@ export const DataFrameComponent = memo(
           data={url || ""}
           hasStableRowId={false}
           totalRows={total_rows ?? 0}
+          sizeBytes={size_bytes ?? null}
           totalColumns={totalColumns ?? 0}
           maxColumns="all"
           pageSize={pageSize}

@@ -1,10 +1,8 @@
-# Copyright 2024 Marimo. All rights reserved.
-# Tier0 Patched Version: Added namespace filtering and numeric identifier quoting
+# Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
 import os
-import re
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from marimo import _loggers
 from marimo._data.models import (
@@ -23,22 +21,8 @@ LOGGER = _loggers.marimo_logger()
 if TYPE_CHECKING:
     import duckdb
 
-
-# ============ Tier0 Patch Start ============
-def _quote_identifier(name: str) -> str:
-    """Quote identifier if it starts with a digit or contains special characters.
-
-    Tier0 Patch: Handle numeric namespace IDs like '326933050398736'
-    """
-    if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
-        return name
-    return f'"{name}"'
-
-
-# Environment variables for S3 Tables namespace filtering
 _S3TABLES_NAMESPACE = os.getenv("NAMESPACE_ID")
 _S3TABLES_DATABASE = os.getenv("S3TABLES_DATABASE", "s3tables")
-# ============ Tier0 Patch End ============
 
 
 def get_datasets_from_variables(
@@ -53,7 +37,9 @@ def get_datasets_from_variables(
     return tables
 
 
-def _get_data_table(value: object, variable_name: VariableName) -> Optional[DataTable]:
+def _get_data_table(
+    value: object, variable_name: VariableName
+) -> DataTable | None:
     try:
         table = get_table_manager_or_none(value)
         if table is None:
@@ -86,8 +72,28 @@ def _get_data_table(value: object, variable_name: VariableName) -> Optional[Data
         return None
 
 
+_SKIP_TABLES = frozenset(
+    {"duckdb_functions()", "duckdb_types()", "duckdb_settings()"}
+)
+
+# duckdb > 1.4.0 added _STATEMENT suffix to the statement types
+_STATEMENT_TYPES = frozenset(
+    {
+        "ATTACH_STATEMENT",
+        "ATTACH",
+        "DETACH_STATEMENT",
+        "DETACH",
+        "ALTER_STATEMENT",
+        "ALTER",
+        # This may catch some false positives for other CREATE statements
+        "CREATE_STATEMENT",
+        "CREATE",
+    }
+)
+
+
 def has_updates_to_datasource(query: str) -> bool:
-    import duckdb  # type: ignore[import-not-found,import-untyped,unused-ignore] # noqa: E501
+    import duckdb
 
     try:
         statements = duckdb.extract_statements(query.strip())
@@ -95,32 +101,23 @@ def has_updates_to_datasource(query: str) -> bool:
         # May not be valid SQL
         return False
 
-    return any(
-        statement.type == duckdb.StatementType.ATTACH
-        or statement.type == duckdb.StatementType.DETACH
-        or statement.type == duckdb.StatementType.ALTER
-        # This may catch some false positives for other CREATE statements
-        or statement.type == duckdb.StatementType.CREATE
-        for statement in statements
-    )
-
-
-def _get_default_connection() -> "duckdb.DuckDBPyConnection":
-    import duckdb
-
-    return duckdb.default_connection()
+    for statement in statements:
+        if statement.type.name in _STATEMENT_TYPES:
+            return True
+    return False
 
 
 def execute_duckdb_query(
-    connection: Optional[duckdb.DuckDBPyConnection], query: str
+    connection: duckdb.DuckDBPyConnection | None, query: str
 ) -> list[Any]:
-    """Execute a DuckDB query and return the result.
-
-    Tier0 Patch: Always use default_connection() so we see S3 Tables attached
-    by sitecustomize.py, even if marimo provides a different connection.
-    """
+    """Execute a DuckDB query and return the result. Uses connection if provided, otherwise uses duckdb."""
     try:
-        return _get_default_connection().execute(query).fetchall()
+        if connection is None:
+            import duckdb
+
+            return duckdb.execute(query).fetchall()
+
+        return connection.execute(query).fetchall()
     except Exception as e:
         if DependencyManager.duckdb.has():
             import duckdb
@@ -135,8 +132,8 @@ def execute_duckdb_query(
 
 
 def get_databases_from_duckdb(
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName] = None,
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None = None,
 ) -> list[Database]:
     try:
         return _get_databases_from_duckdb_internal(connection, engine_name)
@@ -146,8 +143,8 @@ def get_databases_from_duckdb(
 
 
 def _get_empty_databases(
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName],
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None,
 ) -> list[Database]:
     # Fallback to get database names from DuckDB
     all_dbs = _get_duckdb_database_names(connection)
@@ -163,8 +160,8 @@ def _get_empty_databases(
 
 
 def _get_databases_from_duckdb_internal(
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName] = None,
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None = None,
 ) -> list[Database]:
     """Get database information from DuckDB."""
     # Columns
@@ -177,7 +174,12 @@ def _get_databases_from_duckdb_internal(
     tables_result = []
     query = "SHOW ALL TABLES"
     try:
-        tables_result = _get_default_connection().execute(query).fetchall()
+        if connection is None:
+            import duckdb
+
+            tables_result = duckdb.execute(query).fetchall()
+        else:
+            tables_result = connection.execute(query).fetchall()
     except Exception as e:
         if DependencyManager.duckdb.has():
             import duckdb
@@ -204,8 +206,6 @@ def _get_databases_from_duckdb_internal(
     # databases_dict[database][schema] = [table1, table2, ...]
     databases_dict: dict[str, dict[str, list[DataTable]]] = {}
 
-    SKIP_TABLES = ["duckdb_functions()", "duckdb_types()", "duckdb_settings()"]
-
     # Bug with Iceberg catalog tables where there is a single column named "__"
     # https://github.com/marimo-team/marimo/issues/6688
     CATALOG_TABLE_COLUMN_NAME = "__"
@@ -218,30 +218,25 @@ def _get_databases_from_duckdb_internal(
         column_types,
         *_rest,
     ) in tables_result:
-        if name in SKIP_TABLES:
+        if name in _SKIP_TABLES:
             continue
-
-        # ============ Tier0 Patch Start ============
-        # Filter S3 Tables by NAMESPACE_ID environment variable
-        if _S3TABLES_NAMESPACE and database == _S3TABLES_DATABASE:
-            if schema != _S3TABLES_NAMESPACE:
-                continue  # Skip tables from other namespaces
-        # ============ Tier0 Patch End ============
+        if (
+            _S3TABLES_NAMESPACE
+            and database == _S3TABLES_DATABASE
+            and schema != _S3TABLES_NAMESPACE
+        ):
+            continue
 
         assert len(column_names) == len(column_types)
         assert isinstance(column_names, list)
         assert isinstance(column_types, list)
 
         catalog_table = (
-            len(column_names) == 1 and column_names[0] == CATALOG_TABLE_COLUMN_NAME
+            len(column_names) == 1
+            and column_names[0] == CATALOG_TABLE_COLUMN_NAME
         )
         if catalog_table:
-            # ============ Tier0 Patch Start ============
-            # Quote identifiers to handle numeric namespace IDs
-            qualified_name = (
-                f"{database}.{_quote_identifier(schema)}.{_quote_identifier(name)}"
-            )
-            # ============ Tier0 Patch End ============
+            qualified_name = f"{_quote_identifier(database)}.{_quote_identifier(schema)}.{_quote_identifier(name)}"
             columns = get_table_columns(connection, qualified_name)
         else:
             columns = [
@@ -254,6 +249,7 @@ def _get_databases_from_duckdb_internal(
                 for column_name, column_type in zip(
                     cast(list[str], column_names),
                     cast(list[str], column_types),
+                    strict=False,
                 )
             ]
 
@@ -275,11 +271,13 @@ def _get_databases_from_duckdb_internal(
 
         databases_dict[database][schema].append(table)
 
-    return form_databases_from_dict(databases_dict, connection, engine_name)
+    return form_databases_from_dict(
+        databases_dict, connection, engine_name, backfill_empty_databases=True
+    )
 
 
 def get_table_columns(
-    connection: Optional[duckdb.DuckDBPyConnection], table_name: str
+    connection: duckdb.DuckDBPyConnection | None, table_name: str
 ) -> list[DataTableColumn]:
     """Dedicated query to get columns from a table."""
     query = f"DESCRIBE TABLE {table_name}"
@@ -315,8 +313,9 @@ def get_table_columns(
 
 def form_databases_from_dict(
     databases_dict: dict[str, dict[str, list[DataTable]]],
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName],
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None,
+    backfill_empty_databases: bool,
 ) -> list[Database]:
     # Convert grouped data into Database objects
     databases: list[Database] = []
@@ -333,24 +332,25 @@ def form_databases_from_dict(
             )
         )
 
-    # There may be remaining databases not surfaced with SHOW ALL TABLES
-    # These db's likely have no tables
-    for database_name in _get_duckdb_database_names(connection):
-        if database_name not in databases_dict:
-            databases.append(
-                Database(
-                    name=database_name,
-                    dialect="duckdb",
-                    schemas=[],
-                    engine=engine_name,
+    if backfill_empty_databases:
+        # There may be remaining databases not surfaced with SHOW ALL TABLES
+        # These db's likely have no tables
+        for database_name in _get_duckdb_database_names(connection):
+            if database_name not in databases_dict:
+                databases.append(
+                    Database(
+                        name=database_name,
+                        dialect="duckdb",
+                        schemas=[],
+                        engine=engine_name,
+                    )
                 )
-            )
     return databases
 
 
 def get_duckdb_databases_agg_query(
-    connection: Optional[duckdb.DuckDBPyConnection],
-    engine_name: Optional[VariableName],
+    connection: duckdb.DuckDBPyConnection | None,
+    engine_name: VariableName | None,
 ) -> list[Database]:
     """Uses a different query to get database information, which has wider support but has some aggregation overhead"""
 
@@ -394,13 +394,6 @@ def get_duckdb_databases_agg_query(
         table_name,
         cols,
     ) in tables_result:
-        # ============ Tier0 Patch Start ============
-        # Filter S3 Tables by NAMESPACE_ID environment variable
-        if _S3TABLES_NAMESPACE and database_name == _S3TABLES_DATABASE:
-            if schema_name != _S3TABLES_NAMESPACE:
-                continue  # Skip tables from other namespaces
-        # ============ Tier0 Patch End ============
-
         columns: list[DataTableColumn] = []
         assert isinstance(cols, list)
         for col in cols:
@@ -438,11 +431,16 @@ def get_duckdb_databases_agg_query(
 
         databases_dict[database_name][schema_name].append(table)
 
-    return form_databases_from_dict(databases_dict, connection, engine_name)
+    return form_databases_from_dict(
+        databases_dict,
+        connection,
+        engine_name,
+        backfill_empty_databases=False,
+    )
 
 
 def _get_duckdb_database_names(
-    connection: Optional[duckdb.DuckDBPyConnection],
+    connection: duckdb.DuckDBPyConnection | None,
 ) -> list[str]:
     """Get database names from DuckDB. This includes internal databases and databases that have no tables."""
     # Columns
@@ -534,6 +532,7 @@ _BINARY_TYPES = {"bit", "bitstring", "binary", "varbinary", "bytea"}
 _UNKNOWN_TYPES = {
     "row",
     "geometry",
+    "inet",
     # Null type (can occur when attaching databases or with unknown column types)
     "null",
     '"null"',
@@ -552,11 +551,7 @@ def _db_type_to_data_type(db_type: str) -> DataType:
     if db_type in _INTEGER_TYPES or db_type.startswith("uint"):
         return "integer"
 
-    if (
-        db_type in _NUMERIC_TYPES
-        or db_type.startswith("decimal")
-        or db_type.startswith("float")
-    ):
+    if db_type in _NUMERIC_TYPES or db_type.startswith(("decimal", "float")):
         return "number"
 
     if db_type in _BOOLEAN_TYPES:
@@ -581,15 +576,9 @@ def _db_type_to_data_type(db_type: str) -> DataType:
         return "string"
 
     # Nested types
-    if (
-        db_type.startswith("union")
-        or db_type.startswith("map")
-        or db_type.startswith("struct")
-        or db_type.startswith("list")
-        or db_type.startswith("array")
-        or db_type.startswith("json")
-        or ("[" in db_type and "]" in db_type)
-    ):
+    if db_type.startswith(
+        ("union", "map", "struct", "list", "array", "json")
+    ) or ("[" in db_type and "]" in db_type):
         return "unknown"
 
     # Other special types
@@ -598,3 +587,16 @@ def _db_type_to_data_type(db_type: str) -> DataType:
 
     LOGGER.warning("Unknown DuckDB type: %s", db_type)
     return "unknown"
+
+
+def _quote_identifier(identifier: str) -> str:
+    """
+    Quote a DuckDB identifier with double quotes, escaping embedded double quotes.
+    This prevents errors when the identifier contains special characters which need to be escaped.
+    Eg. table.name -> "table.name"
+
+    https://duckdb.org/docs/stable/sql/dialect/keywords_and_identifiers
+    """
+    from marimo._sql.sql_quoting import quote_sql_identifier
+
+    return quote_sql_identifier(identifier, dialect="duckdb")

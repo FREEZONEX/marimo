@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -61,6 +61,116 @@ def test_navigation_restriction() -> None:
     with pytest.raises(RuntimeError) as e:
         fb._list_directory(ListDirectoryArgs(path=str(Path.cwd().parent)))
     assert "Navigation is restricted" in str(e.value)
+
+
+def test_navigation_restriction_allows_subdirectory(tmp_path: Path) -> None:
+    """Navigation within the initial directory must succeed."""
+    root = tmp_path / "root"
+    child = root / "child"
+    child.mkdir(parents=True)
+    (child / "file.txt").touch()
+
+    fb = file_browser(initial_path=root, restrict_navigation=True)
+    response = fb._list_directory(ListDirectoryArgs(path=str(child)))
+    assert isinstance(response, ListDirectoryResponse)
+    file_names = [f["name"] for f in response.files]
+    assert "file.txt" in file_names
+
+
+def test_navigation_restriction_sibling(tmp_path: Path) -> None:
+    """Sibling directories must be rejected, not just direct parents."""
+    restricted = tmp_path / "restricted"
+    sibling = tmp_path / "sibling"
+    restricted.mkdir()
+    sibling.mkdir()
+    (sibling / "secret.txt").touch()
+
+    fb = file_browser(initial_path=restricted, restrict_navigation=True)
+    with pytest.raises(RuntimeError, match="Navigation is restricted"):
+        fb._list_directory(ListDirectoryArgs(path=str(sibling)))
+
+
+def test_navigation_restriction_absolute_path(tmp_path: Path) -> None:
+    """Arbitrary absolute paths outside the root must be rejected."""
+    restricted = tmp_path / "restricted"
+    restricted.mkdir()
+
+    fb = file_browser(initial_path=restricted, restrict_navigation=True)
+    with pytest.raises(RuntimeError, match="Navigation is restricted"):
+        fb._list_directory(ListDirectoryArgs(path="/tmp"))
+
+
+def test_navigation_restriction_symlink_escape(tmp_path: Path) -> None:
+    """A symlink inside the restricted dir pointing outside must be rejected."""
+    restricted = tmp_path / "restricted"
+    restricted.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").touch()
+
+    # Symlink lives inside restricted/ but resolves outside
+    escape_link = restricted / "escape"
+    try:
+        escape_link.symlink_to(outside)
+    except OSError:
+        pytest.skip("Cannot create symlinks on this system")
+
+    fb = file_browser(initial_path=restricted, restrict_navigation=True)
+    with pytest.raises(RuntimeError, match="Navigation is restricted"):
+        fb._list_directory(ListDirectoryArgs(path=str(escape_link)))
+
+
+def test_navigation_restriction_symlink_loop(tmp_path: Path) -> None:
+    """Circular symlinks must not hang or silently succeed."""
+    restricted = tmp_path / "restricted"
+    restricted.mkdir()
+
+    link_a = restricted / "link_a"
+    link_b = restricted / "link_b"
+    try:
+        link_a.symlink_to(link_b)
+        link_b.symlink_to(link_a)
+    except OSError:
+        pytest.skip("Cannot create symlinks on this system")
+
+    fb = file_browser(initial_path=restricted, restrict_navigation=True)
+    with pytest.raises(RuntimeError, match="Navigation is restricted"):
+        fb._list_directory(ListDirectoryArgs(path=str(link_a)))
+
+
+def test_navigation_restriction_internal_symlink(tmp_path: Path) -> None:
+    """A symlink that resolves to a path inside the restricted dir is allowed."""
+    restricted = tmp_path / "restricted"
+    child = restricted / "child"
+    child.mkdir(parents=True)
+    (child / "file.txt").touch()
+
+    # Symlink inside restricted/ pointing to another subdir of restricted/
+    alias = restricted / "alias"
+    try:
+        alias.symlink_to(child)
+    except OSError:
+        pytest.skip("Cannot create symlinks on this system")
+
+    fb = file_browser(initial_path=restricted, restrict_navigation=True)
+    response = fb._list_directory(ListDirectoryArgs(path=str(alias)))
+    assert isinstance(response, ListDirectoryResponse)
+    file_names = [f["name"] for f in response.files]
+    assert "file.txt" in file_names
+
+
+def test_navigation_restriction_dotdot_escape(tmp_path: Path) -> None:
+    """Path traversal via .. components must be caught."""
+    restricted = tmp_path / "restricted"
+    sibling = tmp_path / "sibling"
+    restricted.mkdir()
+    sibling.mkdir()
+    (sibling / "secret.txt").touch()
+
+    fb = file_browser(initial_path=restricted, restrict_navigation=True)
+    traversal = str(restricted / ".." / "sibling")
+    with pytest.raises(RuntimeError, match="Navigation is restricted"):
+        fb._list_directory(ListDirectoryArgs(path=traversal))
 
 
 def test_name_method() -> None:
@@ -219,7 +329,7 @@ def test_extended_path_class(tmp_path: Path) -> None:
     assert isinstance(value[0].path, CustomPath)
 
     class CustomPathWithClient(Path):
-        def __init__(self, path: Path, client: Optional[Any] = None) -> None:
+        def __init__(self, path: Path, client: Any | None = None) -> None:
             super().__init__(path)
             self.client = client
 
@@ -950,4 +1060,33 @@ def test_file_browser_relative_path_normalization(tmp_path: Path) -> None:
 
     finally:
         # Restore original directory
+        os.chdir(original_cwd)
+
+
+def test_file_browser_relative_path_sent_to_frontend_as_absolute(
+    tmp_path: Path,
+) -> None:
+    """Test that the initial-path arg sent to the frontend is always absolute."""
+    sub_dir = tmp_path / "subdir"
+    sub_dir.mkdir()
+    (sub_dir / "file.txt").touch()
+
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+
+        for rel_path in ["subdir", "./subdir", Path("subdir")]:
+            fb = file_browser(initial_path=rel_path)
+            initial_path_arg = str(fb._component_args["initial-path"])  # pyright: ignore[reportPrivateUsage]
+            assert Path(initial_path_arg).is_absolute(), (
+                f"initial-path sent to frontend must be absolute, "
+                f"got: {initial_path_arg!r}"
+            )
+
+            # Navigating up from the initial path should work
+            parent = str(Path(initial_path_arg).parent)
+            response = fb._list_directory(ListDirectoryArgs(path=parent))  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(response, ListDirectoryResponse)
+
+    finally:
         os.chdir(original_cwd)

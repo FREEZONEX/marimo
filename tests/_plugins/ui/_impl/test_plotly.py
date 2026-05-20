@@ -1,7 +1,9 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import os
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -13,12 +15,25 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from marimo._plugins.ui._impl.plotly import (
+    _bar_value_in_selection_range,
+    _compute_waterfall_bar_extents,
     _extract_bars_fallback,
     _extract_bars_numpy,
+    _extract_box_points_fallback,
+    _extract_box_points_numpy,
+    _extract_funnel_stages_fallback,
+    _extract_funnel_stages_numpy,
     _extract_heatmap_cells_fallback,
     _extract_heatmap_cells_numpy,
+    _extract_histogram_points_fallback,
+    _extract_histogram_points_numpy,
     _extract_scatter_points_fallback,
     _extract_scatter_points_numpy,
+    _extract_violin_points_fallback,
+    _extract_violin_points_numpy,
+    _extract_waterfall_bars_fallback,
+    _extract_waterfall_bars_numpy,
+    _to_numeric_coord,
     plotly,
 )
 
@@ -339,14 +354,9 @@ def test_value_returns_points() -> None:
         "indices": [0],
     }
 
-    # _convert_value returns the points
-    # With the new line chart support, it now extracts ALL points in the x-range
+    # _convert_value should preserve Plotly's explicit point payload.
     result = plot._convert_value(selection)
-    assert len(result) == 2  # Points at x=1 and x=2
-    assert result[0]["x"] == 1
-    assert result[0]["y"] == 4
-    assert result[1]["x"] == 2
-    assert result[1]["y"] == 5
+    assert result == [{"x": 1, "y": 4}]
 
 
 def test_plotly_name() -> None:
@@ -571,9 +581,9 @@ def test_heatmap_curve_number() -> None:
     plot = plotly(fig)
 
     selection = {
-        "range": {"x": [-0.5, 1.5], "y": [-0.5, 0.5]},
-        "points": [],
-        "indices": [],
+        "range": {"x": [-0.5, 1.5], "y": [-0.5, 2.5]},
+        "points": [{"x": 1, "y": 1, "curveNumber": 0, "pointIndex": 0}],
+        "indices": [0],
     }
 
     result = plot._convert_value(selection)
@@ -764,7 +774,7 @@ def test_heatmap_numpy_and_fallback_produce_same_results() -> None:
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
     # Compare each cell
-    for np_cell, fb_cell in zip(numpy_sorted, fallback_sorted):
+    for np_cell, fb_cell in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_cell["x"] == fb_cell["x"]
         assert np_cell["y"] == fb_cell["y"]
         assert np_cell["z"] == fb_cell["z"]
@@ -857,7 +867,7 @@ def test_heatmap_numpy_and_fallback_datetime_x_axis() -> None:
     numpy_sorted = sorted(numpy_result, key=sort_key)
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
-    for np_cell, fb_cell in zip(numpy_sorted, fallback_sorted):
+    for np_cell, fb_cell in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_cell["x"] == fb_cell["x"]
         assert np_cell["y"] == fb_cell["y"]
         assert np_cell["z"] == fb_cell["z"]
@@ -916,9 +926,33 @@ def test_scatter_numpy_and_fallback_datetime_x_axis() -> None:
     numpy_sorted = sorted(numpy_result, key=sort_key)
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
-    for np_p, fb_p in zip(numpy_sorted, fallback_sorted):
+    for np_p, fb_p in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_p["x"] == fb_p["x"]
         assert np_p["y"] == fb_p["y"]
+
+
+def test_to_numeric_coord_normalizes_naive_datetimes_to_utc() -> None:
+    """Test naive datetimes align with UTC ISO strings for geometry checks."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("tzset unavailable on this platform")
+
+    original_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+
+        naive_dt = datetime(2024, 1, 2, 3, 4, 5)
+        utc_string = "2024-01-02T03:04:05Z"
+        aware_dt = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+        assert _to_numeric_coord(naive_dt) == _to_numeric_coord(utc_string)
+        assert _to_numeric_coord(naive_dt) == _to_numeric_coord(aware_dt)
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
 
 
 def test_bar_selection_datetime_x_axis() -> None:
@@ -972,7 +1006,7 @@ def test_bar_numpy_and_fallback_datetime_x_axis() -> None:
     numpy_sorted = sorted(numpy_result, key=sort_key)
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
-    for np_bar, fb_bar in zip(numpy_sorted, fallback_sorted):
+    for np_bar, fb_bar in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_bar["x"] == fb_bar["x"]
         assert np_bar["y"] == fb_bar["y"]
 
@@ -995,6 +1029,36 @@ def test_line_chart_basic() -> None:
 
     assert plot is not None
     assert plot.value == []
+
+
+def test_line_chart_click_payload() -> None:
+    """Test pure line click payload is preserved without range selection."""
+    fig = go.Figure(
+        data=go.Scatter(
+            x=[1, 2, 3, 4, 5],
+            y=[10, 20, 15, 25, 30],
+            mode="lines",
+        )
+    )
+    plot = plotly(fig)
+
+    click_payload = {
+        "points": [
+            {
+                "x": 3,
+                "y": 15,
+                "curveNumber": 0,
+                "pointNumber": 2,
+            }
+        ],
+        "indices": [2],
+    }
+
+    result = plot._convert_value(click_payload)
+
+    assert result == click_payload["points"]
+    assert plot.indices == [2]
+    assert plot.ranges == {}
 
 
 def test_line_chart_selection() -> None:
@@ -1030,6 +1094,162 @@ def test_line_chart_selection() -> None:
     assert result[2]["Y"] == 25
 
 
+def test_scattergl_line_selection() -> None:
+    """Test box selection on pure scattergl line chart."""
+    fig = go.Figure(
+        data=go.Scattergl(
+            x=[1, 2, 3, 4, 5],
+            y=[10, 20, 15, 25, 30],
+            mode="lines",
+        )
+    )
+    fig.update_xaxes(title_text="X")
+    fig.update_yaxes(title_text="Y")
+
+    plot = plotly(fig)
+
+    selection = {
+        "range": {"x": [2, 4], "y": [10, 30]},
+        "points": [],  # Empty for pure lines
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    # Should return points at x=2, 3, 4
+    assert len(result) == 3
+    assert result[0]["X"] == 2
+    assert result[0]["Y"] == 20
+    assert result[1]["X"] == 3
+    assert result[1]["Y"] == 15
+    assert result[2]["X"] == 4
+    assert result[2]["Y"] == 25
+
+
+def test_scattergl_line_uses_xy_box_filtering() -> None:
+    """Test scattergl line selection applies both x/y range filtering."""
+    fig = go.Figure(
+        data=go.Scattergl(
+            x=[1, 2, 3, 4, 5],
+            y=[10, 50, 70, 60, 30],
+            mode="lines",
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "range": {"x": [2, 4], "y": [10, 20]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert result == []
+
+
+def test_scattergl_selection_datetime_x_axis() -> None:
+    """Test scattergl line selection with datetime x-axis from frontend ISO strings."""
+    base_date = datetime(2024, 1, 1)
+    dates = [base_date + timedelta(days=i) for i in range(5)]
+    values = [10, 20, 15, 25, 30]
+
+    fig = go.Figure(data=go.Scattergl(x=dates, y=values, mode="lines"))
+    plot = plotly(fig)
+
+    selection = {
+        "range": {
+            "x": [dates[1].isoformat(), dates[3].isoformat()],
+            "y": [0, 50],
+        },
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert result[0]["x"] == dates[1]
+    assert result[0]["y"] == 20
+    assert result[1]["x"] == dates[2]
+    assert result[1]["y"] == 15
+    assert result[2]["x"] == dates[3]
+    assert result[2]["y"] == 25
+
+
+def test_scattergl_multiple_line_traces_selection() -> None:
+    """Test box selection on multiple scattergl line traces."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scattergl(
+            x=[1, 2, 3, 4],
+            y=[10, 20, 15, 25],
+            mode="lines",
+            name="Series A",
+        )
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=[1, 2, 3, 4],
+            y=[15, 10, 20, 18],
+            mode="lines",
+            name="Series B",
+        )
+    )
+    fig.update_xaxes(title_text="X")
+    fig.update_yaxes(title_text="Y")
+
+    plot = plotly(fig)
+
+    selection = {
+        "range": {"x": [2, 4], "y": [0, 30]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    # Should return 6 points total: 3 from each trace
+    assert len(result) == 6
+
+    # Check Series A points
+    series_a_points = [p for p in result if p.get("name") == "Series A"]
+    assert len(series_a_points) == 3
+    assert series_a_points[0]["X"] == 2
+    assert series_a_points[1]["X"] == 3
+    assert series_a_points[2]["X"] == 4
+
+    # Check Series B points
+    series_b_points = [p for p in result if p.get("name") == "Series B"]
+    assert len(series_b_points) == 3
+    assert series_b_points[0]["X"] == 2
+    assert series_b_points[1]["X"] == 3
+    assert series_b_points[2]["X"] == 4
+
+
+def test_marker_selection_does_not_expand_to_shared_x_values() -> None:
+    """Test marker selection preserves Plotly points for repeated x-values."""
+    fig = go.Figure(
+        data=go.Scatter(
+            x=[10, 10, 10, 30],
+            y=[10, 50, 90, 30],
+            mode="markers",
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "range": {"x": [9, 11], "y": [45, 55]},
+        "points": [{"x": 10, "y": 50, "curveNumber": 0, "pointIndex": 1}],
+        "indices": [1],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert result == [{"x": 10, "y": 50, "curveNumber": 0, "pointIndex": 1}]
+    assert plot.indices == [1]
+
+
 def test_line_markers_selection() -> None:
     """Test box selection on line chart with markers."""
     fig = go.Figure(
@@ -1044,11 +1264,14 @@ def test_line_markers_selection() -> None:
 
     plot = plotly(fig)
 
-    # Simulate box selection from x=1.5 to x=3.5
+    # Plotly should provide exact point payloads for marker-bearing traces.
     selection = {
         "range": {"x": [1.5, 3.5], "y": [10, 25]},
-        "points": [],
-        "indices": [],
+        "points": [
+            {"Time": 2, "Value": 20, "curveNumber": 0, "pointIndex": 1},
+            {"Time": 3, "Value": 15, "curveNumber": 0, "pointIndex": 2},
+        ],
+        "indices": [1, 2],
     }
 
     result = plot._convert_value(selection)
@@ -1059,6 +1282,63 @@ def test_line_markers_selection() -> None:
     assert result[0]["Value"] == 20
     assert result[1]["Time"] == 3
     assert result[1]["Value"] == 15
+
+
+def test_mixed_marker_and_line_selection_uses_trace_specific_fallback() -> (
+    None
+):
+    """Test marker traces keep Plotly points while pure lines use box filtering."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=[10, 10, 10],
+            y=[10, 50, 90],
+            mode="markers",
+            name="Markers",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[10, 11, 12],
+            y=[0, 100, 0],
+            mode="lines",
+            name="Line",
+        )
+    )
+
+    plot = plotly(fig)
+
+    selection = {
+        "range": {"x": [9, 11], "y": [45, 55]},
+        "points": [
+            {
+                "x": 10,
+                "y": 50,
+                "curveNumber": 0,
+                "pointIndex": 1,
+                "name": "Markers",
+            }
+        ],
+        "indices": [1],
+    }
+
+    result = plot._convert_value(selection)
+
+    marker_points = [
+        point for point in result if point.get("curveNumber") == 0
+    ]
+    line_points = [point for point in result if point.get("curveNumber") == 1]
+
+    assert marker_points == [
+        {
+            "x": 10,
+            "y": 50,
+            "curveNumber": 0,
+            "pointIndex": 1,
+            "name": "Markers",
+        }
+    ]
+    assert line_points == []
 
 
 def test_line_chart_with_axis_titles() -> None:
@@ -1248,39 +1528,54 @@ def test_line_chart_with_curve_number() -> None:
     assert curve_numbers == {0, 1}
 
 
-def test_line_chart_filters_by_x_range_only() -> None:
-    """Test that line chart selection filters by x-range, matching Altair behavior."""
+def test_line_chart_uses_xy_box_filtering() -> None:
+    """Test line chart selection applies both x/y range filtering."""
     fig = go.Figure(
         data=go.Scatter(
             x=[1, 2, 3, 4, 5],
-            y=[10, 50, 15, 60, 30],  # Varying y values
+            y=[10, 50, 70, 60, 30],
             mode="lines",
         )
     )
 
     plot = plotly(fig)
 
-    # Select x range 2-4, with narrow y range that wouldn't include all points
+    # Select x range 2-4 with y range that excludes all vertices/segments
     selection = {
         "range": {
             "x": [2, 4],
             "y": [10, 20],
-        },  # y range only covers some points
+        },
         "points": [],
         "indices": [],
     }
 
     result = plot._convert_value(selection)
 
-    # Should return ALL points in x-range [2,4], regardless of y
-    # This matches Altair behavior
-    assert len(result) == 3
-    assert result[0]["x"] == 2
-    assert result[0]["y"] == 50  # y=50 is outside [10,20] but still included
-    assert result[1]["x"] == 3
-    assert result[1]["y"] == 15
-    assert result[2]["x"] == 4
-    assert result[2]["y"] == 60  # y=60 is outside [10,20] but still included
+    assert result == []
+
+
+def test_line_chart_excludes_intersecting_segments_without_vertices() -> None:
+    """Test pure line box selection returns only vertices inside the box."""
+    fig = go.Figure(
+        data=go.Scatter(
+            x=[0, 1],
+            y=[0, 10],
+            mode="lines",
+        )
+    )
+    plot = plotly(fig)
+
+    # No vertex lies inside this box, even though the segment crosses through it.
+    selection = {
+        "range": {"x": [0.4, 0.6], "y": [4, 6]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert result == []
 
 
 def test_scatter_points_numpy_and_fallback() -> None:
@@ -1310,7 +1605,111 @@ def test_scatter_points_numpy_and_fallback() -> None:
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
     # Compare each point
-    for np_point, fb_point in zip(numpy_sorted, fallback_sorted):
+    for np_point, fb_point in zip(numpy_sorted, fallback_sorted, strict=False):
+        assert np_point["x"] == fb_point["x"]
+        assert np_point["y"] == fb_point["y"]
+        assert np_point["curveNumber"] == fb_point["curveNumber"]
+
+
+def test_scatter_points_numpy_and_fallback_with_y_range() -> None:
+    """Test numpy/fallback parity for scatter extraction with x/y bounds."""
+    fig = go.Figure(
+        data=go.Scatter(
+            x=[0, 1],
+            y=[0, 10],
+            mode="lines",
+        )
+    )
+
+    numpy_result = _extract_scatter_points_numpy(fig, 0.4, 0.6, 4, 6)
+    fallback_result = _extract_scatter_points_fallback(fig, 0.4, 0.6, 4, 6)
+
+    assert len(numpy_result) == len(fallback_result) == 0
+
+
+def test_scatter_points_categorical_y_uses_category_positions() -> None:
+    """Test repeated categorical y values share the same y-axis position."""
+    fig = go.Figure(
+        data=go.Scatter(
+            x=[0, 1, 2, 3],
+            y=["A", "B", "B", "C"],
+            mode="lines",
+        )
+    )
+
+    numpy_result = _extract_scatter_points_numpy(fig, 0, 3, 0.5, 1.5)
+    fallback_result = _extract_scatter_points_fallback(fig, 0, 3, 0.5, 1.5)
+
+    assert [point["pointIndex"] for point in numpy_result] == [1, 2]
+    assert [point["pointIndex"] for point in fallback_result] == [1, 2]
+
+
+def test_scatter_points_categorical_x_uses_category_positions() -> None:
+    """Test repeated categorical x values share the same x-axis position."""
+    fig = go.Figure(
+        data=go.Scatter(
+            x=["A", "B", "B", "C"],
+            y=[10, 20, 30, 40],
+            mode="lines",
+        )
+    )
+
+    numpy_result = _extract_scatter_points_numpy(fig, 0.5, 1.5, 0, 100)
+    fallback_result = _extract_scatter_points_fallback(fig, 0.5, 1.5, 0, 100)
+
+    assert [point["pointIndex"] for point in numpy_result] == [1, 2]
+    assert [point["pointIndex"] for point in fallback_result] == [1, 2]
+
+
+def test_line_chart_lasso_selection_extracts_inside_points() -> None:
+    """Test pure line lasso selection returns only vertices inside polygon."""
+    fig = go.Figure(
+        data=go.Scatter(
+            x=[0, 1, 2, 3],
+            y=[0, 2, 0, 2],
+            mode="lines",
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "lasso": {
+            "x": [-0.5, 2.5, 2.5, -0.5],
+            "y": [-0.5, -0.5, 0.5, 0.5],
+        },
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert [p["pointIndex"] for p in result] == [0, 2]
+    assert [p["x"] for p in result] == [0, 2]
+
+
+def test_scattergl_points_numpy_and_fallback() -> None:
+    """Test numpy/fallback parity for scattergl extraction."""
+    fig = go.Figure(
+        data=go.Scattergl(
+            x=[1, 2, 3, 4, 5],
+            y=[10, 20, 15, 25, 30],
+            mode="lines",
+        )
+    )
+
+    x_min, x_max = 2, 4
+    numpy_result = _extract_scatter_points_numpy(fig, x_min, x_max)
+    fallback_result = _extract_scatter_points_fallback(fig, x_min, x_max)
+
+    assert len(numpy_result) == len(fallback_result)
+
+    def sort_key(point: dict[str, Any]) -> tuple[Any, ...]:
+        return (point["x"], point["y"])
+
+    numpy_sorted = sorted(numpy_result, key=sort_key)
+    fallback_sorted = sorted(fallback_result, key=sort_key)
+
+    for np_point, fb_point in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_point["x"] == fb_point["x"]
         assert np_point["y"] == fb_point["y"]
         assert np_point["curveNumber"] == fb_point["curveNumber"]
@@ -1940,19 +2339,217 @@ def test_bar_chart_mixed_with_scatter() -> None:
     # Select range that includes scatter points and bars
     selection = {
         "range": {"x": [-0.5, 2.5], "y": [5, 25]},
-        "points": [],
-        "indices": [],
+        "points": [{"x": 1, "y": 10, "curveNumber": 0, "pointIndex": 1}],
+        "indices": [1],
     }
 
     result = plot._convert_value(selection)
 
-    # Should include both scatter points and bar(s)
-    # The exact count depends on the x-range mapping to categorical bar positions
+    # Should include both the selected scatter point and bar(s).
     assert len(result) >= 2
     # Should have at least one bar
     assert any(r.get("x") in ["A", "B", "C"] for r in result)
-    # Should have scatter points
-    assert any(isinstance(r.get("x"), int) for r in result)
+    # Should preserve the explicit scatter point from Plotly
+    assert {"x": 1, "y": 10, "curveNumber": 0, "pointIndex": 1} in result
+
+
+# ============================================================================
+# Histogram Tests
+# ============================================================================
+
+
+def test_histogram_basic() -> None:
+    """Test that histograms can be created (supported chart type)."""
+    fig = go.Figure(data=go.Histogram(x=[0.1, 0.2, 0.3, 0.4]))
+    plot = plotly(fig)
+
+    assert plot is not None
+    assert plot.value == []
+
+
+def test_histogram_selection_vertical_row_level() -> None:
+    """Test histogram vertical selection returns underlying sample rows."""
+    x_values = [-1.2, -0.4, 0.1, 0.6, 1.4]
+    fig = go.Figure(data=go.Histogram(x=x_values))
+    plot = plotly(fig)
+
+    # Simulate Plotly bin payloads covering indices 1, 2, 3 (-0.4, 0.1, 0.6)
+    selection = {
+        "points": [
+            {"curveNumber": 0, "pointNumber": 0, "pointNumbers": [1, 2]},
+            {"curveNumber": 0, "pointNumber": 1, "pointNumbers": [3]},
+        ],
+        "indices": [0, 1],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert [point["x"] for point in result] == [-0.4, 0.1, 0.6]
+    assert [point["pointIndex"] for point in result] == [1, 2, 3]
+    assert all(point["curveNumber"] == 0 for point in result)
+
+
+def test_histogram_selection_horizontal_row_level() -> None:
+    """Test horizontal histogram selection returns underlying sample rows."""
+    y_values = [5, 10, 15, 20]
+    fig = go.Figure(data=go.Histogram(y=y_values, orientation="h"))
+    plot = plotly(fig)
+
+    # Simulate Plotly bin payload covering indices 1, 2 (y=10, 15)
+    selection = {
+        "points": [
+            {"curveNumber": 0, "pointNumber": 0, "pointNumbers": [1, 2]},
+        ],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert [point["y"] for point in result] == [10, 15]
+    assert [point["pointIndex"] for point in result] == [1, 2]
+
+
+def test_histogram_selection_preserves_optional_fields() -> None:
+    """Test histogram row extraction includes y/customdata/text when present."""
+    fig = go.Figure(
+        data=go.Histogram(
+            x=[0, 1, 2, 3],
+            y=[10, 20, 30, 40],
+            text=["a", "b", "c", "d"],
+            customdata=[["id0"], ["id1"], ["id2"], ["id3"]],
+            histfunc="sum",
+        )
+    )
+    plot = plotly(fig)
+
+    # Simulate Plotly bin payload for indices 1, 2 (x=1, x=2)
+    selection = {
+        "points": [
+            {"curveNumber": 0, "pointNumber": 0, "pointNumbers": [1, 2]},
+        ],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert result[0] == {
+        "x": 1,
+        "y": 20,
+        "pointIndex": 1,
+        "curveNumber": 0,
+        "customdata": ["id1"],
+        "text": "b",
+    }
+    assert result[1] == {
+        "x": 2,
+        "y": 30,
+        "pointIndex": 2,
+        "curveNumber": 0,
+        "customdata": ["id2"],
+        "text": "c",
+    }
+
+
+def test_histogram_selection_from_point_numbers() -> None:
+    """Test histogram extraction from pointNumbers (lasso/no-range events)."""
+    fig = go.Figure(data=go.Histogram(x=[0.1, 0.2, 0.3, 0.4, 0.5]))
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {
+                "curveNumber": 0,
+                "pointNumber": 0,
+                "pointNumbers": [1, 3],
+            }
+        ],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert result == [
+        {"x": 0.2, "pointIndex": 1, "curveNumber": 0},
+        {"x": 0.4, "pointIndex": 3, "curveNumber": 0},
+    ]
+    assert plot.indices == [1, 3]
+
+
+def test_histogram_initial_selection() -> None:
+    """Test that initial selection works with histograms."""
+    fig = go.Figure(data=go.Histogram(x=[0.1, 0.9, 1.1, 2.0]))
+    fig.add_selection(x0=0, x1=1, y0=0, y1=100, xref="x", yref="y")
+
+    plot = plotly(fig)
+    initial_value = plot._args.initial_value
+
+    assert initial_value["range"]["x"] == [0, 1]
+    assert initial_value["range"]["y"] == [0, 100]
+    assert initial_value["points"] == [
+        {"x": 0.1, "pointIndex": 0, "curveNumber": 0},
+        {"x": 0.9, "pointIndex": 1, "curveNumber": 0},
+    ]
+    assert initial_value["indices"] == [0, 1]
+
+
+def test_histogram_mixed_with_scatter_drops_bin_payload() -> None:
+    """Test histogram bins are replaced with row-level points in mixed charts."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[0.1, 0.4], y=[10, 20], mode="markers"))
+    fig.add_trace(go.Histogram(x=[0.1, 0.2, 0.7]))
+    plot = plotly(fig)
+
+    # Scatter provides per-point payload; histogram provides a bin payload
+    # with pointNumbers covering samples at indices 0 (x=0.1) and 1 (x=0.2).
+    selection = {
+        "points": [
+            {"x": 0.1, "y": 10, "curveNumber": 0, "pointIndex": 0},
+            {"curveNumber": 1, "pointNumber": 0, "pointNumbers": [0, 1]},
+        ],
+        "indices": [0, 0],
+    }
+
+    result = plot._convert_value(selection)
+
+    scatter_points = [p for p in result if p.get("curveNumber") == 0]
+    histogram_points = [p for p in result if p.get("curveNumber") == 1]
+
+    assert scatter_points == [
+        {"x": 0.1, "y": 10, "curveNumber": 0, "pointIndex": 0}
+    ]
+    assert histogram_points == [
+        {"x": 0.1, "pointIndex": 0, "curveNumber": 1},
+        {"x": 0.2, "pointIndex": 1, "curveNumber": 1},
+    ]
+
+
+def test_histogram_preserves_indices_when_empty_points_exist() -> None:
+    """Test index alignment when frontend emits empty point dicts."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[0.1, 0.4], y=[10, 20], mode="markers"))
+    fig.add_trace(go.Histogram(x=[0.1, 0.2, 0.7]))
+    plot = plotly(fig)
+
+    # The first empty dict simulates frontend payload entries with dropped fields.
+    selection = {
+        "points": [
+            {},
+            {"x": 0.1, "y": 10, "curveNumber": 0, "pointIndex": 0},
+            {"curveNumber": 1, "pointNumbers": [1]},
+        ],
+        "indices": [999, 0, 0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert result == [
+        {"x": 0.1, "y": 10, "curveNumber": 0, "pointIndex": 0},
+        {"x": 0.2, "pointIndex": 1, "curveNumber": 1},
+    ]
+    assert plot.indices == [0, 1]
 
 
 # Test numpy vs fallback implementations
@@ -1985,7 +2582,7 @@ def test_bar_numpy_and_fallback_match_categorical() -> None:
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
     # Compare each bar
-    for np_bar, fb_bar in zip(numpy_sorted, fallback_sorted):
+    for np_bar, fb_bar in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_bar["x"] == fb_bar["x"]
         assert np_bar["y"] == fb_bar["y"]
         assert np_bar["curveNumber"] == fb_bar["curveNumber"]
@@ -2014,7 +2611,7 @@ def test_bar_numpy_and_fallback_match_numeric() -> None:
     numpy_sorted = sorted(numpy_result, key=sort_key)
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
-    for np_bar, fb_bar in zip(numpy_sorted, fallback_sorted):
+    for np_bar, fb_bar in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_bar["x"] == fb_bar["x"]
         assert np_bar["y"] == fb_bar["y"]
         assert np_bar["curveNumber"] == fb_bar["curveNumber"]
@@ -2044,10 +2641,113 @@ def test_bar_numpy_and_fallback_match_horizontal() -> None:
     numpy_sorted = sorted(numpy_result, key=sort_key)
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
-    for np_bar, fb_bar in zip(numpy_sorted, fallback_sorted):
+    for np_bar, fb_bar in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_bar["x"] == fb_bar["x"]
         assert np_bar["y"] == fb_bar["y"]
         assert np_bar["curveNumber"] == fb_bar["curveNumber"]
+
+
+def test_histogram_numpy_and_fallback_match_numeric() -> None:
+    """Test histogram numpy and fallback extraction match on numeric data."""
+    fig = go.Figure(data=go.Histogram(x=[-1.0, -0.5, 0.0, 0.5, 1.0]))
+    range_data = {"x": [-0.5, 0.6], "y": [0, 50]}
+
+    numpy_result = _extract_histogram_points_numpy(fig, range_data)
+    fallback_result = _extract_histogram_points_fallback(fig, range_data)
+
+    assert len(numpy_result) == len(fallback_result)
+
+    def sort_key(point: dict[str, Any]) -> tuple[Any, ...]:
+        return (point["pointIndex"], point["curveNumber"])
+
+    numpy_sorted = sorted(numpy_result, key=sort_key)
+    fallback_sorted = sorted(fallback_result, key=sort_key)
+
+    for np_point, fb_point in zip(numpy_sorted, fallback_sorted, strict=False):
+        assert np_point == fb_point
+
+
+def test_histogram_click_uses_bin_pointnumbers_not_range() -> None:
+    """When a click sends both pointNumbers and a range, bin membership wins.
+
+    In Plotly "select" dragmode, clicking a histogram bar fires both
+    plotly_click and plotly_selected. The latter sets range to the click
+    coordinates. The backend must prioritise the exact bin pointNumbers over
+    raw x-range filtering so that only samples belonging to the clicked bin
+    are returned — not all samples whose x-value happens to fall inside the
+    click range.
+    """
+    x_values = [1.0, 1.5, 2.5, 3.0, 4.0]
+    fig = go.Figure(data=go.Histogram(x=x_values))
+    plot = plotly(fig)
+
+    # Simulates the double-fire scenario: the frontend sends both a range
+    # (from onSelected) and a bin point with pointNumbers (from onClick).
+    # The bin covers samples at indices 0 and 1 (x=1.0, x=1.5).
+    # Raw range filtering on [1.0, 2.0] would also pick up x=1.5 and
+    # potentially x=2.5 depending on bin boundaries — using pointNumbers
+    # ensures only indices 0 and 1 are returned.
+    selection = {
+        "range": {"x": [1.0, 2.0], "y": [0, 10]},
+        "points": [
+            {
+                "x": 1.25,
+                "y": 2,
+                "curveNumber": 0,
+                "pointNumber": 0,
+                "pointNumbers": [0, 1],
+            }
+        ],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert {p["pointIndex"] for p in result} == {0, 1}
+    assert all(p["x"] in (1.0, 1.5) for p in result)
+
+
+def test_histogram_empty_box_selection_returns_empty() -> None:
+    """Selecting an empty region on a histogram must return no data.
+
+    When the user draws a box/lasso over an area with no histogram bars,
+    Plotly sends points=[] and range={x:[a,b]}. The backend must not use the
+    range to find nearby samples — an empty selection must produce empty output.
+    """
+    x_values = [1.0, 2.0, 3.0, 4.0, 5.0]
+    fig = go.Figure(data=go.Histogram(x=x_values))
+    plot = plotly(fig)
+
+    # Plotly sends empty points when the drawn box covers no bars.
+    selection = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [10.0, 20.0], "y": [0, 10]},
+    }
+
+    result = plot._convert_value(selection)
+    assert result == []
+
+
+def test_histogram_numpy_and_fallback_match_categorical() -> None:
+    """Test histogram numpy and fallback extraction match on categories."""
+    fig = go.Figure(data=go.Histogram(x=["A", "B", "A", "C", "B"]))
+    range_data = {"x": [0.5, 1.5], "y": [0, 50]}
+
+    numpy_result = _extract_histogram_points_numpy(fig, range_data)
+    fallback_result = _extract_histogram_points_fallback(fig, range_data)
+
+    assert len(numpy_result) == len(fallback_result)
+
+    def sort_key(point: dict[str, Any]) -> tuple[Any, ...]:
+        return (point["pointIndex"], point["curveNumber"])
+
+    numpy_sorted = sorted(numpy_result, key=sort_key)
+    fallback_sorted = sorted(fallback_result, key=sort_key)
+
+    for np_point, fb_point in zip(numpy_sorted, fallback_sorted, strict=False):
+        assert np_point == fb_point
 
 
 def test_heatmap_numpy_and_fallback_numeric_axes() -> None:
@@ -2078,8 +2778,1564 @@ def test_heatmap_numpy_and_fallback_numeric_axes() -> None:
     numpy_sorted = sorted(numpy_result, key=sort_key)
     fallback_sorted = sorted(fallback_result, key=sort_key)
 
-    for np_cell, fb_cell in zip(numpy_sorted, fallback_sorted):
+    for np_cell, fb_cell in zip(numpy_sorted, fallback_sorted, strict=False):
         assert np_cell["x"] == fb_cell["x"]
         assert np_cell["y"] == fb_cell["y"]
         assert np_cell["z"] == fb_cell["z"]
         assert np_cell["curveNumber"] == fb_cell["curveNumber"]
+
+
+def test_scattermap_basic() -> None:
+    """Test that scattermap plots can be created."""
+    fig = go.Figure(
+        data=go.Scattermap(
+            lat=[37.7749, 34.0522],
+            lon=[-122.4194, -118.2437],
+            mode="markers",
+        )
+    )
+    plot = plotly(fig)
+    assert plot.value == []
+
+
+def test_scattermap_selection_with_indices() -> None:
+    """Test scattermap selection extracts points by indices."""
+    fig = go.Figure(
+        data=go.Scattermap(
+            lat=[37.7749, 34.0522, 40.7128],
+            lon=[-122.4194, -118.2437, -74.0060],
+            mode="markers",
+            name="Cities",
+        )
+    )
+    plot = plotly(fig)
+
+    result = plot._convert_value({"points": [], "indices": [0, 2]})
+
+    assert result == [
+        {
+            "lat": 37.7749,
+            "lon": -122.4194,
+            "pointIndex": 0,
+            "curveNumber": 0,
+            "name": "Cities",
+        },
+        {
+            "lat": 40.7128,
+            "lon": -74.0060,
+            "pointIndex": 2,
+            "curveNumber": 0,
+            "name": "Cities",
+        },
+    ]
+
+
+def test_scattermap_selection_with_customdata() -> None:
+    """Test scattermap selection includes customdata (issue #7970)."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "id": ["WC_0001", "WC_0002", "WC_0003"],
+            "lat": [-33.93, -33.95, -33.91],
+            "lon": [18.42, 18.46, 18.50],
+            "cluster": [0, 1, 0],
+        }
+    )
+
+    fig = go.Figure(
+        data=go.Scattermap(
+            lat=df["lat"],
+            lon=df["lon"],
+            mode="markers",
+            customdata=df[["id", "cluster"]].values,
+        )
+    )
+    plot = plotly(fig)
+
+    result = plot._convert_value({"points": [], "indices": [0]})
+
+    assert len(result) == 1
+    assert result[0]["customdata"][0] == "WC_0001"
+    assert result[0]["customdata"][1] == 0
+
+
+@pytest.mark.filterwarnings("ignore:.*scattermapbox.*:DeprecationWarning")
+def test_scattermapbox_selection() -> None:
+    """Test scattermapbox (deprecated) selection works."""
+    fig = go.Figure(
+        data=go.Scattermapbox(
+            lat=[37.7749, 34.0522],
+            lon=[-122.4194, -118.2437],
+            mode="markers",
+            text=["SF", "LA"],
+        )
+    )
+    plot = plotly(fig)
+
+    result = plot._convert_value({"points": [], "indices": [1]})
+
+    assert len(result) == 1
+    assert result[0]["lat"] == 34.0522
+    assert result[0]["text"] == "LA"
+
+
+def test_scattergeo_selection() -> None:
+    """Test scattergeo selection works."""
+    fig = go.Figure(
+        data=go.Scattergeo(
+            lat=[37.7749, 34.0522],
+            lon=[-122.4194, -118.2437],
+            mode="markers",
+            hovertext=["SF", "LA"],
+        )
+    )
+    plot = plotly(fig)
+
+    result = plot._convert_value({"points": [], "indices": [0]})
+
+    assert len(result) == 1
+    assert result[0]["hovertext"] == "SF"
+
+
+def test_scattermap_preserves_frontend_points() -> None:
+    """Test that existing points with lat/lon from frontend are preserved."""
+    fig = go.Figure(
+        data=go.Scattermap(
+            lat=[37.7749],
+            lon=[-122.4194],
+            mode="markers",
+        )
+    )
+    plot = plotly(fig)
+
+    # Frontend already sent points with lat/lon
+    selection = {
+        "points": [{"lat": 37.7749, "lon": -122.4194, "pointIndex": 0}],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert result == [{"lat": 37.7749, "lon": -122.4194, "pointIndex": 0}]
+
+
+def test_scattermap_empty_selection() -> None:
+    """Test scattermap with empty selection."""
+    fig = go.Figure(
+        data=go.Scattermap(lat=[37.7749], lon=[-122.4194], mode="markers")
+    )
+    plot = plotly(fig)
+
+    assert plot._convert_value({"points": [], "indices": []}) == []
+
+
+def test_scattermap_invalid_indices() -> None:
+    """Test scattermap ignores invalid indices."""
+    fig = go.Figure(
+        data=go.Scattermap(lat=[37.7749], lon=[-122.4194], mode="markers")
+    )
+    plot = plotly(fig)
+
+    # 100 and -1 are out of bounds
+    result = plot._convert_value({"points": [], "indices": [0, 100, -1]})
+
+    assert len(result) == 1
+    assert result[0]["pointIndex"] == 0
+
+
+def test_bar_value_in_selection_range_ignores_non_numeric_values() -> None:
+    """Test non-numeric bar values do not raise during overlap checks."""
+    trace = go.Bar(base=["bad-base"])
+
+    assert (
+        _bar_value_in_selection_range(
+            trace=trace,
+            point_idx=0,
+            point_value="bad-value",
+            selection_min=0,
+            selection_max=10,
+        )
+        is False
+    )
+
+
+def test_bar_chart_explicit_points_are_not_duplicated() -> None:
+    """Test that explicit Plotly bar points are not duplicated by fallback extraction."""
+    fig = go.Figure(
+        data=go.Bar(
+            x=["A", "B", "C"],
+            y=[10, 20, 15],
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "range": {"x": [-0.5, 1.5], "y": [0, 25]},
+        "points": [
+            {
+                "x": "A",
+                "y": 10,
+                "curveNumber": 0,
+                "pointNumber": 0,
+                "pointIndex": 0,
+                "Month": "A",
+                "Sales": 10,
+            },
+            {
+                "x": "B",
+                "y": 20,
+                "curveNumber": 0,
+                "pointNumber": 1,
+                "pointIndex": 1,
+                "Month": "B",
+                "Sales": 20,
+            },
+        ],
+        "indices": [0, 1],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert result == selection["points"]
+    assert plot.indices == [0, 1]
+
+
+def test_bar_chart_preserves_indices_when_empty_points_exist() -> None:
+    """Test bar index alignment when frontend emits empty point dicts."""
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=["A", "B"], y=[10, 20]))
+    plot = plotly(fig)
+
+    selection = {
+        "range": {"x": [0.5, 1.5], "y": [0, 25]},
+        "points": [
+            {},
+            {"x": "B", "y": 20, "curveNumber": 0, "pointIndex": 1},
+        ],
+        "indices": [999, 1],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert result == [{"x": "B", "y": 20, "curveNumber": 0, "pointIndex": 1}]
+    assert plot.indices == [1]
+
+
+# ============================================================================
+# Box Plot Tests
+# ============================================================================
+
+
+def test_box_plot_basic_creation() -> None:
+    """Test that a box plot can be created and has empty initial selection."""
+    fig = go.Figure(data=go.Box(y=[1, 2, 3, 4, 5], name="Group A"))
+    plot = plotly(fig)
+
+    assert plot is not None
+    assert plot.value == []
+    assert plot.ranges == {}
+    assert plot.points == []
+    assert plot.indices == []
+
+
+def test_box_plot_click_expands_point_numbers() -> None:
+    """Clicking a box/whisker sends pointNumbers; Python expands them to rows."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "A", "B", "B"], y=[1, 2, 3, 4, 5]))
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {
+                "x": "A",
+                "y": 2,
+                "pointIndex": 0,
+                "pointNumbers": [0, 1, 2],
+                "curveNumber": 0,
+            }
+        ],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert all(r["x"] == "A" for r in result)
+    assert [r["y"] for r in result] == [1, 2, 3]
+    assert [r["pointIndex"] for r in result] == [0, 1, 2]
+    assert all(r["curveNumber"] == 0 for r in result)
+
+
+def test_box_plot_click_without_point_numbers_passthrough() -> None:
+    """When pointNumbers is absent (individual boxpoint click), pass through."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "B"], y=[1, 2, 3]))
+    plot = plotly(fig)
+
+    selection = {
+        "points": [{"x": "A", "y": 1, "pointIndex": 0, "curveNumber": 0}],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 1
+    assert result[0]["pointIndex"] == 0
+
+
+def test_extract_box_points_numpy_categorical() -> None:
+    """Numpy path: select category 'A' by index position."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "A", "B", "B"], y=[1, 2, 3, 4, 5]))
+
+    range_data = {"x": [-0.4, 0.4], "y": [0, 10]}
+    result = _extract_box_points_numpy(fig, range_data)
+
+    assert len(result) == 3
+    assert all(r["x"] == "A" for r in result)
+    assert [r["y"] for r in result] == [1, 2, 3]
+    assert [r["pointIndex"] for r in result] == [0, 1, 2]
+    assert all(r["curveNumber"] == 0 for r in result)
+
+
+def test_extract_box_points_fallback_categorical() -> None:
+    """Pure-Python path: mirrors numpy categorical selection."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "A", "B", "B"], y=[1, 2, 3, 4, 5]))
+
+    range_data = {"x": [-0.4, 0.4], "y": [0, 10]}
+    result = _extract_box_points_fallback(fig, range_data)
+
+    assert len(result) == 3
+    assert all(r["x"] == "A" for r in result)
+    assert [r["y"] for r in result] == [1, 2, 3]
+
+
+def test_extract_box_points_numpy_all_categories() -> None:
+    """Select all categories when x range covers the full axis."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "B", "B"], y=[1, 2, 3, 4]))
+
+    range_data = {"x": [-1, 5], "y": [0, 10]}
+    result = _extract_box_points_numpy(fig, range_data)
+
+    assert len(result) == 4
+
+
+def test_extract_box_points_numpy_second_category() -> None:
+    """Select only the second category; numpy and fallback agree."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "B", "B"], y=[1, 2, 3, 4]))
+
+    range_data = {"x": [0.6, 1.4], "y": [0, 10]}
+    result_numpy = _extract_box_points_numpy(fig, range_data)
+    result_fallback = _extract_box_points_fallback(fig, range_data)
+
+    assert len(result_numpy) == 2
+    assert all(r["x"] == "B" for r in result_numpy)
+    assert result_numpy == result_fallback
+
+
+def test_box_plot_range_selection_with_individual_points() -> None:
+    """When Plotly sends individual points via onSelected, pass them through."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "B", "B"], y=[10, 20, 30, 40]))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"x": [-0.4, 0.4], "y": [0, 50]},
+        "points": [
+            {"x": "A", "y": 10, "pointIndex": 0, "curveNumber": 0},
+            {"x": "A", "y": 20, "pointIndex": 1, "curveNumber": 0},
+        ],
+        "indices": [0, 1],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert all(r["x"] == "A" for r in result)
+    assert {r["y"] for r in result} == {10, 20}
+    assert {r["pointIndex"] for r in result} == {0, 1}
+
+
+def test_box_plot_range_selection_fallback_no_points() -> None:
+    """When no individual points are sent (boxpoints disabled), extract from range."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "B", "B"], y=[10, 20, 30, 40]))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"x": [-0.4, 0.4], "y": [0, 50]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert all(r["x"] == "A" for r in result)
+    assert {r["y"] for r in result} == {10, 20}
+
+
+def test_box_plot_no_category_data() -> None:
+    """Box trace without explicit x uses trace name as category."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(y=[5, 10, 15], name="Group X"))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"y": [0, 20]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert all(r.get("x") == "Group X" for r in result)
+
+
+def test_box_plot_horizontal_orientation() -> None:
+    """Horizontal box plots swap x/y roles for category and value."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Box(x=[1, 2, 3, 4, 5], y=["A", "A", "A", "B", "B"], orientation="h")
+    )
+
+    range_data = {"y": [-0.4, 0.4], "x": [0, 10]}
+    result_numpy = _extract_box_points_numpy(fig, range_data)
+    result_fallback = _extract_box_points_fallback(fig, range_data)
+
+    assert len(result_numpy) == 3
+    assert all(r["y"] == "A" for r in result_numpy)
+    assert [r["x"] for r in result_numpy] == [1, 2, 3]
+    assert result_numpy == result_fallback
+
+
+def test_box_plot_multiple_traces() -> None:
+    """Range selection across multiple box traces."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A"], y=[1, 2], name="trace0"))
+    fig.add_trace(go.Box(x=["A", "A"], y=[3, 4], name="trace1"))
+
+    range_data = {"x": [-0.4, 0.4], "y": [0, 10]}
+    result = _extract_box_points_numpy(fig, range_data)
+
+    assert len(result) == 4
+    assert {r["curveNumber"] for r in result} == {0, 1}
+
+
+def test_box_plot_click_deduplication() -> None:
+    """Duplicate sample indices within pointNumbers are not repeated."""
+    fig = go.Figure()
+    fig.add_trace(go.Box(x=["A", "A", "A"], y=[1, 2, 3]))
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {
+                "x": "A",
+                "y": 1,
+                "pointIndex": 0,
+                "pointNumbers": [0, 1, 2],
+                "curveNumber": 0,
+            },
+            {
+                "x": "A",
+                "y": 1,
+                "pointIndex": 0,
+                "pointNumbers": [0, 1, 2],
+                "curveNumber": 0,
+            },
+        ],
+        "indices": [0, 0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert sorted(r["pointIndex"] for r in result) == [0, 1, 2]
+
+
+# ============================================================================
+# Violin Plot Tests
+# ============================================================================
+
+
+def test_violin_plot_basic_creation() -> None:
+    """Test that a violin plot can be created and has empty initial selection."""
+    fig = go.Figure(data=go.Violin(y=[1, 2, 3, 4, 5], name="Group A"))
+    plot = plotly(fig)
+
+    assert plot is not None
+    assert plot.value == []
+    assert plot.ranges == {}
+    assert plot.points == []
+    assert plot.indices == []
+
+
+def test_violin_click_expands_point_numbers() -> None:
+    """Clicking a violin body sends pointNumbers; Python expands them to rows."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "A", "B", "B"], y=[1, 2, 3, 4, 5]))
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {
+                "x": "A",
+                "y": 2,
+                "pointIndex": 0,
+                "pointNumbers": [0, 1, 2],
+                "curveNumber": 0,
+            }
+        ],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert all(r["x"] == "A" for r in result)
+    assert [r["y"] for r in result] == [1, 2, 3]
+    assert [r["pointIndex"] for r in result] == [0, 1, 2]
+    assert all(r["curveNumber"] == 0 for r in result)
+
+
+def test_violin_click_without_point_numbers_passthrough() -> None:
+    """When pointNumbers is absent (individual point click), pass through."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "B"], y=[1, 2, 3]))
+    plot = plotly(fig)
+
+    selection = {
+        "points": [{"x": "A", "y": 1, "pointIndex": 0, "curveNumber": 0}],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 1
+    assert result[0]["pointIndex"] == 0
+
+
+def test_extract_violin_points_numpy_categorical() -> None:
+    """Numpy path: select category 'A' by index position."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "A", "B", "B"], y=[1, 2, 3, 4, 5]))
+
+    range_data = {"x": [-0.4, 0.4], "y": [0, 10]}
+    result = _extract_violin_points_numpy(fig, range_data)
+
+    assert len(result) == 3
+    assert all(r["x"] == "A" for r in result)
+    assert [r["y"] for r in result] == [1, 2, 3]
+    assert [r["pointIndex"] for r in result] == [0, 1, 2]
+    assert all(r["curveNumber"] == 0 for r in result)
+
+
+def test_extract_violin_points_fallback_categorical() -> None:
+    """Pure-Python path: mirrors numpy categorical selection."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "A", "B", "B"], y=[1, 2, 3, 4, 5]))
+
+    range_data = {"x": [-0.4, 0.4], "y": [0, 10]}
+    result = _extract_violin_points_fallback(fig, range_data)
+
+    assert len(result) == 3
+    assert all(r["x"] == "A" for r in result)
+    assert [r["y"] for r in result] == [1, 2, 3]
+
+
+def test_extract_violin_points_numpy_second_category() -> None:
+    """Select only the second category; numpy and fallback agree."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "B", "B"], y=[1, 2, 3, 4]))
+
+    range_data = {"x": [0.6, 1.4], "y": [0, 10]}
+    result_numpy = _extract_violin_points_numpy(fig, range_data)
+    result_fallback = _extract_violin_points_fallback(fig, range_data)
+
+    assert len(result_numpy) == 2
+    assert all(r["x"] == "B" for r in result_numpy)
+    assert result_numpy == result_fallback
+
+
+def test_violin_range_selection_with_individual_points() -> None:
+    """When Plotly sends individual points via onSelected, pass them through."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "B", "B"], y=[10, 20, 30, 40]))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"x": [-0.4, 0.4], "y": [0, 50]},
+        "points": [
+            {"x": "A", "y": 10, "pointIndex": 0, "curveNumber": 0},
+            {"x": "A", "y": 20, "pointIndex": 1, "curveNumber": 0},
+        ],
+        "indices": [0, 1],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert all(r["x"] == "A" for r in result)
+    assert {r["pointIndex"] for r in result} == {0, 1}
+
+
+def test_violin_range_selection_fallback_no_points() -> None:
+    """When no individual points are sent (points disabled), extract from range."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "B", "B"], y=[10, 20, 30, 40]))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"x": [-0.4, 0.4], "y": [0, 50]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert all(r["x"] == "A" for r in result)
+    assert {r["y"] for r in result} == {10, 20}
+
+
+def test_violin_no_category_data() -> None:
+    """Violin trace without explicit x uses trace name as category."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(y=[5, 10, 15], name="Group X"))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"y": [0, 20]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert all(r.get("x") == "Group X" for r in result)
+
+
+def test_violin_horizontal_orientation() -> None:
+    """Horizontal violin plots swap x/y roles for category and value."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Violin(
+            x=[1, 2, 3, 4, 5],
+            y=["A", "A", "A", "B", "B"],
+            orientation="h",
+        )
+    )
+
+    range_data = {"y": [-0.4, 0.4], "x": [0, 10]}
+    result_numpy = _extract_violin_points_numpy(fig, range_data)
+    result_fallback = _extract_violin_points_fallback(fig, range_data)
+
+    assert len(result_numpy) == 3
+    assert all(r["y"] == "A" for r in result_numpy)
+    assert [r["x"] for r in result_numpy] == [1, 2, 3]
+    assert result_numpy == result_fallback
+
+
+def test_violin_multiple_traces() -> None:
+    """Range selection across multiple violin traces."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A"], y=[1, 2], name="trace0"))
+    fig.add_trace(go.Violin(x=["A", "A"], y=[3, 4], name="trace1"))
+
+    range_data = {"x": [-0.4, 0.4], "y": [0, 10]}
+    result = _extract_violin_points_numpy(fig, range_data)
+
+    assert len(result) == 4
+    assert {r["curveNumber"] for r in result} == {0, 1}
+
+
+def test_violin_click_deduplication() -> None:
+    """Duplicate sample indices within pointNumbers are not repeated."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "A"], y=[1, 2, 3]))
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {
+                "x": "A",
+                "y": 1,
+                "pointIndex": 0,
+                "pointNumbers": [0, 1, 2],
+                "curveNumber": 0,
+            },
+            {
+                "x": "A",
+                "y": 1,
+                "pointIndex": 0,
+                "pointNumbers": [0, 1, 2],
+                "curveNumber": 0,
+            },
+        ],
+        "indices": [0, 0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert sorted(r["pointIndex"] for r in result) == [0, 1, 2]
+
+
+# ============================================================================
+# Strip Chart Tests (px.strip uses go.Box traces with boxpoints="all")
+# ============================================================================
+
+
+def test_strip_chart_basic_creation() -> None:
+    """Test that a strip chart can be created and has empty initial selection."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "category": ["A", "A", "B", "B", "C"],
+            "value": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+    fig = px.strip(df, x="category", y="value")
+    plot = plotly(fig)
+
+    assert plot is not None
+    assert plot.value == []
+    assert plot.ranges == {}
+    assert plot.points == []
+    assert plot.indices == []
+
+
+def test_strip_chart_uses_box_traces() -> None:
+    """Verify that px.strip produces go.Box traces (type='box')."""
+    import pandas as pd
+
+    df = pd.DataFrame({"cat": ["A", "A", "B"], "val": [1, 2, 3]})
+    fig = px.strip(df, x="cat", y="val")
+
+    trace_types = [getattr(t, "type", None) for t in fig.data]
+    assert all(t == "box" for t in trace_types)
+
+
+def test_strip_chart_individual_point_click() -> None:
+    """Clicking an individual strip point (boxpoints='all') passes through directly."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {"cat": ["A", "A", "A", "B", "B"], "val": [1.0, 2.0, 3.0, 4.0, 5.0]}
+    )
+    fig = px.strip(df, x="cat", y="val")
+    plot = plotly(fig)
+
+    # Individual point click – no pointNumbers, just pointIndex
+    selection = {
+        "points": [{"x": "A", "y": 1.0, "pointIndex": 0, "curveNumber": 0}],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 1
+    assert result[0]["pointIndex"] == 0
+    assert result[0]["y"] == 1.0
+
+
+def test_strip_chart_range_selection_with_individual_points() -> None:
+    """Box/lasso selection on a strip chart returns the individual points Plotly sent."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "cat": ["A", "A", "A", "B", "B"],
+            "val": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+    fig = px.strip(df, x="cat", y="val")
+    plot = plotly(fig)
+
+    # Simulate onSelected: Plotly sends category-A points + range
+    selection: dict[str, Any] = {
+        "range": {"x": [-0.4, 0.4], "y": [0, 10]},
+        "points": [
+            {"x": "A", "y": 1.0, "pointIndex": 0, "curveNumber": 0},
+            {"x": "A", "y": 2.0, "pointIndex": 1, "curveNumber": 0},
+            {"x": "A", "y": 3.0, "pointIndex": 2, "curveNumber": 0},
+        ],
+        "indices": [0, 1, 2],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 3
+    assert all(r["x"] == "A" for r in result)
+    assert {r["y"] for r in result} == {1.0, 2.0, 3.0}
+
+
+def test_strip_chart_range_selection_no_individual_points() -> None:
+    """When Plotly sends no individual points, extract from range using box logic."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {"cat": ["A", "A", "B", "B"], "val": [10.0, 20.0, 30.0, 40.0]}
+    )
+    fig = px.strip(df, x="cat", y="val")
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"x": [-0.4, 0.4], "y": [0, 50]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert all(r["x"] == "A" for r in result)
+    assert {r["y"] for r in result} == {10.0, 20.0}
+
+
+def test_strip_chart_grouped_selection() -> None:
+    """Range selection that spans two strip groups returns all matching rows."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "cat": ["A", "A", "B", "B"],
+            "val": [1.0, 2.0, 3.0, 4.0],
+            "grp": ["X", "X", "Y", "Y"],
+        }
+    )
+    fig = px.strip(df, x="cat", y="val", color="grp")
+    plot = plotly(fig)
+
+    # Select all — range covers all category positions
+    selection: dict[str, Any] = {
+        "range": {"x": [-1, 5], "y": [0, 10]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    # All 4 rows should be returned (2 from each strip trace)
+    assert len(result) == 4
+
+
+def test_strip_chart_customdata_preserved() -> None:
+    """Customdata fields are included in selected strip points."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Box(
+            x=["A", "A", "B"],
+            y=[1.0, 2.0, 3.0],
+            boxpoints="all",
+            customdata=["id_0", "id_1", "id_2"],
+        )
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"x": [-0.4, 0.4], "y": [0, 10]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    assert len(result) == 2
+    assert result[0]["customdata"] == "id_0"
+    assert result[1]["customdata"] == "id_1"
+
+
+# ============================================================================
+# Waterfall chart tests
+# ============================================================================
+
+
+def test_waterfall_basic() -> None:
+    """Waterfall plot starts with empty value."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue", "Costs", "Net"],
+            y=[1000, 400, -150, 0],
+            measure=["absolute", "relative", "relative", "total"],
+        )
+    )
+    plot = plotly(fig)
+    assert plot.value == []
+    assert plot.indices == []
+
+
+def test_waterfall_click_selection() -> None:
+    """Click on a waterfall bar passes through x, y, and pointIndex."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue", "Costs", "Net"],
+            y=[1000, 400, -150, 0],
+            measure=["absolute", "relative", "relative", "total"],
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {
+                "x": "Revenue",
+                "y": 400,
+                "curveNumber": 0,
+                "pointIndex": 1,
+                "pointNumber": 1,
+            }
+        ],
+        "indices": [1],
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 1
+    assert result[0]["x"] == "Revenue"
+    assert result[0]["y"] == 400
+    assert plot.indices == [1]
+
+
+def test_waterfall_click_empty_placeholder_stripped() -> None:
+    """Empty-dict placeholders from the frontend are stripped on click."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue"],
+            y=[1000, 400],
+            measure=["absolute", "relative"],
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {},
+            {"x": "Revenue", "y": 400, "curveNumber": 0, "pointIndex": 1},
+        ],
+        "indices": [999, 1],
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 1
+    assert result[0]["x"] == "Revenue"
+    assert plot.indices == [1]
+
+
+def test_compute_waterfall_bar_extents_relative() -> None:
+    """Relative bars stack on top of each other."""
+    y = [100, 50, -30]
+    measures = ["relative", "relative", "relative"]
+    extents = _compute_waterfall_bar_extents(y, measures, base=0.0)
+    assert extents == [(0.0, 100.0), (100.0, 150.0), (120.0, 150.0)]
+
+
+def test_compute_waterfall_bar_extents_absolute_resets() -> None:
+    """An 'absolute' bar resets the running total."""
+    y = [100, 50, 200, -20]
+    measures = ["relative", "relative", "absolute", "relative"]
+    extents = _compute_waterfall_bar_extents(y, measures, base=0.0)
+    # After absolute bar at index 2: running_total = 200
+    assert extents[2] == (0.0, 200.0)
+    assert extents[3] == (180.0, 200.0)
+
+
+def test_compute_waterfall_bar_extents_total() -> None:
+    """A 'total' bar shows running total from base; does not change it."""
+    y = [500, 300, 0]
+    measures = ["absolute", "relative", "total"]
+    extents = _compute_waterfall_bar_extents(y, measures, base=0.0)
+    # running_total after absolute=500, after relative=800
+    # total bar = [0, 800]
+    assert extents[2] == (0.0, 800.0)
+
+
+def test_compute_waterfall_bar_extents_negative_relative() -> None:
+    """Negative relative bars extend downward; extents are sorted low-high."""
+    y = [400, -150]
+    measures = ["absolute", "relative"]
+    extents = _compute_waterfall_bar_extents(y, measures, base=0.0)
+    assert extents[0] == (0.0, 400.0)
+    # bar goes from 400 down to 250 → stored as (250, 400)
+    assert extents[1] == (250.0, 400.0)
+
+
+def test_waterfall_range_selection_partial() -> None:
+    """Box selection extracts only bars whose visual extent overlaps the range."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue", "Costs", "Net"],
+            y=[1000, 400, -150, 0],
+            measure=["absolute", "relative", "relative", "total"],
+        )
+    )
+    plot = plotly(fig)
+
+    # Visual extents:
+    #   Start:   [0, 1000]    (absolute)
+    #   Revenue: [1000, 1400] (relative)
+    #   Costs:   [1250, 1400] (relative, -150)
+    #   Net:     [0, 1250]    (total)
+    #
+    # y_range [1100, 1500] overlaps Revenue and Costs but NOT Start or Net.
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [-0.5, 2.5], "y": [1100.0, 1500.0]},
+    }
+    result = plot._convert_value(selection)
+    labels = [p["x"] for p in result]
+    assert "Revenue" in labels
+    assert "Costs" in labels
+    assert "Start" not in labels
+    assert "Net" not in labels
+
+
+def test_waterfall_range_selection_all_bars() -> None:
+    """Full y-range selects every bar."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue", "Costs", "Net"],
+            y=[1000, 400, -150, 0],
+            measure=["absolute", "relative", "relative", "total"],
+        )
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [-0.5, 3.5], "y": [0.0, 1500.0]},
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 4
+
+
+def test_waterfall_range_selection_empty() -> None:
+    """Range that misses all bars returns empty."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue"],
+            y=[1000, 400],
+            measure=["absolute", "relative"],
+        )
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [-0.5, 1.5], "y": [5000.0, 6000.0]},
+    }
+    result = plot._convert_value(selection)
+    assert result == []
+    assert plot.indices == []
+
+
+def test_waterfall_measure_included_in_range_extraction() -> None:
+    """Extracted points include the measure field."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue", "Net"],
+            y=[1000, 400, 0],
+            measure=["absolute", "relative", "total"],
+        )
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [-0.5, 2.5], "y": [0.0, 1500.0]},
+    }
+    result = plot._convert_value(selection)
+    measures = {p["x"]: p.get("measure") for p in result}
+    assert measures.get("Start") == "absolute"
+    assert measures.get("Revenue") == "relative"
+    assert measures.get("Net") == "total"
+
+
+def test_waterfall_numpy_and_fallback_match() -> None:
+    """numpy and fallback extraction produce identical results."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue", "Costs", "Net"],
+            y=[1000, 400, -150, 0],
+            measure=["absolute", "relative", "relative", "total"],
+        )
+    )
+
+    x_min, x_max = -0.5, 2.5
+    y_min, y_max = 1100.0, 1500.0
+
+    numpy_result = _extract_waterfall_bars_numpy(
+        fig, x_min, x_max, y_min, y_max
+    )
+    fallback_result = _extract_waterfall_bars_fallback(
+        fig, x_min, x_max, y_min, y_max
+    )
+
+    assert len(numpy_result) == len(fallback_result)
+    for np_pt, fb_pt in zip(
+        sorted(numpy_result, key=lambda p: p["pointIndex"]),
+        sorted(fallback_result, key=lambda p: p["pointIndex"]),
+        strict=False,
+    ):
+        assert np_pt["x"] == fb_pt["x"]
+        assert np_pt["y"] == fb_pt["y"]
+        assert np_pt["pointIndex"] == fb_pt["pointIndex"]
+
+
+def test_waterfall_horizontal_orientation() -> None:
+    """Horizontal waterfall (orientation='h') extracts bars correctly."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            y=["Start", "Revenue", "Costs"],
+            x=[500, 200, -80],
+            measure=["absolute", "relative", "relative"],
+            orientation="h",
+        )
+    )
+    plot = plotly(fig)
+
+    # Visual extents on x-axis:
+    #   Start:   [0, 500]
+    #   Revenue: [500, 700]
+    #   Costs:   [620, 700]
+    # x_range [550, 750] overlaps Revenue and Costs but not Start.
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [550.0, 750.0], "y": [-0.5, 2.5]},
+    }
+    result = plot._convert_value(selection)
+    labels = [p["y"] for p in result]
+    assert "Revenue" in labels
+    assert "Costs" in labels
+    assert "Start" not in labels
+
+
+def test_waterfall_multi_trace() -> None:
+    """Multiple waterfall traces are each extracted independently."""
+    fig = go.Figure(
+        data=[
+            go.Waterfall(
+                x=["A", "B"],
+                y=[100, 50],
+                measure=["absolute", "relative"],
+                name="T1",
+            ),
+            go.Waterfall(
+                x=["A", "B"],
+                y=[200, -30],
+                measure=["absolute", "relative"],
+                name="T2",
+            ),
+        ]
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [-0.5, 1.5], "y": [0.0, 300.0]},
+    }
+    result = plot._convert_value(selection)
+    curve_numbers = {p["curveNumber"] for p in result}
+    assert curve_numbers == {0, 1}
+    assert len(result) == 4
+
+
+def test_waterfall_customdata_included() -> None:
+    """customdata attached to bars appears in extracted points."""
+    fig = go.Figure(
+        data=go.Waterfall(
+            x=["Start", "Revenue"],
+            y=[1000, 400],
+            measure=["absolute", "relative"],
+            customdata=[["dept_A"], ["dept_B"]],
+        )
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [-0.5, 1.5], "y": [0.0, 1500.0]},
+    }
+    result = plot._convert_value(selection)
+    assert all(p.get("customdata") is not None for p in result)
+
+
+# ============================================================================
+# Funnel chart tests
+# ============================================================================
+
+
+def test_funnel_basic() -> None:
+    """Funnel plot with no selection starts with empty value."""
+    fig = go.Figure(
+        data=go.Funnel(
+            y=["Visit", "Cart", "Purchase"],
+            x=[1000, 800, 600],
+        )
+    )
+    plot = plotly(fig)
+    assert plot.value == []
+    assert plot.indices == []
+
+
+def test_funnel_click_selection() -> None:
+    """Click on a funnel stage passes through with all funnel-specific fields."""
+    fig = go.Figure(
+        data=go.Funnel(
+            y=["Visit", "Cart", "Purchase"],
+            x=[1000, 800, 600],
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {
+                "x": 1000,
+                "y": "Visit",
+                "label": "Visit",
+                "value": 1000,
+                "percentInitial": 1.0,
+                "percentPrevious": 1.0,
+                "percentTotal": 1.0,
+                "curveNumber": 0,
+                "pointIndex": 0,
+                "pointNumber": 0,
+            }
+        ],
+        "indices": [0],
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 1
+    assert result[0]["x"] == 1000
+    assert result[0]["y"] == "Visit"
+    assert result[0]["percentInitial"] == 1.0
+    assert plot.indices == [0]
+
+
+def test_funnel_range_selection() -> None:
+    """Box selection on funnel extracts stages whose bar overlaps the range."""
+    fig = go.Figure(
+        data=go.Funnel(
+            y=["Visit", "Cart", "Purchase"],
+            x=[1000, 800, 600],
+        )
+    )
+    plot = plotly(fig)
+
+    # Range covers y positions 0 and 1 (Visit, Cart) with x overlap
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [500, 1100], "y": [-0.5, 1.5]},
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 2
+    labels = [p["y"] for p in result]
+    assert "Visit" in labels
+    assert "Cart" in labels
+    assert "Purchase" not in labels
+
+
+def test_funnel_range_selection_all_stages() -> None:
+    """Full range selects every funnel stage."""
+    fig = go.Figure(
+        data=go.Funnel(
+            y=["Visit", "Cart", "Purchase"],
+            x=[1000, 800, 600],
+        )
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [0, 1100], "y": [-0.5, 2.5]},
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 3
+
+
+def test_funnel_range_selection_empty() -> None:
+    """Range that misses all stages returns empty selection."""
+    fig = go.Figure(
+        data=go.Funnel(
+            y=["Visit", "Cart", "Purchase"],
+            x=[1000, 800, 600],
+        )
+    )
+    plot = plotly(fig)
+
+    # x range below all values
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [-500, -1], "y": [-0.5, 2.5]},
+    }
+    result = plot._convert_value(selection)
+    assert result == []
+    assert plot.indices == []
+
+
+def test_funnel_numpy_and_fallback_match() -> None:
+    """numpy and fallback extraction produce identical results."""
+    fig = go.Figure(
+        data=go.Funnel(
+            y=["Visit", "Cart", "Purchase"],
+            x=[1000, 800, 600],
+        )
+    )
+
+    x_min, x_max = 500.0, 1100.0
+    y_min, y_max = -0.5, 1.5
+
+    numpy_result = _extract_funnel_stages_numpy(
+        fig, x_min, x_max, y_min, y_max
+    )
+    fallback_result = _extract_funnel_stages_fallback(
+        fig, x_min, x_max, y_min, y_max
+    )
+
+    assert len(numpy_result) == len(fallback_result)
+    for np_pt, fb_pt in zip(
+        sorted(numpy_result, key=lambda p: p["pointIndex"]),
+        sorted(fallback_result, key=lambda p: p["pointIndex"]),
+        strict=True,
+    ):
+        assert np_pt["x"] == fb_pt["x"]
+        assert np_pt["y"] == fb_pt["y"]
+        assert np_pt["pointIndex"] == fb_pt["pointIndex"]
+
+
+def test_funnel_vertical_orientation() -> None:
+    """Vertical funnel (orientation='v') extracts stages correctly."""
+    fig = go.Figure(
+        data=go.Funnel(
+            x=["Visit", "Cart", "Purchase"],
+            y=[1000, 800, 600],
+            orientation="v",
+        )
+    )
+    plot = plotly(fig)
+
+    # For vertical funnel: x=labels (cat axis), y=values (val axis)
+    # y_range covers stages 0 and 1, x_range covers their positions
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [-0.5, 1.5], "y": [500, 1100]},
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 2
+    labels = [p["x"] for p in result]
+    assert "Visit" in labels
+    assert "Cart" in labels
+
+
+def test_funnel_multi_trace() -> None:
+    """Multiple funnel traces are each extracted independently."""
+    fig = go.Figure(
+        data=[
+            go.Funnel(y=["A", "B"], x=[100, 50], name="T1"),
+            go.Funnel(y=["A", "B"], x=[200, 80], name="T2"),
+        ]
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [0, 250], "y": [-0.5, 1.5]},
+    }
+    result = plot._convert_value(selection)
+    curve_numbers = {p["curveNumber"] for p in result}
+    assert curve_numbers == {0, 1}
+    assert len(result) == 4
+
+
+def test_funnel_customdata_included() -> None:
+    """customdata attached to funnel stages appears in extracted points."""
+    fig = go.Figure(
+        data=go.Funnel(
+            y=["Visit", "Cart"],
+            x=[1000, 800],
+            customdata=[["web", "US"], ["mobile", "EU"]],
+        )
+    )
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [],
+        "indices": [],
+        "range": {"x": [0, 1100], "y": [-0.5, 1.5]},
+    }
+    result = plot._convert_value(selection)
+    assert any(p.get("customdata") is not None for p in result)
+
+
+def test_funnel_click_empty_placeholder_stripped() -> None:
+    """Empty-dict placeholders from the frontend are stripped on click."""
+    fig = go.Figure(data=go.Funnel(y=["Visit", "Cart"], x=[1000, 800]))
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {},
+            {"x": 1000, "y": "Visit", "curveNumber": 0, "pointIndex": 0},
+        ],
+        "indices": [999, 0],
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 1
+    assert result[0]["y"] == "Visit"
+    assert plot.indices == [0]
+
+
+# ============================================================================
+# FunnelArea chart tests
+# ============================================================================
+
+
+def test_funnelarea_basic() -> None:
+    """FunnelArea plot starts with empty value."""
+    fig = go.Figure(
+        data=go.Funnelarea(
+            labels=["Visit", "Cart", "Purchase"],
+            values=[1000, 800, 600],
+        )
+    )
+    plot = plotly(fig)
+    assert plot.value == []
+    assert plot.indices == []
+
+
+def test_funnelarea_click_selection() -> None:
+    """Click on a funnelarea sector passes through label/value/percent fields."""
+    fig = go.Figure(
+        data=go.Funnelarea(
+            labels=["Visit", "Cart", "Purchase"],
+            values=[1000, 800, 600],
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {
+                "label": "Cart",
+                "value": 800,
+                "percentInitial": 0.8,
+                "percentPrevious": 0.8,
+                "percentTotal": 0.8,
+                "curveNumber": 0,
+                "pointNumber": 1,
+            }
+        ],
+        "indices": [1],
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 1
+    assert result[0]["label"] == "Cart"
+    assert result[0]["value"] == 800
+    assert result[0]["percentInitial"] == 0.8
+    assert plot.indices == [1]
+
+
+def test_funnelarea_click_empty_placeholder_stripped() -> None:
+    """Empty-dict placeholders are stripped for funnelarea clicks."""
+    fig = go.Figure(
+        data=go.Funnelarea(
+            labels=["Visit", "Cart"],
+            values=[1000, 800],
+        )
+    )
+    plot = plotly(fig)
+
+    selection = {
+        "points": [
+            {},
+            {
+                "label": "Visit",
+                "value": 1000,
+                "curveNumber": 0,
+                "pointNumber": 0,
+            },
+        ],
+        "indices": [999, 0],
+    }
+    result = plot._convert_value(selection)
+    assert len(result) == 1
+    assert result[0]["label"] == "Visit"
+    assert plot.indices == [0]
+
+
+def test_violin_and_bar_range_selection_interaction() -> None:
+    """Mixed violin+bar figure: both trace types appear in the range result."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A"], y=[1, 2]))
+    fig.add_trace(go.Bar(x=["A"], y=[10]))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "range": {"x": [-0.4, 0.4], "y": [0, 15]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+
+    curve_numbers = {r["curveNumber"] for r in result}
+    assert 0 in curve_numbers  # violin trace
+    assert 1 in curve_numbers  # bar trace
+
+
+def test_violin_lasso_without_range_skips_extraction() -> None:
+    """Lasso event without a range dict does not extract violin rows."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "B"], y=[1, 2, 3]))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "lasso": {"x": [0.5, 1.0, 0.5], "y": [0, 10, 10]},
+        "points": [],
+        "indices": [],
+    }
+
+    result = plot._convert_value(selection)
+    assert result == []
+
+
+def test_violin_click_with_empty_point_numbers_produces_no_rows() -> None:
+    """Click with empty pointNumbers list expands to zero points."""
+    fig = go.Figure()
+    fig.add_trace(go.Violin(x=["A", "A", "A"], y=[1, 2, 3]))
+    plot = plotly(fig)
+
+    selection: dict[str, Any] = {
+        "points": [
+            {
+                "x": "A",
+                "y": 1,
+                "pointIndex": 0,
+                "pointNumbers": [],
+                "curveNumber": 0,
+            }
+        ],
+        "indices": [0],
+    }
+
+    result = plot._convert_value(selection)
+    assert result == []

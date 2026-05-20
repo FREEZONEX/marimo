@@ -1,16 +1,19 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import functools
 import html
 import json
 import os
+import re
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Literal, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from marimo._ast.app_config import _AppConfig
 from marimo._config.config import MarimoConfig, PartialMarimoConfig
 from marimo._convert.converters import MarimoConvert
+from marimo._messaging.notification import ModelLifecycleNotification
 from marimo._output.utils import uri_encode_component
 from marimo._schemas.notebook import NotebookV1
 from marimo._schemas.session import NotebookSessionV1
@@ -20,6 +23,10 @@ from marimo._session.model import SessionMode
 from marimo._session.notebook import read_css_file, read_html_head_file
 from marimo._utils.versions import is_editable
 from marimo._version import __version__
+
+if TYPE_CHECKING:
+    from marimo._server.api.endpoints.assets import LspWorkspace
+
 
 MOUNT_CONFIG_TEMPLATE = "'{{ mount_config }}'"
 
@@ -42,19 +49,61 @@ def json_script(data: Any) -> str:
     return json.dumps(data, sort_keys=True).translate(_json_script_escapes)
 
 
+def _export_context_block(*, notebook_code: str) -> str:
+    """Emit the trusted export marker consumed by islands/export runtime code."""
+    return dedent(
+        f"""
+    <script data-marimo="true">
+        Object.defineProperty(window, "__MARIMO_EXPORT_CONTEXT__", {{
+            value: Object.freeze({{
+                trusted: true,
+                notebookCode: {json_script(notebook_code)},
+            }}),
+            writable: false,
+            configurable: false,
+        }});
+    </script>
+    """
+    )
+
+
+def _static_state_block(
+    *, files: dict[str, str], model_notifications: list[Any]
+) -> str:
+    """Emit the static-export virtual file table as a frozen, non-configurable
+    global. Locking the shape prevents notebook-authored content from
+    redirecting `@file/...` fetches by mutating the map after emission."""
+    return dedent(
+        f"""
+    <script data-marimo="true">
+        Object.defineProperty(window, "__MARIMO_STATIC__", {{
+            value: Object.freeze({{
+                files: Object.freeze({json_script(files)}),
+                modelNotifications: Object.freeze({json_script(model_notifications)}),
+            }}),
+            writable: false,
+            configurable: false,
+        }});
+    </script>
+    """
+    )
+
+
 def _get_mount_config(
     *,
-    filename: Optional[str],
-    mode: Literal["edit", "home", "read"],
+    filename: str | None,
+    cwd: str | None = None,
+    lsp_workspace: LspWorkspace | None = None,
+    mode: Literal["edit", "home", "read", "gallery"],
     server_token: SkewProtectionToken,
     user_config: MarimoConfig,
     config_overrides: PartialMarimoConfig,
-    app_config: Optional[_AppConfig],
-    version: Optional[str] = None,
+    app_config: _AppConfig | None,
+    version: str | None = None,
     show_app_code: bool = True,
-    session_snapshot: Optional[NotebookSessionV1] = None,
-    notebook_snapshot: Optional[NotebookV1] = None,
-    runtime_config: Optional[list[dict[str, Any]]] = None,
+    session_snapshot: NotebookSessionV1 | None = None,
+    notebook_snapshot: NotebookV1 | None = None,
+    runtime_config: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     Return a JSON string with custom indentation and sorting.
@@ -62,6 +111,8 @@ def _get_mount_config(
 
     options: dict[str, Any] = {
         "filename": filename or "",
+        "cwd": cwd or "",
+        "lsp_workspace": lsp_workspace,
         "mode": mode,
         "version": version or get_version(),
         "server_token": str(server_token),
@@ -80,6 +131,8 @@ def _get_mount_config(
 
     return """{{
             "filename": {filename},
+            "cwd": {cwd},
+            "lspWorkspace": {lsp_workspace},
             "mode": {mode},
             "version": {version},
             "serverToken": {server_token},
@@ -100,7 +153,8 @@ def home_page_template(
     user_config: MarimoConfig,
     config_overrides: PartialMarimoConfig,
     server_token: SkewProtectionToken,
-    asset_url: Optional[str] = None,
+    mode: SessionMode,
+    asset_url: str | None = None,
 ) -> str:
     html = html.replace("{{ base_url }}", base_url)
     html = html.replace("{{ title }}", "marimo")
@@ -115,11 +169,14 @@ def home_page_template(
 
     html = _replace_asset_urls(html, asset_url)
 
+    app_mode: Literal["home", "gallery"] = (
+        "home" if mode == SessionMode.EDIT else "gallery"
+    )
     html = html.replace(
         MOUNT_CONFIG_TEMPLATE,
         _get_mount_config(
             filename=None,
-            mode="home",
+            mode=app_mode,
             server_token=server_token,
             user_config=user_config,
             config_overrides=config_overrides,
@@ -133,6 +190,76 @@ def home_page_template(
     return html
 
 
+def opengraph_metadata_template(
+    *,
+    base_url: str,
+    mode: SessionMode,
+    app_config: _AppConfig,
+    filename: str | None,
+    filepath: str | None,
+) -> str:
+    """Return OpenGraph `<meta>` tags for a notebook, or an empty string."""
+    if not filepath:
+        return ""
+
+    try:
+        from marimo._metadata.opengraph import (
+            OpenGraphContext,
+            is_https_url,
+            resolve_opengraph_metadata,
+        )
+
+        file_key = (
+            filename if filename and not Path(filename).is_absolute() else None
+        )
+        opengraph = resolve_opengraph_metadata(
+            filepath,
+            app_title=app_config.app_title,
+            context=OpenGraphContext(
+                filepath=filepath,
+                file_key=file_key,
+                base_url=base_url,
+                mode=mode.value,
+            ),
+        )
+    except Exception:
+        return ""
+
+    if not opengraph.title and not opengraph.description:
+        return ""
+
+    if opengraph.image and is_https_url(opengraph.image):
+        thumbnail_url = opengraph.image
+    else:
+        # Server-resolvable thumbnail URL, falling back to a placeholder when
+        # no screenshot exists.
+        thumbnail_url = f"{base_url}/og/thumbnail"
+        if filename and not Path(filename).is_absolute():
+            thumbnail_url = (
+                f"{thumbnail_url}?file={uri_encode_component(filename)}"
+            )
+
+    meta_tags: list[str] = []
+    if opengraph.title:
+        meta_tags.append(
+            f'<meta property="og:title" content="{_html_escape(opengraph.title)}" />'
+        )
+    if opengraph.description:
+        meta_tags.append(
+            f'<meta property="og:description" content="{_html_escape(opengraph.description)}" />'
+        )
+        meta_tags.append(
+            f'<meta name="description" content="{_html_escape(opengraph.description)}" />'
+        )
+    meta_tags.append(
+        f'<meta property="og:image" content="{_html_escape(thumbnail_url)}" />'
+    )
+    meta_tags.append(
+        '<meta name="twitter:card" content="summary_large_image" />'
+    )
+    return "\n".join(meta_tags)
+
+
 def notebook_page_template(
     *,
     html: str,
@@ -141,23 +268,30 @@ def notebook_page_template(
     config_overrides: PartialMarimoConfig,
     server_token: SkewProtectionToken,
     app_config: _AppConfig,
-    filename: Optional[str],
+    filename: str | None,
+    filepath: str | None = None,
+    lsp_workspace: LspWorkspace | None = None,
     mode: SessionMode,
-    session_snapshot: Optional[NotebookSessionV1] = None,
-    notebook_snapshot: Optional[NotebookV1] = None,
-    runtime_config: Optional[list[dict[str, Any]]] = None,
-    asset_url: Optional[str] = None,
+    session_snapshot: NotebookSessionV1 | None = None,
+    notebook_snapshot: NotebookV1 | None = None,
+    runtime_config: list[dict[str, Any]] | None = None,
+    asset_url: str | None = None,
+    html_head: str | None = None,
 ) -> str:
     html = html.replace("{{ base_url }}", base_url)
 
     # When we have a remote URL, let's pre-populate the index.html page
     # with a view of the notebook.
-    if runtime_config and filename and notebook_snapshot is None:
-        filepath = Path(filename)
-        if filepath.exists():
-            notebook_snapshot = MarimoConvert.from_py(
-                filepath.read_text(encoding="utf-8")
-            ).to_notebook_v1()
+    if runtime_config and notebook_snapshot is None:
+        # Prefer the absolute path for IO, since `filename` can be a display
+        # path (workspace-relative) in gallery mode.
+        path = filepath or filename
+        if path:
+            path_obj = Path(path)
+            if path_obj.exists():
+                notebook_snapshot = MarimoConvert.from_py(
+                    path_obj.read_text(encoding="utf-8")
+                ).to_notebook_v1()
 
     html = html.replace("{{ filename }}", _html_escape(filename or ""))
 
@@ -170,10 +304,13 @@ def notebook_page_template(
 
     html = _replace_asset_urls(html, asset_url)
 
+    cwd = os.path.dirname(filepath) if filepath else None
     html = html.replace(
         MOUNT_CONFIG_TEMPLATE,
         _get_mount_config(
             filename=filename,
+            cwd=cwd,
+            lsp_workspace=lsp_workspace,
             mode="read" if mode == SessionMode.RUN else "edit",
             server_token=server_token,
             user_config=user_config,
@@ -194,22 +331,46 @@ def notebook_page_template(
         ),
     )
 
+    opengraph_tags = opengraph_metadata_template(
+        base_url=base_url,
+        mode=mode,
+        app_config=app_config,
+        filename=filename,
+        filepath=filepath,
+    )
+    if opengraph_tags:
+        html = html.replace("</head>", f"{opengraph_tags}\n</head>")
+
     # If has custom css, inline the css and add to the head
+    # Prefer the absolute path for IO, since `filename` can be a display
+    # path (workspace-relative) in gallery/workspace mode.
     if app_config.css_file:
-        css_contents = read_css_file(app_config.css_file, filename=filename)
+        css_contents = read_css_file(
+            app_config.css_file, filename=filepath or filename
+        )
         if css_contents:
             css_contents = _custom_css_block(css_contents)
             # Append to head
             html = html.replace("</head>", f"{css_contents}</head>")
 
     # Add custom CSS from display config
-    html = _inject_custom_css_for_config(html, user_config, filename)
-    html = _inject_custom_css_for_config(html, config_overrides, filename)
+    html = _inject_custom_css_for_config(
+        html, user_config, filepath or filename
+    )
+    html = _inject_custom_css_for_config(
+        html, config_overrides, filepath or filename
+    )
 
-    # Add HTML head file contents if specified
-    if app_config.html_head_file:
+    # Add global HTML head contents if specified (from create_asgi_app)
+    if html_head:
+        html = html.replace("</head>", f"{html_head}</head>")
+
+    # html_head_file is blocked in edit mode: it can contain arbitrary scripts
+    # and markup that could exfiltrate data or redress the UI. CSS-only styling
+    # (css_file) is permitted. Run mode is unaffected.
+    if mode == SessionMode.RUN and app_config.html_head_file:
         head_contents = read_html_head_file(
-            app_config.html_head_file, filename=filename
+            app_config.html_head_file, filename=filepath or filename
         )
         if head_contents:
             # Append to head
@@ -224,13 +385,14 @@ def static_notebook_template(
     config_overrides: PartialMarimoConfig,
     server_token: SkewProtectionToken,
     app_config: _AppConfig,
-    filepath: Optional[str],
+    filepath: str | None,
     code: str,
     code_hash: str,
     session_snapshot: NotebookSessionV1,
     notebook_snapshot: NotebookV1,
     files: dict[str, str],
-    asset_url: Optional[str] = None,
+    model_notifications: list[ModelLifecycleNotification] | None = None,
+    asset_url: str | None = None,
 ) -> str:
     if asset_url is None:
         asset_url = f"https://cdn.jsdelivr.net/npm/@marimo-team/frontend@{__version__}/dist"
@@ -247,6 +409,7 @@ def static_notebook_template(
         MOUNT_CONFIG_TEMPLATE,
         _get_mount_config(
             filename=filename,
+            cwd=None,  # We don't need the cwd for static notebooks
             mode="read",
             server_token=server_token,
             user_config=user_config,
@@ -267,14 +430,13 @@ def static_notebook_template(
         ),
     )
 
-    static_block = dedent(
-        f"""
-    <script data-marimo="true">
-        window.__MARIMO_STATIC__ = {{}};
-        window.__MARIMO_STATIC__.files = {json_script(files)};
-    </script>
-    """
+    static_block = _static_state_block(
+        files=files,
+        model_notifications=[
+            n.to_json_serializable() for n in model_notifications or []
+        ],
     )
+    static_block += _export_context_block(notebook_code=code)
 
     # Add HTML head file contents if specified
     if app_config.html_head_file:
@@ -341,7 +503,9 @@ def wasm_notebook_template(
     mode: Literal["edit", "run"],
     code: str,
     show_code: bool,
-    asset_url: Optional[str] = None,
+    asset_url: str | None = None,
+    session_snapshot: NotebookSessionV1 | None = None,
+    notebook_snapshot: NotebookV1 | None = None,
 ) -> str:
     """Template for WASM notebooks."""
     import re
@@ -375,6 +539,8 @@ def wasm_notebook_template(
             version=version,
             show_app_code=show_code,
             runtime_config=None,
+            session_snapshot=session_snapshot,
+            notebook_snapshot=notebook_snapshot,
         ),
     )
 
@@ -427,7 +593,10 @@ def wasm_notebook_template(
 
     body = body.replace(
         "</head>",
-        f'<marimo-code hidden="">{uri_encode_component(code)}</marimo-code></head>',
+        (
+            f"{_export_context_block(notebook_code=code)}"
+            f'<marimo-code hidden="">{uri_encode_component(code)}</marimo-code></head>'
+        ),
     )
 
     return body
@@ -451,22 +620,40 @@ def _del_none_or_empty(d: Any) -> Any:
     }
 
 
+@functools.lru_cache(maxsize=1)
 def get_version() -> str:
+    # Invariant for the lifetime of the process; cache so the three
+    # render-path call sites (mount_config + two .replace passes) don't
+    # each pay the importlib.metadata lookup.
     return (
         f"{__version__} (editable)" if is_editable("marimo") else __version__
     )
 
 
+# HTML5 terminates a <style> raw-text element at the first "</style"
+# (case-insensitive, optional whitespace). Neutralize that sequence so
+# notebook-controlled CSS cannot break out of the block and inject HTML.
+_STYLE_END_RE = re.compile(r"</(?=\s*style)", re.IGNORECASE)
+
+
+def _sanitize_css_for_style_block(css_contents: str) -> str:
+    # "\/" is a valid CSS escape for "/", so the CSS tokenizer still sees
+    # a (harmlessly invalid) token, while the HTML parser no longer
+    # matches the end-tag.
+    return _STYLE_END_RE.sub(r"<\\/", css_contents)
+
+
 def _custom_css_block(css_contents: str) -> str:
     # marimo-custom is used by the frontend to identify this stylesheet
     # comes from marimo
-    return f"<style title='marimo-custom'>{css_contents}</style>"
+    safe = _sanitize_css_for_style_block(css_contents)
+    return f"<style title='marimo-custom'>{safe}</style>"
 
 
 def _inject_custom_css_for_config(
     html: str,
-    config: Union[MarimoConfig, PartialMarimoConfig],
-    filename: Optional[str] = None,
+    config: MarimoConfig | PartialMarimoConfig,
+    filename: str | None = None,
 ) -> str:
     """Inject custom CSS from display config into HTML."""
     custom_css = config.get("display", {}).get("custom_css", [])
@@ -486,7 +673,7 @@ def _inject_custom_css_for_config(
     return html.replace("</head>", f"{css_block}</head>")
 
 
-def _replace_asset_urls(html: str, asset_url: Optional[str]) -> str:
+def _replace_asset_urls(html: str, asset_url: str | None) -> str:
     """Replace asset URLs with the given asset URL.
 
     These are naturally relative URLs. This can be used to load assets

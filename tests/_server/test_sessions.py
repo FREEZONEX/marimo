@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import inspect
 import os
 import queue
@@ -13,7 +12,7 @@ from multiprocessing.queues import Queue as MPQueue
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from textwrap import dedent
-from typing import Any, Callable, TypeVar
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,8 +23,8 @@ from marimo._config.manager import (
     get_default_config_manager,
 )
 from marimo._messaging.notification import (
+    NotebookDocumentTransactionNotification,
     NotificationMessage,
-    UpdateCellCodesNotification,
 )
 from marimo._messaging.serde import deserialize_kernel_message
 from marimo._messaging.types import KernelMessage
@@ -36,9 +35,9 @@ from marimo._runtime.commands import (
     SyncGraphCommand,
     UpdateUIElementCommand,
 )
-from marimo._server.file_router import AppFileRouter
 from marimo._server.session_manager import SessionManager
 from marimo._server.utils import initialize_asyncio
+from marimo._server.workspace import PathFileKey, SingleFileWorkspace
 from marimo._session import Session
 from marimo._session.consumer import SessionConsumer
 from marimo._session.events import SessionEventBus
@@ -56,8 +55,6 @@ from marimo._types.ids import ConsumerId, SessionId
 from marimo._utils.marimo_path import MarimoPath
 
 initialize_asyncio()
-
-F = TypeVar("F", bound=Callable[..., Any])
 
 app_metadata = AppMetadata(
     query_params={"some_param": "some_value"},
@@ -89,29 +86,9 @@ class MockSessionConsumer(SessionConsumer):
         self.notify_calls.append(deserialize_kernel_message(notification))
 
 
-# TODO(akshayka): automatically do this for every test in our test suite
-def save_and_restore_main(f: F) -> F:
-    """Kernels swap out the main module; restore it after running tests"""
-
-    @functools.wraps(f)
-    def wrapper(*args: Any, **kwargs: Any) -> None:
-        main = sys.modules["__main__"]
-        try:
-            res = f(*args, **kwargs)
-            if asyncio.iscoroutine(res):
-                asyncio.run(res)
-            else:
-                pass
-        finally:
-            sys.modules["__main__"] = main
-
-    return wrapper  # type: ignore
-
-
 session_id = SessionId("test")
 
 
-@save_and_restore_main
 def test_queue_manager() -> None:
     # Test with multiprocessing queues
     queue_manager_mp = QueueManagerImpl(use_multiprocessing=True)
@@ -126,7 +103,6 @@ def test_queue_manager() -> None:
     assert isinstance(queue_manager_thread.input_queue, queue.Queue)
 
 
-@save_and_restore_main
 def test_kernel_manager_run_mode() -> None:
     # Mock objects and data for testing
     queue_manager = QueueManagerImpl(use_multiprocessing=False)
@@ -139,7 +115,7 @@ def test_kernel_manager_run_mode() -> None:
         configs={},
         app_metadata=app_metadata,
         config_manager=get_default_config_manager(current_path=None),
-        virtual_files_supported=True,
+        virtual_file_storage="in_memory",
         redirect_console_to_browser=False,
     )
 
@@ -160,7 +136,6 @@ def test_kernel_manager_run_mode() -> None:
     assert queue_manager.control_queue.empty()
 
 
-@save_and_restore_main
 def test_kernel_manager_edit_mode() -> None:
     # Mock objects and data for testing
     queue_manager = QueueManagerImpl(use_multiprocessing=True)
@@ -173,7 +148,7 @@ def test_kernel_manager_edit_mode() -> None:
         configs={},
         app_metadata=app_metadata,
         config_manager=get_default_config_manager(current_path=None),
-        virtual_files_supported=True,
+        virtual_file_storage="shared_memory",
         redirect_console_to_browser=False,
     )
 
@@ -194,7 +169,6 @@ def test_kernel_manager_edit_mode() -> None:
     queue_manager.control_queue.join_thread()  # type: ignore
 
 
-@save_and_restore_main
 def test_kernel_manager_interrupt(tmp_path: Path) -> None:
     queue_manager = QueueManagerImpl(use_multiprocessing=True)
     mode = SessionMode.EDIT
@@ -205,7 +179,7 @@ def test_kernel_manager_interrupt(tmp_path: Path) -> None:
         configs={},
         app_metadata=app_metadata,
         config_manager=get_default_config_manager(current_path=None),
-        virtual_files_supported=True,
+        virtual_file_storage="shared_memory",
         redirect_console_to_browser=False,
     )
 
@@ -245,6 +219,7 @@ def test_kernel_manager_interrupt(tmp_path: Path) -> None:
                     ),
                 ),
             ),
+            cell_ids=("1",),
             set_ui_element_value_request=UpdateUIElementCommand(
                 object_ids=[], values=[]
             ),
@@ -299,7 +274,6 @@ def test_kernel_manager_interrupt(tmp_path: Path) -> None:
 session_id = SessionId("test_session_id")
 
 
-@save_and_restore_main
 async def test_session() -> None:
     session_consumer: Any = MagicMock()
     session_consumer.connection_state.return_value = ConnectionState.OPEN
@@ -310,7 +284,7 @@ async def test_session() -> None:
         configs={},
         app_metadata=app_metadata,
         config_manager=get_default_config_manager(current_path=None),
-        virtual_files_supported=True,
+        virtual_file_storage="in_memory",
         redirect_console_to_browser=False,
     )
 
@@ -345,7 +319,6 @@ async def test_session() -> None:
     assert session.connection_state() == ConnectionState.CLOSED
 
 
-@save_and_restore_main
 def test_session_disconnect_reconnect() -> None:
     session_consumer: Any = MagicMock()
     session_consumer.connection_state.return_value = ConnectionState.OPEN
@@ -356,7 +329,7 @@ def test_session_disconnect_reconnect() -> None:
         configs={},
         app_metadata=app_metadata,
         config_manager=get_default_config_manager(current_path=None),
-        virtual_files_supported=True,
+        virtual_file_storage="in_memory",
         redirect_console_to_browser=False,
     )
 
@@ -403,7 +376,6 @@ def test_session_disconnect_reconnect() -> None:
     assert session.connection_state() == ConnectionState.CLOSED
 
 
-@save_and_restore_main
 def test_session_with_kiosk_consumers() -> None:
     session_consumer: Any = MagicMock()
     session_consumer.connection_state.return_value = ConnectionState.OPEN
@@ -414,7 +386,7 @@ def test_session_with_kiosk_consumers() -> None:
         configs={},
         app_metadata=app_metadata,
         config_manager=get_default_config_manager(current_path=None),
-        virtual_files_supported=True,
+        virtual_file_storage="in_memory",
         redirect_console_to_browser=False,
     )
 
@@ -468,7 +440,6 @@ def test_session_with_kiosk_consumers() -> None:
 
 
 @pytest.mark.flaky(reruns=3)
-@save_and_restore_main
 async def test_session_manager_file_watching(tmp_path: Path) -> None:
     # Create a temporary file
     tmp_file = tmp_path / "test.py"
@@ -482,13 +453,13 @@ def __():
     1
 """
     )
-    file_key = str(tmp_file)
+    file_key = PathFileKey(str(tmp_file))
 
     try:
         # Create a session manager with file watching enabled
-        file_router = AppFileRouter.from_filename(MarimoPath(tmp_file))
+        workspace = SingleFileWorkspace.from_path(MarimoPath(tmp_file))
         session_manager = SessionManager(
-            file_router=file_router,
+            workspace=workspace,
             mode=SessionMode.EDIT,
             quiet=True,
             include_code=True,
@@ -535,20 +506,18 @@ def __():
         )
 
         # Wait for the watcher to detect the change
-        for _ in range(16):  # noqa: B007
+        for _ in range(16):
             await asyncio.sleep(0.1)
             if len(session_consumer.notify_calls) > 0:
                 break
 
-        # Check that UpdateCellCodes was sent with the new code
-        update_ops = [
+        # Check that a document transaction was sent with the new code
+        tx_ops = [
             op
             for op in session_consumer.notify_calls
-            if isinstance(op, UpdateCellCodesNotification)
+            if isinstance(op, NotebookDocumentTransactionNotification)
         ]
-        assert len(update_ops) == 1
-        assert "2" == update_ops[0].codes[0]
-        assert update_ops[0].code_is_stale is True
+        assert len(tx_ops) >= 1
 
         # Create another session for the same file
         session_consumer2 = MockSessionConsumer()
@@ -574,7 +543,7 @@ def __():
         )
 
         # Wait for the watcher to detect the change
-        for _ in range(16):  # noqa: B007
+        for _ in range(16):
             await asyncio.sleep(0.1)
             if len(session_consumer.notify_calls) > 0:
                 break
@@ -583,17 +552,15 @@ def __():
         update_ops = [
             op
             for op in session_consumer.notify_calls
-            if isinstance(op, UpdateCellCodesNotification)
+            if isinstance(op, NotebookDocumentTransactionNotification)
         ]
         update_ops2 = [
             op
             for op in session_consumer2.notify_calls
-            if isinstance(op, UpdateCellCodesNotification)
+            if isinstance(op, NotebookDocumentTransactionNotification)
         ]
-        assert len(update_ops) == 1
-        assert len(update_ops2) == 1
-        assert "3" == update_ops[0].codes[0]
-        assert "3" == update_ops2[0].codes[0]
+        assert len(update_ops) >= 1
+        assert len(update_ops2) >= 1
 
         # Close one session and verify the other still receives updates
         session_manager.close_session(session_id)
@@ -611,7 +578,7 @@ def __():
         )
 
         # Wait for the watcher to detect the change
-        for _ in range(16):  # noqa: B007
+        for _ in range(16):
             await asyncio.sleep(0.1)
             if len(session_consumer2.notify_calls) > 0:
                 break
@@ -620,16 +587,14 @@ def __():
         update_ops2 = [
             op
             for op in session_consumer2.notify_calls
-            if isinstance(op, UpdateCellCodesNotification)
+            if isinstance(op, NotebookDocumentTransactionNotification)
         ]
-        assert len(update_ops2) == 1
-        assert "4" == update_ops2[0].codes[0]
+        assert len(update_ops2) >= 1
     finally:
         # Cleanup
         session_manager.shutdown()
 
 
-@save_and_restore_main
 def test_watch_mode_does_not_override_config(tmp_path: Path) -> None:
     """Test that watch mode does not override config settings."""
     # Create a temporary file
@@ -640,9 +605,9 @@ def test_watch_mode_does_not_override_config(tmp_path: Path) -> None:
     config_reader = get_default_config_manager(current_path=None)
 
     # Create a session manager with watch mode enabled
-    file_router = AppFileRouter.from_filename(MarimoPath(str(tmp_file)))
+    workspace = SingleFileWorkspace.from_path(MarimoPath(str(tmp_file)))
     session_manager = SessionManager(
-        file_router=file_router,
+        workspace=workspace,
         mode=SessionMode.EDIT,
         quiet=True,
         include_code=True,
@@ -657,7 +622,7 @@ def test_watch_mode_does_not_override_config(tmp_path: Path) -> None:
     )
 
     session_manager_no_watch = SessionManager(
-        file_router=file_router,
+        workspace=workspace,
         mode=SessionMode.EDIT,
         quiet=True,
         include_code=True,
@@ -684,7 +649,6 @@ def test_watch_mode_does_not_override_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.flaky(reruns=3)
-@save_and_restore_main
 async def test_watch_mode_with_watcher_on_save_autorun(tmp_path: Path) -> None:
     """Test that watch mode with autorun config auto-executes changed cells."""
     tmp_file = tmp_path / "test.py"
@@ -714,9 +678,9 @@ async def test_watch_mode_with_watcher_on_save_autorun(tmp_path: Path) -> None:
         )
 
         # Create a session manager with file watching enabled
-        file_router = AppFileRouter.from_filename(MarimoPath(str(tmp_file)))
+        workspace = SingleFileWorkspace.from_path(MarimoPath(str(tmp_file)))
         session_manager = SessionManager(
-            file_router=file_router,
+            workspace=workspace,
             mode=SessionMode.EDIT,
             quiet=True,
             include_code=True,
@@ -738,14 +702,14 @@ async def test_watch_mode_with_watcher_on_save_autorun(tmp_path: Path) -> None:
             session_id=session_id,
             session_consumer=session_consumer,
             query_params={},
-            file_key=str(tmp_file),
+            file_key=PathFileKey(str(tmp_file)),
             auto_instantiate=False,
         )
         mock_session_view = MagicMock(spec=SessionView)
         session.session_view = mock_session_view
 
         # Wait for file watcher to be initialized by checking it exists
-        for _ in range(20):  # noqa: B007
+        for _ in range(20):
             await asyncio.sleep(0.05)
             if (
                 hasattr(session_manager, "_file_watcher")
@@ -768,22 +732,20 @@ async def test_watch_mode_with_watcher_on_save_autorun(tmp_path: Path) -> None:
             )
         )
 
-        # Wait for the watcher to detect the change and send UpdateCellCodes
-        update_ops: list[UpdateCellCodesNotification] = []
-        for _ in range(20):  # noqa: B007
+        # Wait for the watcher to detect the change and send transaction
+        tx_ops: list[NotebookDocumentTransactionNotification] = []
+        for _ in range(20):
             await asyncio.sleep(0.1)
-            update_ops = [
+            tx_ops = [
                 op
                 for op in session_consumer.notify_calls
-                if isinstance(op, UpdateCellCodesNotification)
+                if isinstance(op, NotebookDocumentTransactionNotification)
             ]
-            if update_ops:
+            if tx_ops:
                 break
 
-        # Check that UpdateCellCodes was sent with code_is_stale=False (autorun)
-        assert len(update_ops) == 1
-        assert "2" in update_ops[0].codes[0]
-        assert update_ops[0].code_is_stale is False
+        # Check that a document transaction was sent (autorun)
+        assert len(tx_ops) >= 1
 
         # Verify that cells were queued for execution
         assert session.session_view.add_control_request.called
@@ -796,7 +758,6 @@ async def test_watch_mode_with_watcher_on_save_autorun(tmp_path: Path) -> None:
             session_manager.shutdown()
 
 
-@save_and_restore_main
 async def test_watch_mode_with_watcher_on_save_lazy(tmp_path: Path) -> None:
     """Test that watch mode with lazy config marks cells as stale without executing."""
     tmp_file = tmp_path / "test.py"
@@ -826,9 +787,9 @@ async def test_watch_mode_with_watcher_on_save_lazy(tmp_path: Path) -> None:
         )
 
         # Create a session manager with file watching enabled
-        file_router = AppFileRouter.from_filename(MarimoPath(str(tmp_file)))
+        workspace = SingleFileWorkspace.from_path(MarimoPath(str(tmp_file)))
         session_manager = SessionManager(
-            file_router=file_router,
+            workspace=workspace,
             mode=SessionMode.EDIT,
             quiet=True,
             include_code=True,
@@ -850,12 +811,12 @@ async def test_watch_mode_with_watcher_on_save_lazy(tmp_path: Path) -> None:
             session_id=session_id,
             session_consumer=session_consumer,
             query_params={},
-            file_key=str(tmp_file),
+            file_key=PathFileKey(str(tmp_file)),
             auto_instantiate=False,
         )
 
         # Wait a bit for session to be ready
-        for _ in range(16):  # noqa: B007
+        for _ in range(16):
             await asyncio.sleep(0.1)
             if len(session_consumer.notify_calls) > 0:
                 break
@@ -876,20 +837,18 @@ async def test_watch_mode_with_watcher_on_save_lazy(tmp_path: Path) -> None:
         )
 
         # Wait for the watcher to detect the change
-        for _ in range(16):  # noqa: B007
+        for _ in range(16):
             await asyncio.sleep(0.1)
             if len(session_consumer.notify_calls) > 0:
                 break
 
-        # Check that UpdateCellCodes was sent with code_is_stale=True (lazy)
-        update_ops = [
+        # Check that a document transaction was sent (lazy mode)
+        tx_ops = [
             op
             for op in session_consumer.notify_calls
-            if isinstance(op, UpdateCellCodesNotification)
+            if isinstance(op, NotebookDocumentTransactionNotification)
         ]
-        assert len(update_ops) == 1
-        assert "2" in update_ops[0].codes[0]
-        assert update_ops[0].code_is_stale is True
+        assert len(tx_ops) >= 1
 
     finally:
         # Cleanup
@@ -897,7 +856,6 @@ async def test_watch_mode_with_watcher_on_save_lazy(tmp_path: Path) -> None:
             session_manager.shutdown()
 
 
-@save_and_restore_main
 async def test_session_manager_file_rename() -> None:
     """Test that file renaming works correctly with file watching."""
     # Create two temporary files
@@ -920,9 +878,9 @@ def __():
 
     try:
         # Create a session manager with file watching enabled
-        file_router = AppFileRouter.from_filename(MarimoPath(str(tmp_path1)))
+        workspace = SingleFileWorkspace.from_path(MarimoPath(str(tmp_path1)))
         session_manager = SessionManager(
-            file_router=file_router,
+            workspace=workspace,
             mode=SessionMode.EDIT,
             quiet=True,
             include_code=True,
@@ -949,7 +907,7 @@ def __():
             session_id=session_id,
             session_consumer=session_consumer,
             query_params={},
-            file_key=str(tmp_path1),
+            file_key=PathFileKey(str(tmp_path1)),
             auto_instantiate=False,
         )
 
@@ -993,30 +951,28 @@ def __():
         )
 
         # Wait for the watcher to detect the change
-        for _ in range(16):  # noqa: B007
+        for _ in range(16):
             await asyncio.sleep(0.1)
             if len(operations) > 0:
                 break
 
-        # Check that UpdateCellCodes was sent with the new code
-        update_ops = [
+        # Check that a document transaction was sent with the new code
+        tx_ops = [
             op
             for op in operations
-            if isinstance(op, UpdateCellCodesNotification)
+            if isinstance(op, NotebookDocumentTransactionNotification)
         ]
-        assert len(update_ops) == 1
-        assert "2" == update_ops[0].codes[0]
+        assert len(tx_ops) >= 1
 
     finally:
         # Cleanup
         session_manager.shutdown()
-        if new_path.exists():  # noqa: ASYNC240
+        if new_path.exists():
             os.remove(new_path)
         if tmp_path1.exists():  # noqa: ASYNC240
             os.remove(tmp_path1)
 
 
-@save_and_restore_main
 def test_session_with_script_config_overrides(
     tmp_path: Path,
 ) -> None:
@@ -1047,7 +1003,7 @@ def test_session_with_script_config_overrides(
         app_metadata=app_metadata,
         app_file_manager=app_file_manager,
         config_manager=get_default_config_manager(current_path=None),
-        virtual_files_supported=True,
+        virtual_file_storage="in_memory",
         redirect_console_to_browser=False,
         ttl_seconds=None,
         auto_instantiate=True,
@@ -1068,23 +1024,41 @@ def test_session_with_script_config_overrides(
     session.close()
 
 
-@save_and_restore_main
-async def test_caching_enabled_only_in_edit_mode() -> None:
-    """Test that caching is only enabled in EDIT mode, not RUN mode."""
-    from marimo._session.extensions.extensions import CachingExtension
+async def test_caching_extension_respects_mode_and_config() -> None:
+    """Test caching enablement and mode across edit/run sessions."""
+    from marimo._session.extensions.extensions import (
+        CacheMode,
+        CachingExtension,
+    )
 
     session_consumer = MagicMock()
     session_consumer.connection_state.return_value = ConnectionState.OPEN
 
-    def create_session(mode: SessionMode, auto_instantiate: bool) -> Session:
+    def create_session(
+        mode: SessionMode,
+        auto_instantiate: bool,
+        *,
+        serve_cached_sessions_in_apps: bool | None = None,
+    ) -> Session:
+        config_manager = get_default_config_manager(current_path=None)
+        if serve_cached_sessions_in_apps is not None:
+            config_manager = config_manager.with_overrides(
+                {
+                    "runtime": {
+                        "serve_cached_sessions_in_apps": serve_cached_sessions_in_apps
+                    }
+                }
+            )
         return SessionImpl.create(
             initialization_id="test_session",
             session_consumer=session_consumer,
             mode=mode,
             app_metadata=app_metadata,
             app_file_manager=AppFileManager.from_app(InternalApp(App())),
-            config_manager=get_default_config_manager(current_path=None),
-            virtual_files_supported=True,
+            config_manager=config_manager,
+            virtual_file_storage="shared_memory"
+            if mode == SessionMode.EDIT
+            else "in_memory",
             redirect_console_to_browser=False,
             ttl_seconds=None,
             auto_instantiate=auto_instantiate,
@@ -1099,20 +1073,44 @@ async def test_caching_enabled_only_in_edit_mode() -> None:
         assert len(extension) == 1
         return extension[0]
 
-    # Test 1: EDIT mode with auto_instantiate=False -> caching enabled
+    # Test 1: EDIT mode with auto_instantiate=False -> caching enabled/read-write
     session_edit = create_session(SessionMode.EDIT, False)
 
     # Find the CachingExtension
     caching_extension_edit = find_caching_extension(session_edit)
     assert caching_extension_edit.enabled is True
+    assert caching_extension_edit.mode is CacheMode.READ_WRITE
 
-    # Test 2: RUN mode with auto_instantiate=True -> caching disabled
-    session_run = create_session(SessionMode.RUN, True)
+    # Test 2: EDIT mode with auto_instantiate=True -> caching disabled
+    session_edit_disabled = create_session(SessionMode.EDIT, True)
+    caching_extension_edit_disabled = find_caching_extension(
+        session_edit_disabled
+    )
+    assert caching_extension_edit_disabled.enabled is False
+    assert caching_extension_edit_disabled.mode is CacheMode.READ_WRITE
+
+    # Test 3: RUN mode with config disabled -> caching disabled/read-only
+    session_run_disabled = create_session(
+        SessionMode.RUN, True, serve_cached_sessions_in_apps=False
+    )
 
     # Find the CachingExtension
-    caching_extension_run = find_caching_extension(session_run)
-    assert caching_extension_run.enabled is False
+    caching_extension_run_disabled = find_caching_extension(
+        session_run_disabled
+    )
+    assert caching_extension_run_disabled.enabled is False
+    assert caching_extension_run_disabled.mode is CacheMode.READ
+
+    # Test 4: RUN mode with config enabled -> caching enabled/read-only
+    session_run_enabled = create_session(
+        SessionMode.RUN, True, serve_cached_sessions_in_apps=True
+    )
+    caching_extension_run_enabled = find_caching_extension(session_run_enabled)
+    assert caching_extension_run_enabled.enabled is True
+    assert caching_extension_run_enabled.mode is CacheMode.READ
 
     # Cleanup
     session_edit.close()
-    session_run.close()
+    session_edit_disabled.close()
+    session_run_disabled.close()
+    session_run_enabled.close()

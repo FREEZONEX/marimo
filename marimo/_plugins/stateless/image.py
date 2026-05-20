@@ -4,7 +4,7 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import marimo._output.data.data as mo_data
 from marimo._dependencies.dependencies import DependencyManager
@@ -14,14 +14,18 @@ from marimo._output.rich_help import mddoc
 from marimo._output.utils import create_style, normalize_dimension
 from marimo._plugins.core.media import io_to_data_url
 
-Image = Union[str, bytes, io.BytesIO, io.BufferedReader, Path]
+Image = str | bytes | io.BytesIO | io.BufferedReader | Path
 # Union[list, torch.Tensor, jax.numpy.ndarray,
 #             np.ndarray, scipy.sparse.spmatrix]
 Tensor = Any
-ImageLike = Union[Image, Tensor]
+ImageLike = Image | Tensor
 
 
-def _normalize_image(src: ImageLike) -> Image:
+def _normalize_image(
+    src: ImageLike,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> Image:
     """Normalize an image-like object to a standard format.
 
     This function handles a variety of input types, including lists, arrays,
@@ -39,6 +43,10 @@ def _normalize_image(src: ImageLike) -> Image:
     Args:
         src: An image-like object. This can be a list, array, tensor, or a
             file-like object.
+        vmin: Minimum value for normalization. If provided along with `vmax`,
+            values are clipped to [vmin, vmax] and scaled to [0, 255].
+            Only applies to array inputs.
+        vmax: Maximum value for normalization. See `vmin`.
 
     Returns:
         A BytesIO object or other Image type.
@@ -68,7 +76,42 @@ def _normalize_image(src: ImageLike) -> Image:
             if hasattr(src, "toarray"):
                 src = src.toarray()
             src = numpy.array(src)
-        src = (src - src.min()) / (src.max() - src.min()) * 255.0
+
+        # uint8 (typestr '|u1') is already in [0, 255]; use directly
+        # see https://numpy.org/doc/stable/reference/arrays.interface.html
+        is_uint8 = src.__array_interface__["typestr"] == "|u1"
+        has_bounds = vmin is not None or vmax is not None
+
+        if 0 in src.__array_interface__.get("shape", (0,)):
+            raise ValueError(
+                f"Cannot render an image from an array with a zero-size "
+                f"dimension (shape {src.__array_interface__['shape']!r})."
+            )
+
+        if not is_uint8 or has_bounds:
+            lo = float(vmin) if vmin is not None else float(src.min())
+            hi = float(vmax) if vmax is not None else float(src.max())
+            if has_bounds:
+                if lo > hi:
+                    raise ValueError(
+                        f"vmin ({vmin}) must be less than or equal to "
+                        f"vmax ({vmax})."
+                    )
+                # torch/jax/tf tensors lack __array_interface__ and are
+                # converted to numpy above, so src is always an ndarray here.
+                if not hasattr(src, "clip"):
+                    raise ValueError(
+                        f"Array of type {type(src)} does not support "
+                        "clipping. Convert to a numpy array before passing "
+                        "to `mo.image`."
+                    )
+                src = src.clip(lo, hi)
+            denom = hi - lo
+            if denom == 0:
+                src = src - src  # zeros, preserving shape
+            else:
+                src = (src - lo) / denom * 255.0
+
         img = _Image.fromarray(src.astype("uint8"))
         # io.BytesIO is one of the Image types.
         normalized_src: Image = io.BytesIO()
@@ -96,12 +139,14 @@ def _normalize_image(src: ImageLike) -> Image:
 @mddoc
 def image(
     src: ImageLike,
-    alt: Optional[str] = None,
-    width: Optional[Union[int, str]] = None,
-    height: Optional[Union[int, str]] = None,
+    alt: str | None = None,
+    width: int | str | None = None,
+    height: int | str | None = None,
     rounded: bool = False,
-    style: Optional[dict[str, Any]] = None,
-    caption: Optional[str] = None,
+    style: dict[str, Any] | None = None,
+    caption: str | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
 ) -> Html:
     """Render an image as HTML.
 
@@ -123,26 +168,48 @@ def image(
         )
         ```
 
+        ```python3
+        # Compare images with consistent intensity scaling
+        import numpy as np
+
+        dark = np.full((100, 100), 50)
+        light = np.full((100, 100), 200)
+        mo.hstack(
+            [
+                mo.image(dark, vmin=0, vmax=255),
+                mo.image(light, vmin=0, vmax=255),
+            ]
+        )
+        ```
+
     Args:
-        src: a path or URL to an image, a file-like object
-            (opened in binary mode), or array-like object.
+        src: a path or URL to an image, a file-like object (opened in binary
+            mode), or array-like object. When `src` is array-like, `uint8`
+            arrays are used as-is. Other dtypes are min-max normalized unless
+            `vmin`/`vmax` are provided.
         alt: the alt text of the image
         width: the width of the image in pixels or a string with units
         height: the height of the image in pixels or a string with units
         rounded: whether to round the corners of the image
         style: a dictionary of CSS styles to apply to the image
         caption: the caption of the image
+        vmin: minimum value for normalization when `src` is an array. Values
+            below `vmin` are clipped. If `None`, defaults to the array
+            minimum. Only used when `src` is array-like.
+        vmax: maximum value for normalization when `src` is an array. Values
+            above `vmax` are clipped. If `None`, defaults to the array
+            maximum. Only used when `src` is array-like.
 
     Returns:
         `Html` object
     """
     # Convert to virtual file
-    resolved_src: Optional[str]
-    src = _normalize_image(src)
+    resolved_src: str | None
+    src = _normalize_image(src, vmin=vmin, vmax=vmax)
     # TODO: Consider downsampling here. This is something matplotlib does
     # implicitly, and can potentially remove the bottle-neck of very large
     # images.
-    if isinstance(src, io.BufferedReader) or isinstance(src, io.BytesIO):
+    if isinstance(src, (io.BufferedReader, io.BytesIO)):
         src.seek(0)
         resolved_src = mo_data.image(src.read()).url
     elif isinstance(src, bytes):

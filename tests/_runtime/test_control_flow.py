@@ -4,6 +4,7 @@ from __future__ import annotations
 from marimo._runtime import control_flow
 from marimo._runtime.commands import ExecuteCellCommand
 from marimo._runtime.runner import cell_runner
+from marimo._runtime.runner.hooks import NotebookCellHooks
 from marimo._runtime.runtime import Kernel
 
 
@@ -60,13 +61,17 @@ async def test_stop_output(execution_kernel: Kernel) -> None:
         [
             ExecuteCellCommand(
                 cell_id="0",
-                code="import marimo as mo; x = 0; mo.stop(True, 'stopped!'); y = 1",  # noqa: E501
+                code="import marimo as mo; x = 0; mo.stop(True, 'stopped!'); y = 1",
             ),
         ]
     )
     # Run the cell through the runner to get the output
     runner = cell_runner.Runner(
-        set(["0"]), graph=k.graph, glbls=k.globals, debugger=k.debugger
+        {"0"},
+        graph=k.graph,
+        glbls=k.globals,
+        debugger=k.debugger,
+        hooks=NotebookCellHooks(),
     )
     run_result = await runner.run("0")
     # Check that the cell was stopped and its output is the stop output

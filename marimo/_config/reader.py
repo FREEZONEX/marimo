@@ -2,25 +2,25 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional, Union, cast
+from typing import Any, cast
 
 from marimo import _loggers
 from marimo._config.config import PartialMarimoConfig
-from marimo._utils.toml import read_toml
+from marimo._utils.toml import toml_reader
 
 LOGGER = _loggers.marimo_logger()
 
 
 def read_marimo_config(path: str) -> PartialMarimoConfig:
     """Read the marimo.toml configuration."""
-    return cast(PartialMarimoConfig, read_toml(path))
+    return cast(PartialMarimoConfig, toml_reader.read(path))
 
 
 def read_pyproject_marimo_config(
-    pyproject_path: Union[str, Path],
-) -> Optional[PartialMarimoConfig]:
+    pyproject_path: str | Path,
+) -> PartialMarimoConfig | None:
     """Read the marimo tool config from a pyproject.toml file."""
-    pyproject_config = read_toml(pyproject_path)
+    pyproject_config = toml_reader.read(pyproject_path)
     marimo_tool_config = get_marimo_config_from_pyproject_dict(
         pyproject_config
     )
@@ -42,13 +42,17 @@ def sanitize_pyproject_dict(
             else:
                 return pyproject_dict
         if current_level and key_path[-1] in current_level:
+            LOGGER.warning(
+                "%s in script metadata is ignored for security reasons",
+                ".".join(key_path),
+            )
             del current_level[key_path[-1]]
     return pyproject_dict
 
 
 def get_marimo_config_from_pyproject_dict(
     pyproject_dict: dict[str, Any],
-) -> Optional[PartialMarimoConfig]:
+) -> PartialMarimoConfig | None:
     """Get the marimo config from a pyproject.toml dictionary."""
     marimo_tool_config = pyproject_dict.get("tool", {}).get("marimo", None)
     if marimo_tool_config is None:
@@ -63,8 +67,8 @@ def get_marimo_config_from_pyproject_dict(
 
 
 def find_nearest_pyproject_toml(
-    start_path: Union[str, Path],
-) -> Optional[Path]:
+    start_path: str | Path,
+) -> Path | None:
     """Find the nearest pyproject.toml file."""
     path = Path(start_path)
     root = path.anchor

@@ -47,7 +47,7 @@ and deployable as apps.
 - 🖐️ **interactive:** [bind sliders, tables, plots, and more](https://docs.marimo.io/guides/interactivity.html) to Python — no callbacks required
 - 🐍 **git-friendly:** stored as `.py` files
 - 🛢️ **designed for data**: query dataframes, databases, warehouses, or lakehouses [with SQL](https://docs.marimo.io/guides/working_with_data/sql.html), filter and search [dataframes](https://docs.marimo.io/guides/working_with_data/dataframes.html)
-- 🤖 **AI-native**: [generate cells with AI](https://docs.marimo.io/guides/generate_with_ai/) tailored for data work
+- 🤖 **AI-native**: [connect agent CLIs](https://docs.marimo.io/guides/generate_with_ai/marimo_pair/) like Claude Code to notebooks, or use our editor's [built-in AI features](https://docs.marimo.io/guides/editor_features/ai_completion/)
 - 🔬 **reproducible:** [no hidden state](https://docs.marimo.io/guides/reactivity.html#no-hidden-state), deterministic execution, [built-in package management](https://docs.marimo.io/guides/package_management/)
 - 🏃 **executable:** [execute as a Python script](https://docs.marimo.io/guides/scripts.html), parameterized by CLI args
 - 🛜 **shareable**: [deploy as an interactive web app](https://docs.marimo.io/guides/apps.html) or [slides](https://docs.marimo.io/guides/apps.html#slides-layout), [run in the browser via WASM](https://docs.marimo.io/guides/wasm.html)
@@ -60,9 +60,9 @@ and deployable as apps.
 pip install marimo && marimo tutorial intro
 ```
 
-_Try marimo at [our online playground](https://marimo.app/l/c7h6pz), which runs entirely in the browser!_
-
-_Jump to the [quickstart](#quickstart) for a primer on our CLI._
+_Get started instantly with [**mo**lab, our free online
+notebook](https://molab.marimo.io/notebooks). Or jump to the
+[quickstart](#quickstart) for a primer on our CLI._
 
 ## A reactive programming environment
 
@@ -100,11 +100,14 @@ millions of rows blazingly fast, no code required.
 
 <img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/docs-df.gif" width="700px" />
 
-**Generate cells with data-aware AI.** [Generate code with an AI
-assistant](https://docs.marimo.io/guides/editor_features/ai_completion/) that is highly
-specialized for working with data, with context about your variables in memory;
-[zero-shot entire notebooks](https://docs.marimo.io/guides/generate_with_ai/text_to_notebook/).
-Customize the system prompt, bring your own API keys, or use local models.
+**Generate cells with data-aware AI.** Collaborate on marimo notebooks with
+your favorite agent, such as Claude Code, Codex, or OpenCode, using [marimo
+pair](https://docs.marimo.io/guides/generate_with_ai/marimo_pair/). Or,
+generate code [in the marimo editor with an AI
+assistant](https://docs.marimo.io/guides/editor_features/ai_completion/) that
+is highly specialized for working with data, with context about your variables
+in memory. Customize the system prompt, bring your own API keys, or use local
+models.
 
 <img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/readme-generate-with-ai.gif" width="700px" />
 
@@ -213,7 +216,7 @@ See the [FAQ](https://docs.marimo.io/faq.html) at our docs.
 
 marimo is easy to get started with, with lots of room for power users.
 For example, here's an embedding visualizer made in marimo
-([video](https://marimo.io/videos/landing/full.mp4)):
+([try the notebook live on molab!](https://molab.marimo.io/notebooks/nb_jJiFFtznAy4BxkrrZA1o9b/app?show-code=true)):
 
 <img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/embedding.gif" width="700px" />
 
@@ -259,23 +262,23 @@ Check out our [docs](https://docs.marimo.io),
   </tr>
   <tr>
     <td>
-      <a target="_blank" href="https://marimo.app/l/c7h6pz">
-        <img src="https://marimo.io/shield.svg"/>
+      <a target="_blank" href="https://molab.marimo.io/notebooks/nb_TWVGCgZZK4L8zj5ziUBNVL">
+        <img src="https://marimo.io/molab-shield.svg"/>
       </a>
     </td>
     <td>
-      <a target="_blank" href="https://marimo.app/l/0ue871">
-        <img src="https://marimo.io/shield.svg"/>
+      <a target="_blank" href="https://molab.marimo.io/notebooks/nb_WuoXgs7mjg5yqrMxJXjRpF">
+        <img src="https://marimo.io/molab-shield.svg"/>
       </a>
     </td>
     <td>
-      <a target="_blank" href="https://marimo.app/l/lxp1jk">
-        <img src="https://marimo.io/shield.svg"/>
+      <a target="_blank" href="https://molab.marimo.io/notebooks/nb_vXxD13t2RoMTLjC89qdn6c">
+        <img src="https://marimo.io/molab-shield.svg"/>
       </a>
     </td>
     <td>
-      <a target="_blank" href="https://marimo.app/l/14ovyr">
-        <img src="https://marimo.io/shield.svg"/>
+      <a target="_blank" href="https://molab.marimo.io/notebooks/nb_XpXx8MX99dWAjn4k1b3xiU">
+        <img src="https://marimo.io/molab-shield.svg"/>
       </a>
     </td>
   </tr>
@@ -301,6 +304,7 @@ We're building a community. Come hang out with us!
 - 🦋 [Follow us on Bluesky](https://bsky.app/profile/marimo.io)
 - 🐦 [Follow us on Twitter](https://twitter.com/marimo_io)
 - 🎥 [Subscribe on YouTube](https://www.youtube.com/@marimo-team)
+- 🤖 [Follow us on Reddit](https://www.reddit.com/r/marimo_notebook)
 - 🕴️ [Follow us on LinkedIn](https://www.linkedin.com/company/marimo-io)
 
 **A NumFOCUS affiliated project.** marimo is a core part of the broader Python

@@ -56,9 +56,7 @@ def df_length(df: IntoDataFrame | IntoLazyFrame) -> int:
 
 
 def is_not_narwhals_dataframe(df: IntoDataFrame | IntoLazyFrame) -> bool:
-    if is_narwhals_lazyframe(df) or is_narwhals_dataframe(df):
-        return False
-    return True
+    return not (is_narwhals_lazyframe(df) or is_narwhals_dataframe(df))
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
@@ -75,23 +73,16 @@ class TestDataframes:
         subject = ui.dataframe(df)
 
         assert is_not_narwhals_dataframe(subject.value)
-        assert (
-            subject._component_args["columns"]
-            == [
-                ["A", "integer", "i64"],
-                ["B", "string", "str"],
-            ]
-            or subject._component_args["columns"]
-            == [
-                ["A", "integer", "int64"],
-                ["B", "string", "object"],
-            ]
-            or subject._component_args["columns"]
-            == [
-                ["A", "integer", "int64"],
-                ["B", "string", "string"],
-            ]
-        )
+        assert subject._component_args["columns"] in [
+            # polars
+            [["A", "integer", "i64"], ["B", "string", "str"]],
+            # pandas 2.x
+            [["A", "integer", "int64"], ["B", "string", "object"]],
+            # pandas 2.x with future.infer_string
+            [["A", "integer", "int64"], ["B", "string", "string"]],
+            # pandas 3.x
+            [["A", "integer", "int64"], ["B", "string", "str"]],
+        ]
         assert subject._get_column_values(
             GetColumnValuesArgs(column="A")
         ) == GetColumnValuesResponse(values=[1, 2, 3], too_many_values=False)
@@ -119,9 +110,11 @@ class TestDataframes:
         subject = ui.dataframe(df)
 
         assert is_not_narwhals_dataframe(subject.value)
-        assert subject._component_args["columns"] == [
-            ["1", "integer", "int64"],
-            ["2", "string", "object"],
+        assert subject._component_args["columns"] in [
+            # pandas 2.x
+            [["1", "integer", "int64"], ["2", "string", "object"]],
+            # pandas 3.x
+            [["1", "integer", "int64"], ["2", "string", "str"]],
         ]
 
         assert subject._get_column_values(
@@ -334,9 +327,8 @@ class TestDataframes:
         df = pd.DataFrame({"A": [1, 2], "B": ["こんにちは", "世界"]})
         subject = ui.dataframe(df)
 
-        csv_url = subject._download_as(DownloadAsArgs(format="csv"))
+        csv_url = subject._download_as(DownloadAsArgs(format="csv")).url
         csv_bytes = from_data_uri(csv_url)[1]
-        # Check that BOM is not included
         assert not csv_bytes.startswith(b"\xef\xbb\xbf")
 
     @staticmethod
@@ -350,11 +342,27 @@ class TestDataframes:
             download_csv_encoding="utf-8-sig",
         )
 
-        # CSV should include BOM
-        csv_url = subject._download_as(DownloadAsArgs(format="csv"))
+        csv_url = subject._download_as(DownloadAsArgs(format="csv")).url
         csv_bytes = from_data_uri(csv_url)[1]
+        # CSV should include BOM
         assert csv_bytes.startswith(b"\xef\xbb\xbf")
         assert "こんにちは" in csv_bytes.decode("utf-8-sig")
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not HAS_DEPS, reason="optional dependencies not installed"
+    )
+    def test_dataframe_download_csv_separator() -> None:
+        df = pd.DataFrame({"A": [1, 2], "B": ["x", "y"]})
+        subject = ui.dataframe(
+            df,
+            download_csv_separator=";",
+        )
+
+        csv_url = subject._download_as(DownloadAsArgs(format="csv")).url
+        csv_text = from_data_uri(csv_url)[1].decode("utf-8")
+        assert "A;B" in csv_text
+        assert "1;x" in csv_text
 
     @staticmethod
     @pytest.mark.skipif(
@@ -367,8 +375,7 @@ class TestDataframes:
             download_json_ensure_ascii=False,
         )
 
-        # JSON should preserve characters without BOM when ensure_ascii is False
-        json_url = subject._download_as(DownloadAsArgs(format="json"))
+        json_url = subject._download_as(DownloadAsArgs(format="json")).url
         json_bytes = from_data_uri(json_url)[1]
         assert not json_bytes.startswith(b"\xef\xbb\xbf")
         json_text = json_bytes.decode("utf-8")
@@ -390,8 +397,9 @@ class TestDataframes:
         )
         subject = ui.dataframe(df)
 
-        # no transformations
-        download_url = subject._download_as(DownloadAsArgs(format=format_type))
+        download_url = subject._download_as(
+            DownloadAsArgs(format=format_type)
+        ).url
         assert download_url.startswith("data:")
 
         data_bytes = from_data_uri(download_url)[1]
@@ -415,8 +423,7 @@ class TestDataframes:
         # Apply some transformations (would be done through the UI)
         subject._value = df[df["age"] > 27]
 
-        # download with transformations applied
-        download_url = subject._download_as(DownloadAsArgs(format="json"))
+        download_url = subject._download_as(DownloadAsArgs(format="json")).url
         data_bytes = from_data_uri(download_url)[1]
 
         json_data = json.loads(data_bytes.decode("utf-8"))
@@ -436,7 +443,7 @@ class TestDataframes:
         df = pd.DataFrame({"A": [], "B": []})
         subject = ui.dataframe(df)
 
-        download_url = subject._download_as(DownloadAsArgs(format="csv"))
+        download_url = subject._download_as(DownloadAsArgs(format="csv")).url
         data_bytes = from_data_uri(download_url)[1]
 
         csv_content = data_bytes.decode("utf-8")
@@ -478,13 +485,56 @@ class TestDataframes:
             try:
                 download_url = subject._download_as(
                     DownloadAsArgs(format=format_type)
-                )
+                ).url
                 assert download_url.startswith("data:")
             except Exception as e:
                 # Some backends might not support all formats
                 pytest.skip(f"Backend doesn't support {format_type}: {e}")
 
         assert type(subject.value) is type(df)
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not HAS_DEPS, reason="optional dependencies not installed"
+    )
+    def test_dataframe_download_uses_bound_variable_name() -> None:
+        my_dataframe = pd.DataFrame({"A": [1, 2, 3], "B": ["x", "y", "z"]})
+        subject = ui.dataframe(my_dataframe)
+
+        mock_registry = Mock()
+        mock_registry.bound_names.return_value = {"my_dataframe"}
+
+        mock_ctx = Mock()
+        mock_ctx.ui_element_registry = mock_registry
+
+        mock_vfile = Mock()
+        mock_vfile.url = "data:text/csv;base64,dGVzdA=="
+        mock_vfile.filename = "random_name"
+
+        with (
+            patch(
+                "marimo._runtime.context.get_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "marimo._plugins.ui._impl.utils.dataframe.get_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "marimo._plugins.ui._impl.utils.dataframe.get_default_csv_encoding",
+                return_value="utf-8",
+            ),
+            patch(
+                "marimo._output.data.data.csv",
+                return_value=mock_vfile,
+            ),
+        ):
+            result = subject._download_as(DownloadAsArgs(format="csv"))
+
+        # The filename should be the bound variable name with extension
+        assert result.filename == "my_dataframe.csv"
+        # The URL should come from mo_data
+        assert result.url == "data:text/csv;base64,dGVzdA=="
 
     @staticmethod
     @pytest.mark.parametrize(
@@ -833,3 +883,40 @@ def test_base_exception_handling():
     assert "to json panic" in str(exc_info.value)
     assert exc_info.value.error == str(exc_info.value)
     assert type(table.value) is type(df)
+
+
+@pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
+def test_dataframe_render_args_carry_size_bytes() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({"a": [1, 2, 3]})
+    subject = ui.dataframe(df)
+    args = subject._component_args  # type: ignore[attr-defined]
+    assert args["size-bytes"] == len(
+        subject._manager.to_json(strict_json=True)
+    )
+
+
+@pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
+def test_dataframe_get_dataframe_response_carries_size_bytes() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({"a": [1, 2, 3]})
+    subject = ui.dataframe(df)
+    response = subject._get_dataframe(EmptyArgs())
+    assert response.size_bytes == len(
+        subject._manager.to_json(strict_json=True)
+    )
+
+
+@pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
+def test_dataframe_get_json_size_bytes_fails_open() -> None:
+    import pandas as pd
+
+    subject = ui.dataframe(pd.DataFrame({"a": [1]}))
+
+    class _Boom:
+        def to_json(self, **_: object) -> str:
+            raise RuntimeError("boom")
+
+    assert subject._get_json_size_bytes(_Boom()) is None  # type: ignore[arg-type]

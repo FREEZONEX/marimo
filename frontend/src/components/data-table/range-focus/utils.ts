@@ -2,17 +2,25 @@
 
 import type { Table } from "@tanstack/react-table";
 import { SELECT_COLUMN_ID } from "../types";
-import { stringifyUnknownValue } from "../utils";
+import { getClipboardContent, getRawValue } from "../utils";
 import type { SelectedCell } from "./atoms";
 
+export interface CellValuesResult {
+  text: string;
+  html: string | undefined;
+}
+
 /**
- * Get the values of the selected cells.
+ * Get the values of the selected cells, preferring raw (unformatted) values
+ * for plain text. If any cell contains HTML (e.g. a hyperlink), also builds
+ * an HTML table so rich content can be preserved on paste.
  */
 export function getCellValues<TData>(
   table: Table<TData>,
   selectedCellIds: Set<string>,
-): string {
-  const rowValues = new Map<string, string[]>();
+): CellValuesResult {
+  const rows = new Map<string, { text: string; html?: string }[]>();
+  let hasHtml = false;
 
   for (const cellId of selectedCellIds) {
     if (cellId.includes(SELECT_COLUMN_ID)) {
@@ -20,27 +28,112 @@ export function getCellValues<TData>(
       continue;
     }
 
-    const [rowId] = cellId.split("_"); // CellId is rowId_columnId
+    const { rowId, columnId } = getRowAndColumnId(cellId);
     const row = table.getRow(rowId);
     if (!row) {
       continue;
     }
 
-    const tableCell = row.getAllCells().find((c) => c.id === cellId);
-    if (!tableCell) {
+    const rawValue = getRawValue(table, row.index, columnId);
+    const { text, html } = getClipboardContent(
+      rawValue,
+      row.getValue(columnId),
+    );
+
+    if (html) {
+      hasHtml = true;
+    }
+    const cells = rows.get(rowId) ?? [];
+    cells.push({ text, html });
+    rows.set(rowId, cells);
+  }
+
+  const rowValues = [...rows.values()];
+  const tabSeparatedText = rowValues
+    .map((cells) => cells.map((c) => c.text).join("\t"))
+    .join("\n");
+
+  let htmlTable: string | undefined;
+  if (hasHtml) {
+    const htmlTableRows = rowValues
+      .map(
+        (cells) =>
+          `<tr>${cells.map((c) => `<td>${c.html ?? escapeHtml(c.text)}</td>`).join("")}</tr>`,
+      )
+      .join("");
+    htmlTable = `<table>${htmlTableRows}</table>`;
+  }
+
+  return {
+    text: tabSeparatedText,
+    html: htmlTable,
+  };
+}
+
+function escapeHtml(str: string): string {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+/**
+ * Count selected cells excluding the select checkbox column.
+ */
+export function countDataCellsInSelection(
+  selectedCellIds: Set<string>,
+): number {
+  let count = 0;
+  for (const cellId of selectedCellIds) {
+    if (!cellId.includes(SELECT_COLUMN_ID)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * Extract numeric values from the selected cells. Only finite numbers and
+ * non-empty numeric strings (e.g. "42", "3.14", "0") are included. Skips select
+ * checkbox column, missing cells, and all other types (boolean, null, etc.).
+ */
+export function getNumericValuesFromSelectedCells<TData>(
+  table: Table<TData>,
+  selectedCellIds: Set<string>,
+): number[] {
+  const numericValues: number[] = [];
+  for (const cellId of selectedCellIds) {
+    if (cellId.includes(SELECT_COLUMN_ID)) {
+      continue;
+    }
+    const { rowId, columnId } = getRowAndColumnId(cellId);
+    const row = table.getRow(rowId);
+    if (!row) {
       continue;
     }
 
-    const values = rowValues.get(rowId) ?? [];
-    values.push(stringifyUnknownValue({ value: tableCell.getValue() }));
-    rowValues.set(rowId, values);
+    const value =
+      getRawValue(table, row.index, columnId) ?? row.getValue(columnId);
+
+    // Only accept numbers and strings
+    // Skip booleans, null, etc.
+    let num: number;
+    if (typeof value === "number") {
+      num = value;
+    } else if (typeof value === "string") {
+      if (value.trim() === "") {
+        continue;
+      }
+      num = Number(value);
+    } else {
+      continue;
+    }
+
+    // Skip NaN and Infinity
+    if (Number.isFinite(num)) {
+      numericValues.push(num);
+    }
   }
-
-  return getTabSeparatedValues([...rowValues.values()]);
-}
-
-export function getTabSeparatedValues(values: string[][]) {
-  return values.map((row) => row.join("\t")).join("\n");
+  return numericValues;
 }
 
 /**
@@ -102,4 +195,11 @@ export function getCellsBetween<TData>(
  */
 function getCellId(rowId: string, columnId: string) {
   return `${rowId}_${columnId}`;
+}
+
+function getRowAndColumnId(cellId: string) {
+  const sepIdx = cellId.indexOf("_");
+  const rowId = cellId.slice(0, sepIdx);
+  const columnId = cellId.slice(sepIdx + 1);
+  return { rowId, columnId };
 }

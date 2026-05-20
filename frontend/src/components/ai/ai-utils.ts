@@ -21,6 +21,7 @@ const CREDENTIAL_CHECKERS: Record<KnownProviderId, CredentialChecker> = {
   openrouter: (ai) => Boolean(ai?.openrouter?.api_key),
   azure: (ai) => Boolean(ai?.azure?.api_key && ai?.azure?.base_url),
   wandb: (ai) => Boolean(ai?.wandb?.api_key),
+  "opencode-go": (ai) => Boolean(ai?.opencode_go?.api_key),
   bedrock: (ai) => Boolean(ai?.bedrock?.region_name),
   ollama: (ai) => Boolean(ai?.ollama?.base_url),
   // These providers don't have user-configurable credentials in the UI
@@ -32,18 +33,16 @@ const CREDENTIAL_CHECKERS: Record<KnownProviderId, CredentialChecker> = {
  * Returns the first configured provider based on credentials.
  */
 export function getConfiguredProvider(
-  config: UserConfig,
+  config: UserConfig["ai"],
 ): ProviderId | undefined {
-  const ai = config.ai;
-
   for (const provider of KNOWN_PROVIDERS) {
-    if (CREDENTIAL_CHECKERS[provider](ai)) {
+    if (CREDENTIAL_CHECKERS[provider](config)) {
       return provider;
     }
   }
 
   // Check custom providers
-  const customProviders = ai?.custom_providers;
+  const customProviders = config?.custom_providers;
   if (customProviders) {
     const firstCustomProvider = Object.entries(customProviders).find(
       ([_, providerConfig]) => providerConfig?.base_url,
@@ -54,7 +53,9 @@ export function getConfiguredProvider(
   }
 }
 
-export function getRecommendedModel(config: UserConfig): string | undefined {
+export function getRecommendedModel(
+  config: UserConfig["ai"],
+): string | undefined {
   const provider = getConfiguredProvider(config);
   if (!provider) {
     return undefined;
@@ -73,14 +74,16 @@ export interface AutoPopulateResult {
  *
  * @param values - The full form values
  */
-export function autoPopulateModels(values: UserConfig): AutoPopulateResult {
+export function autoPopulateModels(
+  values: UserConfig["ai"],
+): AutoPopulateResult {
   const result: AutoPopulateResult = {
     chatModel: undefined,
     editModel: undefined,
   };
 
-  const needsChatModel = !values.ai?.models?.chat_model;
-  const needsEditModel = !values.ai?.models?.edit_model;
+  const needsChatModel = !values?.models?.chat_model;
+  const needsEditModel = !values?.models?.edit_model;
 
   if (!needsChatModel && !needsEditModel) {
     return result;

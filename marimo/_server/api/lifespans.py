@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import socket
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from marimo import _loggers
 from marimo._server.ai.mcp.config import is_mcp_config_empty
@@ -12,7 +13,6 @@ from marimo._server.ai.tools.tool_manager import setup_tool_manager
 from marimo._server.api.deps import AppState, AppStateBase
 from marimo._server.api.interrupt import InterruptHandler
 from marimo._server.api.utils import open_url_in_browser
-from marimo._server.file_router import AppFileRouter
 from marimo._server.lsp import any_lsp_server_running
 from marimo._server.print import (
     print_experimental_features,
@@ -25,7 +25,10 @@ from marimo._server.session_manager import SessionManager
 from marimo._server.tokens import AuthToken
 from marimo._server.utils import initialize_mimetypes
 from marimo._server.uvicorn_utils import close_uvicorn
+from marimo._server.workspace import NewFileKey
 from marimo._session.model import SessionMode
+from marimo._utils.asyncio_utils import cancel_and_wait, supervised_task
+from marimo._utils.subprocess import cancel_pending_reaps
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -55,18 +58,15 @@ async def lsp(app: Starlette) -> AsyncIterator[None]:
 
     LOGGER.debug("Language Servers are enabled")
     # Start LSP server in background to avoid blocking server startup
-    task = asyncio.create_task(session_mgr.start_lsp_server())
-    background_tasks.add(task)  # Keep a reference to prevent GC
-    task.add_done_callback(background_tasks.discard)  # Clean up when done
+    task = supervised_task(
+        session_mgr.start_lsp_server(),
+        name="lsp.start",
+        registry=background_tasks,
+    )
 
     yield
 
-    # Shutdown
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    await cancel_and_wait(task)
 
 
 @contextlib.asynccontextmanager
@@ -101,7 +101,7 @@ async def mcp(app: Starlette) -> AsyncIterator[None]:
         yield
         return
 
-    async def background_connect_mcp_servers() -> Optional[MCPClient]:
+    async def background_connect_mcp_servers() -> MCPClient | None:
         try:
             from marimo._server.ai.mcp import get_mcp_client
 
@@ -117,24 +117,30 @@ async def mcp(app: Starlette) -> AsyncIterator[None]:
             LOGGER.warning(f"Failed to connect MCP servers: {e}")
             return None
 
-    task = asyncio.create_task(background_connect_mcp_servers())
-    background_tasks.add(task)  # Keep a reference to prevent GC
-    task.add_done_callback(background_tasks.discard)  # Clean up when done
+    # Awaited below — opt out of supervisor logging to avoid duplicate logs.
+    task = supervised_task(
+        background_connect_mcp_servers(),
+        name="mcp.connect",
+        registry=background_tasks,
+        on_exception=lambda _exc: None,
+    )
 
     yield
 
-    # Shutdown
-    task.cancel()
+    await cancel_and_wait(task)
+    if task.cancelled():
+        return
+
+    mcp_client = task.result()
+    if not mcp_client:
+        return
+
     try:
-        mcp_client = await task
-        if mcp_client:
-            LOGGER.info("Disconnecting from all MCP servers")
-            await mcp_client.disconnect_from_all_servers()
-            LOGGER.info("Successfully disconnected from all MCP servers")
-    except asyncio.CancelledError:
-        pass
+        LOGGER.info("Disconnecting from all MCP servers")
+        await mcp_client.disconnect_from_all_servers()
+        LOGGER.info("Successfully disconnected from all MCP servers")
     except Exception as e:
-        LOGGER.error(f"Error during MCP cleanup: {e}")
+        LOGGER.error(f"Error during MCP disconnect: {e}")
 
 
 @contextlib.asynccontextmanager
@@ -157,19 +163,20 @@ async def logging(app: Starlette) -> AsyncIterator[None]:
     state = AppState.from_app(app)
     manager: SessionManager = state.session_manager
     quiet = state.quiet
-    file_router = manager.file_router
+    workspace = manager.workspace
     mcp_server_enabled = state.mcp_server_enabled
     skew_protection_enabled = state.skew_protection
 
     # Startup message
     if not quiet:
-        file = file_router.maybe_get_single_file()
+        file = workspace.single_file()
         print_startup(
             file_name=file.name if file else None,
             url=_startup_url(state),
             run=manager.mode == SessionMode.RUN,
-            new=file_router.get_unique_file_key() == AppFileRouter.NEW_FILE,
+            new=isinstance(workspace.get_unique_file_key(), NewFileKey),
             network=state.host == "0.0.0.0",
+            startup_tip=state.startup_tip,
         )
 
         print_experimental_features(state.config_manager.get_config())
@@ -207,6 +214,49 @@ async def signal_handler(app: Starlette) -> AsyncIterator[None]:
 
 
 @contextlib.asynccontextmanager
+async def server_registry(app: Starlette) -> AsyncIterator[None]:
+    """Register this server in the local registry for discovery.
+
+    Only servers started **without** an auth token (``--no-token``)
+    are registered.  This ensures only servers that have explicitly
+    opted into relaxed local access are discoverable.
+    """
+    from marimo._server.server_registry import (
+        ServerRegistryEntry,
+        ServerRegistryWriter,
+    )
+
+    state = AppState.from_app(app)
+
+    # Guard: only register when the user has opted into relaxed local
+    # access (no auth token).  Skew protection is irrelevant here —
+    # it guards against frontend/server version mismatch and should
+    # not prevent agent-oriented discovery.
+    if state.enable_auth:
+        LOGGER.debug(
+            "Skipping server registry: auth=%s",
+            state.enable_auth,
+        )
+        yield
+        return
+
+    entry = ServerRegistryEntry.from_server(
+        host=state.host,
+        port=state.port,
+        base_url=state.base_url,
+    )
+    writer = ServerRegistryWriter(entry)
+    try:
+        writer.register()
+    except Exception as e:
+        LOGGER.warning("Failed to register server: %s", e)
+
+    yield
+
+    writer.deregister()
+
+
+@contextlib.asynccontextmanager
 async def etc(app: Starlette) -> AsyncIterator[None]:
     del app
     # Mimetypes
@@ -214,60 +264,90 @@ async def etc(app: Starlette) -> AsyncIterator[None]:
     yield
 
 
-def _startup_url(state: AppStateBase) -> str:
-    host = state.host
-    port = state.port
-    try:
-        # pretty printing:
-        # if the address maps to localhost, print "localhost" to stdout
-        if (
-            socket.getnameinfo((host, port), socket.NI_NOFQDN)[0]
-            == "localhost"
-        ):
-            host = "localhost"
-    except Exception:
-        # aggressive try/except in case of platform-specific quirks;
-        # nothing to handle, since the `try` logic is just for pretty
-        # printing the host name
-        ...
+@contextlib.asynccontextmanager
+async def reap_subprocesses(app: Starlette) -> AsyncIterator[None]:
+    del app
+    yield
+    await cancel_pending_reaps()
 
-    url = f"http://{host}:{port}{state.base_url}"
+
+def _pretty_host(host: str, port: int) -> str:
+    """Replace loopback addresses with 'localhost' for display.
+
+    Uses ipaddress for a reliable cross-platform loopback check (covers
+    127.0.0.1, ::1, and the full 127.0.0.0/8 range).  Falls back to
+    socket.getnameinfo only for non-IP hosts.  getnameinfo is skipped for
+    raw IP addresses because it can hang on Windows/CI for link-local IPv6.
+    """
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return "localhost"
+    except ValueError:
+        # Not a valid IP literal — might be a hostname; try getnameinfo
+        try:
+            if (
+                socket.getnameinfo((host, port), socket.NI_NOFQDN)[0]
+                == "localhost"
+            ):
+                return "localhost"
+        except Exception:
+            pass
+    return host
+
+
+def _startup_url(state: AppStateBase) -> str:
+    host = state.host.strip(
+        "[]"
+    )  # normalize: remove brackets if user passed [addr]
+    port = state.port
+
+    # Strip IPv6 zone ID (e.g. fe80::1%eth0 -> fe80::1); zone IDs are
+    # interface-specific and not valid in URLs.
+    # Must happen before _pretty_host — zone IDs can cause getnameinfo
+    # to hang on Windows/CI.
+    host = host.split("%")[0]
+
+    # pretty printing: show "localhost" for loopback addresses
+    host = _pretty_host(host, port)
+
+    url_host_bare = host
+    # IPv6 addresses must be wrapped in brackets in URLs (RFC 3986)
+    url_host = f"[{url_host_bare}]" if ":" in url_host_bare else url_host_bare
+    url = f"http://{url_host}:{port}{state.base_url}"
     if port == 80:
-        url = f"http://{host}{state.base_url}"
+        url = f"http://{url_host}{state.base_url}"
     elif port == 443:
-        url = f"https://{host}{state.base_url}"
+        url = f"https://{url_host}{state.base_url}"
 
     if AuthToken.is_empty(state.session_manager.auth_token):
         return url
-    return f"{url}?access_token={str(state.session_manager.auth_token)}"
+    return f"{url}?access_token={state.session_manager.auth_token!s}"
 
 
 def _mcp_startup_url(state: AppStateBase) -> str:
-    host = state.host
+    host = state.host.strip(
+        "[]"
+    )  # normalize: remove brackets if user passed [addr]
     port = state.port
     base_url = state.base_url
 
-    # Handle localhost pretty printing (same logic as _startup_url)
-    try:
-        if (
-            socket.getnameinfo((host, port), socket.NI_NOFQDN)[0]
-            == "localhost"
-        ):
-            host = "localhost"
-    except Exception:
-        ...
+    # Strip zone ID, then pretty-print loopback (same logic as _startup_url)
+    host = host.split("%")[0]
+    host = _pretty_host(host, port)
 
+    url_host_bare = host
+    url_host = f"[{url_host_bare}]" if ":" in url_host_bare else url_host_bare
     # Construct MCP endpoint URL
     mcp_prefix = "/mcp"
     mcp_name = "server"
     full_mcp_path = f"{mcp_prefix}/{mcp_name}"
-    url = f"http://{host}:{port}{base_url}{full_mcp_path}"
+    url = f"http://{url_host}:{port}{base_url}{full_mcp_path}"
     if port == 80:
-        url = f"http://{host}{base_url}{full_mcp_path}"
+        url = f"http://{url_host}{base_url}{full_mcp_path}"
     elif port == 443:
-        url = f"https://{host}{base_url}{full_mcp_path}"
+        url = f"https://{url_host}{base_url}{full_mcp_path}"
 
     # Add access token if not empty
     if AuthToken.is_empty(state.session_manager.auth_token):
         return url
-    return f"{url}?access_token={str(state.session_manager.auth_token)}"
+    return f"{url}?access_token={state.session_manager.auth_token!s}"

@@ -9,7 +9,6 @@ from typing import (
     Any,
     Generic,
     Literal,
-    Optional,
     TypeVar,
     get_args,
 )
@@ -25,6 +24,10 @@ from marimo._ai._pydantic_ai_utils import (
     generate_id,
 )
 from marimo._dependencies.dependencies import Dependency, DependencyManager
+from marimo._plugins.ui._impl.chat.chat import (
+    AI_SDK_VERSION,
+    require_vercel_ai_sdk_support,
+)
 from marimo._server.ai.config import AnyProviderConfig
 from marimo._server.ai.ids import AiModelId
 from marimo._server.ai.tools.tool_manager import get_tool_manager
@@ -35,15 +38,16 @@ from marimo._utils.http import HTTPStatus
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
 
-    from anthropic.types.beta import BetaThinkingConfigParam
     from openai import AsyncOpenAI
-    from openai.types.shared.reasoning_effort import ReasoningEffort
     from pydantic_ai import Agent, DeferredToolRequests, FunctionToolset
-    from pydantic_ai.messages import ThinkingPart
     from pydantic_ai.models import Model
     from pydantic_ai.models.bedrock import BedrockConverseModel
     from pydantic_ai.models.google import GoogleModel
-    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+    from pydantic_ai.models.openai import (
+        OpenAIChatModel,
+        OpenAIResponsesModel,
+        OpenAIResponsesModelSettings,
+    )
     from pydantic_ai.providers import Provider
     from pydantic_ai.providers.anthropic import (
         AnthropicProvider as PydanticAnthropic,
@@ -53,9 +57,8 @@ if TYPE_CHECKING:
     )
     from pydantic_ai.providers.google import GoogleProvider as PydanticGoogle
     from pydantic_ai.providers.openai import OpenAIProvider as PydanticOpenAI
-    from pydantic_ai.ui.vercel_ai import VercelAIAdapter
+    from pydantic_ai.settings import ModelSettings, ThinkingLevel
     from pydantic_ai.ui.vercel_ai.request_types import UIMessage, UIMessagePart
-    from pydantic_ai.ui.vercel_ai.response_types import BaseChunk
     from starlette.responses import StreamingResponse
 
 
@@ -95,8 +98,12 @@ class PydanticProvider(ABC, Generic[ProviderT]):
             deps: The dependencies to require.
         """
         DependencyManager.require_many(
-            "for AI assistance", DependencyManager.pydantic_ai, *(deps or [])
+            "for AI assistance",
+            DependencyManager.pydantic_ai,
+            *(deps or []),
+            source="server",
         )
+        require_vercel_ai_sdk_support()
 
         self.model = model
         self.config = config
@@ -123,16 +130,30 @@ class PydanticProvider(ABC, Generic[ProviderT]):
         toolset, output_type = self._get_toolsets_and_output_type(tools)
         return Agent(
             model,
+            model_settings=self._build_agent_settings(model),
             toolsets=[toolset] if tools else None,
             instructions=system_prompt,
             output_type=output_type,
         )
 
-    def get_vercel_adapter(self) -> type[VercelAIAdapter[Any, Any]]:
-        """Return the Vercel AI adapter for the given provider."""
-        from pydantic_ai.ui.vercel_ai import VercelAIAdapter
+    def _build_agent_settings(self, model: Model) -> ModelSettings | None:
+        """Settings applied at agent level on every request."""
+        from pydantic_ai.settings import ModelSettings
 
-        return VercelAIAdapter
+        thinking = self._default_thinking(model)
+        if thinking is None:
+            return None
+        if not (
+            model.profile.supports_thinking
+            or model.profile.thinking_always_enabled
+        ):
+            return None
+        return ModelSettings(thinking=thinking)
+
+    def _default_thinking(self, model: Model) -> ThinkingLevel | None:
+        """Default unified thinking flag. Return None to skip."""
+        del model
+        return True
 
     def convert_messages(
         self, messages: list[ServerUIMessage]
@@ -146,9 +167,10 @@ class PydanticProvider(ABC, Generic[ProviderT]):
         system_prompt: str,
         max_tokens: int,
         additional_tools: list[ToolDefinition],
-        stream_options: Optional[StreamOptions] = None,
+        stream_options: StreamOptions | None = None,
     ) -> StreamingResponse:
         """Return a streaming response from the given messages. The response are AI SDK events."""
+        from pydantic_ai.ui.vercel_ai import VercelAIAdapter
         from pydantic_ai.ui.vercel_ai.request_types import SubmitMessage
 
         tools = (self.config.tools or []) + additional_tools
@@ -165,9 +187,11 @@ class PydanticProvider(ABC, Generic[ProviderT]):
         # TODO: Text only and format stream are not supported yet
         stream_options = stream_options or StreamOptions()
 
-        vercel_adapter = self.get_vercel_adapter()
-        adapter = vercel_adapter(
-            agent=agent, run_input=run_input, accept=stream_options.accept
+        adapter = VercelAIAdapter(
+            agent=agent,
+            run_input=run_input,
+            accept=stream_options.accept,
+            sdk_version=AI_SDK_VERSION,
         )
         event_stream = adapter.run_stream()
         return adapter.streaming_response(event_stream)
@@ -181,19 +205,18 @@ class PydanticProvider(ABC, Generic[ProviderT]):
         additional_tools: list[ToolDefinition],
     ) -> AsyncGenerator[str]:
         """Return a stream of text from the given messages."""
+        from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
         tools = (self.config.tools or []) + additional_tools
         agent = self.create_agent(
             max_tokens=max_tokens, tools=tools, system_prompt=system_prompt
         )
-        vercel_adapter = self.get_vercel_adapter()
 
         async with agent.run_stream(
             user_prompt=user_prompt,
-            message_history=vercel_adapter.load_messages(
+            message_history=VercelAIAdapter.load_messages(
                 self.convert_messages(messages)
             ),
-            instructions=system_prompt,
         ) as result:
             async for message in result.stream_text(delta=True):
                 yield message
@@ -216,7 +239,6 @@ class PydanticProvider(ABC, Generic[ProviderT]):
         result = await agent.run(
             user_prompt=None,
             message_history=VercelAIAdapter.load_messages(messages),
-            instructions=system_prompt,
         )
 
         return str(result.output)
@@ -252,7 +274,14 @@ class GoogleProvider(PydanticProvider["PydanticGoogle"]):
         )
         if use_vertex:
             project = os.getenv("GOOGLE_CLOUD_PROJECT")
-            location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+            # Upstream (pydantic-ai) defaults to us-central1 if not set
+            location = os.getenv("GOOGLE_CLOUD_LOCATION") or None
+            if location is None:
+                LOGGER.info(
+                    "GOOGLE_CLOUD_LOCATION is not set. "
+                    "The upstream provider will default to 'us-central1'. "
+                    "Set this env var if your project has region restrictions."
+                )
             # The type stubs don't have an overload that combines vertexai
             # with project/location, but the runtime supports it
             provider: PydanticGoogle = PydanticGoogle(  # type: ignore[call-overload]
@@ -271,11 +300,7 @@ class GoogleProvider(PydanticProvider["PydanticGoogle"]):
         return GoogleModel(
             model_name=self.model,
             provider=self.provider,
-            settings=GoogleModelSettings(
-                max_tokens=max_tokens,
-                # Works on non-thinking models too
-                google_thinking_config={"include_thoughts": True},
-            ),
+            settings=GoogleModelSettings(max_tokens=max_tokens),
         )
 
 
@@ -296,9 +321,9 @@ class OpenAIClientMixin:
         ssl_verify: bool = (
             config.ssl_verify if config.ssl_verify is not None else True
         )
-        extra_headers: Optional[dict[str, str]] = config.extra_headers
-        ca_bundle_path: Optional[str] = config.ca_bundle_path
-        client_pem: Optional[str] = config.client_pem
+        extra_headers: dict[str, str] | None = config.extra_headers
+        ca_bundle_path: str | None = config.ca_bundle_path
+        client_pem: str | None = config.client_pem
 
         # Check if ca_bundle_path and client_pem are valid files
         if ca_bundle_path:
@@ -361,9 +386,9 @@ class OpenAIClientMixin:
 
 
 class OpenAIProvider(OpenAIClientMixin, PydanticProvider["PydanticOpenAI"]):
-    # Medium effort provides a balance between speed and accuracy
     # https://openai.com/index/openai-o3-mini/
-    DEFAULT_REASONING_EFFORT: ReasoningEffort = "medium"
+    # 'auto' lets OpenAI decide between detailed/concise based on the prompt;
+    # marimo wants reasoning summaries surfaced for display.
     DEFAULT_REASONING_SUMMARY: Literal["detailed", "concise", "auto"] = "auto"
 
     def create_provider(self, config: AnyProviderConfig) -> PydanticOpenAI:
@@ -380,65 +405,41 @@ class OpenAIProvider(OpenAIClientMixin, PydanticProvider["PydanticOpenAI"]):
             OpenAIResponsesModelSettings,
         )
 
-        is_reasoning_model = self._is_reasoning_model(self.model)
-
-        settings = (
-            OpenAIResponsesModelSettings(
-                max_tokens=max_tokens,
-                openai_reasoning_summary=self.DEFAULT_REASONING_SUMMARY,
-                openai_reasoning_effort=self.DEFAULT_REASONING_EFFORT,
-            )
-            if is_reasoning_model
-            else OpenAIResponsesModelSettings(max_tokens=max_tokens)
-        )
         return OpenAIResponsesModel(
             model_name=self.model,
             provider=self.provider,
-            settings=settings,
+            settings=OpenAIResponsesModelSettings(max_tokens=max_tokens),
         )
 
-    def _is_reasoning_model(self, model: str) -> bool:
-        """
-        Check if reasoning_effort should be added to the request.
-        Only add for actual OpenAI reasoning models, not for OpenAI-compatible APIs.
+    def _build_agent_settings(self, model: Model) -> ModelSettings | None:
+        # `reasoning.summary` is only valid for OpenAI reasoning models (gpt-5
+        # and the o-series).
+        settings = super()._build_agent_settings(model)
+        if settings is not None and "thinking" in settings:
+            extra: OpenAIResponsesModelSettings = {
+                "openai_reasoning_summary": self.DEFAULT_REASONING_SUMMARY,
+            }
+            settings.update(extra)
+        return settings
 
-        OpenAI-compatible APIs (identified by custom base_url) may not support
-        the reasoning_effort parameter even if the model name suggests it's a
-        reasoning model.
-        """
-        import re
-
-        # Check for reasoning model patterns: o{digit} or gpt-5, with optional openai/ prefix
-        reasoning_patterns = [
-            r"^openai/o\d",  # openai/o1, openai/o3, etc.
-            r"^o\d",  # o1, o3, etc.
-            r"^openai/gpt-5",  # openai/gpt-5*
-            r"^gpt-5",  # gpt-5*
-        ]
-
-        is_reasoning_model_name = any(
-            re.match(pattern, model) for pattern in reasoning_patterns
-        )
-
-        if not is_reasoning_model_name:
-            return False
-
-        # If using a custom base_url that's not OpenAI, don't assume reasoning is supported
+    def _default_thinking(self, model: Model) -> ThinkingLevel | None:
+        # OpenAI-compatible third-party endpoints (custom base_url) may not
+        # accept `reasoning_effort` even when the model name looks like a
+        # reasoning model. Suppress the unified thinking flag in that case.
         if (
             self.config.base_url
             and "api.openai.com" not in self.config.base_url
         ):
-            return False
-
-        return True
+            return None
+        return super()._default_thinking(model)
 
 
 class AzureOpenAIProvider(OpenAIProvider):
-    def _is_reasoning_model(self, model: str) -> bool:
-        # https://learn.microsoft.com/en-us/answers/questions/5519548/does-gpt-5-via-azure-support-reasoning-effort-and
-        # Only custom models support reasoning effort, we can expose this as a parameter in the future
+    # Only custom Azure deployments support `reasoning_effort`, and we don't expose that config yet.
+    # https://learn.microsoft.com/en-us/answers/questions/5519548/does-gpt-5-via-azure-support-reasoning-effort-and
+    def _default_thinking(self, model: Model) -> ThinkingLevel | None:
         del model
-        return False
+        return None
 
     def _handle_azure_openai(self, base_url: str) -> tuple[str, str, str]:
         """Handle Azure OpenAI.
@@ -675,8 +676,9 @@ class CustomProvider(OpenAIClientMixin, PydanticProvider["Provider[Any]"]):
                 provider_factory=lambda _: self.provider,
             )
         except UserError:
-            LOGGER.warning(
-                f"Model {self.model} not found. Falling back to OpenAIChatModel."
+            LOGGER.debug(
+                f"Model {self.model} not found in pydantic-ai's model registry. "
+                "Falling back to OpenAIChatModel."
             )
             model = self.create_model(max_tokens)
         except Exception as e:
@@ -685,14 +687,24 @@ class CustomProvider(OpenAIClientMixin, PydanticProvider["Provider[Any]"]):
             )
             model = self.create_model(max_tokens)
 
+        agent_settings = ModelSettings(max_tokens=max_tokens)
+        agent_settings.update(self._build_agent_settings(model) or {})
+
         toolset, output_type = self._get_toolsets_and_output_type(tools)
         return Agent(
             model,
-            model_settings=ModelSettings(max_tokens=max_tokens),
+            model_settings=agent_settings,
             toolsets=[toolset] if tools else None,
             instructions=system_prompt,
             output_type=output_type,
         )
+
+    def _default_thinking(self, model: Model) -> ThinkingLevel | None:
+        # Custom OpenAI-compatible endpoints (Together, vLLM, LM Studio, ...)
+        # often don't honor `reasoning_effort`
+        if self._is_openai_compatible():
+            return None
+        return super()._default_thinking(model)
 
 
 class AnthropicProvider(PydanticProvider["PydanticAnthropic"]):
@@ -701,18 +713,9 @@ class AnthropicProvider(PydanticProvider["PydanticAnthropic"]):
     # https://docs.anthropic.com/en/docs/test-and-evaluate/strengthen-guardrails/reduce-latency?utm_source=chatgpt.com
     DEFAULT_TEMPERATURE = 0.2
 
-    # Extended thinking defaults based on:
+    # Extended thinking requires temperature of 1.
     # https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
-    # Extended thinking requires temperature of 1
     DEFAULT_EXTENDED_THINKING_TEMPERATURE = 1
-    EXTENDED_THINKING_MODEL_PREFIXES = [
-        "claude-opus-4",
-        "claude-sonnet-4",
-        "claude-haiku-4-5",
-        "claude-3-7-sonnet",
-    ]
-    # 1024 tokens is the minimum budget for extended thinking
-    DEFAULT_EXTENDED_THINKING_BUDGET_TOKENS = 1024
 
     def create_provider(self, config: AnyProviderConfig) -> PydanticAnthropic:
         from pydantic_ai.providers.anthropic import (
@@ -726,36 +729,33 @@ class AnthropicProvider(PydanticProvider["PydanticAnthropic"]):
             AnthropicModel,
             AnthropicModelSettings,
         )
+        from pydantic_ai.profiles.anthropic import (
+            AnthropicModelProfile,
+            anthropic_model_profile,
+        )
 
-        is_thinking_model = self.is_extended_thinking_model(self.model)
-        thinking_config: BetaThinkingConfigParam = {"type": "disabled"}
-        if is_thinking_model:
-            thinking_config = {
-                "type": "enabled",
-                "budget_tokens": self.DEFAULT_EXTENDED_THINKING_BUDGET_TOKENS,
-            }
+        settings: AnthropicModelSettings = {"max_tokens": max_tokens}
+
+        # Anthropic extended thinking requires temperature=1; non-thinking
+        # models keep our default coding temperature. Some adaptive-only
+        # models (Opus 4.7+) reject sampling settings entirely — skip
+        # `temperature` for them so pydantic-ai doesn't drop it with a warning.
+        profile = AnthropicModelProfile.from_profile(
+            anthropic_model_profile(self.model)
+        )
+        if not getattr(
+            profile, "anthropic_disallows_sampling_settings", False
+        ):
+            settings["temperature"] = (
+                self.DEFAULT_EXTENDED_THINKING_TEMPERATURE
+                if profile.supports_thinking
+                else self.DEFAULT_TEMPERATURE
+            )
 
         return AnthropicModel(
             model_name=self.model,
             provider=self.provider,
-            settings=AnthropicModelSettings(
-                max_tokens=max_tokens,
-                temperature=self.get_temperature(),
-                anthropic_thinking=thinking_config,
-            ),
-        )
-
-    def is_extended_thinking_model(self, model: str) -> bool:
-        return any(
-            model.startswith(prefix)
-            for prefix in self.EXTENDED_THINKING_MODEL_PREFIXES
-        )
-
-    def get_temperature(self) -> float:
-        return (
-            self.DEFAULT_EXTENDED_THINKING_TEMPERATURE
-            if self.is_extended_thinking_model(self.model)
-            else self.DEFAULT_TEMPERATURE
+            settings=settings,
         )
 
     def convert_messages(
@@ -781,70 +781,6 @@ class AnthropicProvider(PydanticProvider["PydanticAnthropic"]):
                 provider_metadata=part.provider_metadata,
             )
         return part
-
-    def get_vercel_adapter(
-        self,
-    ) -> type[VercelAIAdapter[None, DeferredToolRequests | str]]:
-        """
-        Return a custom adapter that includes thinking signatures in ReasoningEndChunk.
-
-        pydantic_ai's VercelAIEventStream.handle_thinking_end doesn't pass the signature
-        from ThinkingPart to ReasoningEndChunk, which breaks Anthropic's extended thinking
-        on follow-up messages (Anthropic requires signatures on thinking blocks).
-
-        TODO: Remove this once https://github.com/pydantic/pydantic-ai/pull/3754 is released
-        """
-        from pydantic_ai import DeferredToolRequests
-        from pydantic_ai.ui.vercel_ai import VercelAIAdapter
-        from pydantic_ai.ui.vercel_ai._event_stream import VercelAIEventStream
-        from pydantic_ai.ui.vercel_ai.response_types import ReasoningEndChunk
-
-        AnthropicOutputType = DeferredToolRequests | str
-
-        # Custom event stream that includes signature in ReasoningEndChunk
-        class AnthropicVercelAIEventStream(
-            VercelAIEventStream[None, AnthropicOutputType]
-        ):
-            async def handle_thinking_end(
-                self, part: ThinkingPart, followed_by_thinking: bool = False
-            ) -> AsyncIterator[BaseChunk]:
-                """Override to include signature in provider_metadata."""
-                try:
-                    provider_metadata = None
-                    if part.signature:
-                        pydantic_ai_meta: dict[str, Any] = {
-                            "signature": part.signature
-                        }
-                        if part.provider_name:
-                            pydantic_ai_meta["provider_name"] = (
-                                part.provider_name
-                            )
-                        if part.id:
-                            pydantic_ai_meta["id"] = part.id
-                        provider_metadata = {"pydantic_ai": pydantic_ai_meta}
-
-                    yield ReasoningEndChunk(
-                        id=self.message_id, provider_metadata=provider_metadata
-                    )
-                except Exception as e:
-                    LOGGER.warning(
-                        f"Error in AnthropicVercelAIEventStream.handle_thinking_end: {e}"
-                    )
-                    async for chunk in super().handle_thinking_end(
-                        part, followed_by_thinking
-                    ):
-                        yield chunk
-
-        # Custom adapter that uses the custom event stream
-        class AnthropicVercelAIAdapter(
-            VercelAIAdapter[None, AnthropicOutputType]
-        ):
-            def build_event_stream(self) -> AnthropicVercelAIEventStream:
-                return AnthropicVercelAIEventStream(
-                    self.run_input, accept=self.accept
-                )
-
-        return AnthropicVercelAIAdapter
 
 
 class BedrockProvider(PydanticProvider["PydanticBedrock"]):
@@ -885,10 +821,7 @@ class BedrockProvider(PydanticProvider["PydanticBedrock"]):
         return BedrockConverseModel(
             model_name=self.model,
             provider=self.provider,
-            settings=BedrockModelSettings(
-                max_tokens=max_tokens,
-                # TODO: Add reasoning support
-            ),
+            settings=BedrockModelSettings(max_tokens=max_tokens),
         )
 
 
@@ -922,7 +855,7 @@ def get_completion_provider(
 async def merge_backticks(
     chunks: AsyncIterator[str],
 ) -> AsyncGenerator[str, None]:
-    buffer: Optional[str] = None
+    buffer: str | None = None
 
     def only_whitespace_or_newlines(text: str) -> bool:
         return all(char.isspace() or char == "\n" for char in text)
@@ -978,7 +911,7 @@ async def without_wrapping_backticks(
     langs = ["python", "sql", "markdown"]
 
     first_chunk = True
-    buffer: Optional[str] = None
+    buffer: str | None = None
     has_starting_backticks = False
 
     async for chunk in chunks:
@@ -993,8 +926,7 @@ async def without_wrapping_backticks(
                     # Remove the starting backticks with lang
                     chunk = stripped_chunk[3 + len(lang) :]
                     # Also remove starting newline if present
-                    if chunk.startswith("\n"):
-                        chunk = chunk[1:]
+                    chunk = chunk.removeprefix("\n")
                     break
             # If no language-specific fence was found, check for plain backticks
             else:
@@ -1002,8 +934,7 @@ async def without_wrapping_backticks(
                     has_starting_backticks = True
                     chunk = stripped_chunk[3:]  # Remove the starting backticks
                     # Also remove starting newline if present
-                    if chunk.startswith("\n"):
-                        chunk = chunk[1:]
+                    chunk = chunk.removeprefix("\n")
 
         # If we have a buffered chunk, yield it now
         if buffer is not None:

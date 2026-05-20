@@ -16,15 +16,17 @@ __all__ = [
     "data_editor",
     "data_explorer",
     "dataframe",
-    "date_range",
     "date",
+    "date_range",
     "datetime",
-    "experimental_data_editor",
     "dictionary",
     "dropdown",
-    "file_browser",
+    "experimental_data_editor",
     "file",
+    "file_browser",
     "form",
+    "matplotlib",
+    "matrix",
     "microphone",
     "multiselect",
     "number",
@@ -38,8 +40,8 @@ __all__ = [
     "switch",
     "table",
     "tabs",
-    "text_area",
     "text",
+    "text_area",
 ]
 
 from marimo._plugins.ui._impl.altair_chart import altair_chart
@@ -76,7 +78,9 @@ from marimo._plugins.ui._impl.input import (
     text,
     text_area,
 )
+from marimo._plugins.ui._impl.matrix import matrix
 from marimo._plugins.ui._impl.microphone import microphone
+from marimo._plugins.ui._impl.mpl import matplotlib
 from marimo._plugins.ui._impl.plotly import plotly
 from marimo._plugins.ui._impl.refresh import refresh
 from marimo._plugins.ui._impl.run_button import run_button

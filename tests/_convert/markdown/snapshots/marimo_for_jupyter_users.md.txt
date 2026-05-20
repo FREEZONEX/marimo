@@ -3,6 +3,12 @@ title: marimo for Jupyter users
 marimo-version: 0.0.0
 header: |-
   # Copyright 2026 Marimo. All rights reserved.
+  # /// script
+  # requires-python = ">=3.12"
+  # dependencies = [
+  #     "marimo",
+  # ]
+  # ///
 ---
 
 # marimo for Jupyter users
@@ -27,7 +33,7 @@ y = x + 1; y
 marimo 'reacts' to the change in `x` and automatically recalculates `y`!
 
 **Explanation.** marimo reads the code in your cells and understands the
-dependences between them, based on the variables that each cell declares and
+dependencies between them, based on the variables that each cell declares and
 references. When you execute one cell, marimo automatically executes all other
 cells that depend on it, not unlike a spreadsheet.
 
@@ -130,14 +136,20 @@ If you run into this error, here are your options:
 <!---->
 ## Markdown
 
-marimo only has Python cells, but you can still write Markdown: `import marimo as mo` and use `mo.md` to write Markdown.
+marimo notebooks are stored as pure Python, but you can still write Markdown:
+`import marimo as mo` and use `mo.md`.
+
+/// details | What about markdown & SQL "cells"?
+
+You may notice marimo UI has markdown and SQL cells in the editor. These are
+conveniences that use `mo.md` and `mo.sql` under the hood, with nicer
+ergonomics for authoring.
+///
 
 ```python {.marimo}
-mo.md(
-    f"""
-    The value of {slider} is {slider.value}.
-    """
-)
+mo.md(f"""
+The value of {slider} is {slider.value}.
+""")
 ```
 
 **Explanation.** By lifting Markdown into Python, marimo lets you construct

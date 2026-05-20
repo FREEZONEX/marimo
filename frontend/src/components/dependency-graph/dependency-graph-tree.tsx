@@ -51,13 +51,14 @@ export const DependencyGraphTree: React.FC<PropsWithChildren<Props>> = ({
   layoutDirection,
   settings,
 }) => {
-  // eslint-disable-next-line react/hook-use-state
+  // oxlint-disable-next-line react/hook-use-state
   const [initial] = useState(() => {
     let elements = elementsBuilder.createElements(
       cellIds,
       cellAtoms,
       variables,
       settings.hidePureMarkdown,
+      settings.hideReusableFunctions,
     );
     elements = layoutElements({
       nodes: elements.nodes,
@@ -94,9 +95,17 @@ export const DependencyGraphTree: React.FC<PropsWithChildren<Props>> = ({
         cellAtoms,
         variables,
         settings.hidePureMarkdown,
+        settings.hideReusableFunctions,
       ),
     );
-  }, [cellIds, variables, cellAtoms, syncChanges, settings.hidePureMarkdown]);
+  }, [
+    cellIds,
+    variables,
+    cellAtoms,
+    syncChanges,
+    settings.hidePureMarkdown,
+    settings.hideReusableFunctions,
+  ]);
 
   const [selection, setSelection] = useState<GraphSelection>();
   useFitToViewOnDimensionChange();

@@ -5,10 +5,11 @@ import abc
 import inspect
 import re
 from collections import namedtuple
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Optional, get_args
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from marimo._plugins.ui._core.ui_element import UIElement
+from marimo._runtime.cell_lifecycle_item import CellLifecycleItem
 from marimo._runtime.context import ContextNotInitializedError, get_context
 from marimo._runtime.state import SetFunctor
 from marimo._save.stubs import (
@@ -16,6 +17,7 @@ from marimo._save.stubs import (
     CustomStub,
     FunctionStub,
     ModuleStub,
+    ReferenceStub,
     UIElementStub,
     maybe_register_stub,
 )
@@ -32,12 +34,14 @@ UNEXPECTED_FAILURE_BOILERPLATE = (
 
 if TYPE_CHECKING:
     from marimo._ast.visitor import Name
+    from marimo._runtime.context.types import RuntimeContext
     from marimo._runtime.state import State
     from marimo._save.hash import HashKey
     from marimo._save.loaders import Loader
+    from marimo._save.stores import Store
 
 # NB. Increment on cache breaking changes.
-MARIMO_CACHE_VERSION: int = 3
+MARIMO_CACHE_VERSION: int = 4
 
 CacheType = Literal[
     "ContextExecutionPath",
@@ -57,8 +61,53 @@ CACHE_PREFIX: dict[CacheType, str] = {
     "Unknown": "U_",
 }
 
+
+@dataclass
+class CacheState:
+    """Groups cache-related state on RuntimeContext.
+
+    The ``is_memoizable`` method controls which value types are eligible
+    for content-hash memoization.  Override (or swap the instance) to
+    broaden memoization for cached / parallel execution.
+    """
+
+    store: Store
+    hash_memo: dict[str, bytes] = field(default_factory=dict)
+
+    def is_memoizable(self, value: Any) -> bool:
+        """Whether *value* is eligible for content-hash memoization.
+
+        Currently restricted to non-primitive data primitives (tensors,
+        arrays) — they are expensive to serialize and typically long-lived.
+        """
+        from marimo._runtime.primitives import is_data_primitive, is_primitive
+
+        return not is_primitive(value) and is_data_primitive(value)
+
+
+class HashMemoCleanup(CellLifecycleItem):
+    """Clears memoized content hashes when a defining cell is re-executed.
+
+    Deduped via __hash__/__eq__ — at most one per cell's lifecycle set.
+    Gets cache from context at disposal time.
+    """
+
+    def __hash__(self) -> int:
+        return hash("HashMemoCleanup")
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, HashMemoCleanup)
+
+    def create(self, context: RuntimeContext | None) -> None:
+        pass
+
+    def dispose(self, context: RuntimeContext, deletion: bool) -> bool:  # noqa: ARG002
+        context.cache.hash_memo.clear()
+        return True
+
+
 ValidCacheSha = namedtuple("ValidCacheSha", ("sha", "cache_type"))
-MetaKey = Literal["return", "version", "runtime"]
+MetaKey = Literal["return", "version", "runtime", "variable_hashes"]
 # Matches functools
 CacheInfo = namedtuple(
     "CacheInfo", ["hits", "misses", "maxsize", "currsize", "time_saved"]
@@ -147,10 +196,10 @@ class Cache:
         elif isinstance(value, set):
             # Sets cannot be recursive (require hashable items), but keep the
             # reference.
-            result = set(
+            result = {
                 self._restore_from_stub_if_needed(item, scope, memo)
                 for item in value
-            )
+            }
             value.clear()
             value.update(result)
             result = value
@@ -172,6 +221,8 @@ class Cache:
             value.clear()
             value.update(result)
             result = value
+        elif isinstance(value, ReferenceStub):
+            result = value.load(scope)
         elif isinstance(value, CustomStub):
             # CustomStub is a placeholder for a custom type, which cannot be
             # restored directly.
@@ -185,7 +236,7 @@ class Cache:
     def update(
         self,
         scope: dict[str, Any],
-        meta: Optional[dict[MetaKey, Any]] = None,
+        meta: dict[MetaKey, Any] | None = None,
         preserve_pointers: bool = True,
     ) -> None:
         """Loads values from scope, updating the cache."""
@@ -277,10 +328,10 @@ class Cache:
             )
         elif isinstance(value, set):
             # sets cannot be recursive (require hashable items)
-            converted = set(
+            converted = {
                 self._convert_to_stub_if_needed(item, memo, preserve_pointers)
                 for item in value
-            )
+            }
             if preserve_pointers:
                 value.clear()
                 value.update(converted)
@@ -399,7 +450,7 @@ class CacheContext(abc.ABC):
     Base class for cache interfaces."""
 
     __slots__ = "_loader"
-    _loader: Optional[State[Loader]]
+    _loader: State[Loader] | None
 
     # Match functools api
     def cache_info(self) -> CacheInfo:
@@ -458,7 +509,7 @@ class CacheContext(abc.ABC):
 
     @property
     @abc.abstractmethod
-    def last_hash(self) -> Optional[str]:
+    def last_hash(self) -> str | None:
         """Last computed cache hash, if available."""
 
     def __repr__(self) -> str:

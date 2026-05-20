@@ -12,7 +12,10 @@ import pytest
 from marimo._data.models import ValueCount
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._plugins import ui
-from marimo._plugins.ui._impl.dataframes.transforms.types import Condition
+from marimo._plugins.ui._impl.dataframes.transforms.types import (
+    FilterCondition,
+    FilterGroup,
+)
 from marimo._plugins.ui._impl.table import (
     CHART_MAX_ROWS_STRING_VALUE_COUNTS,
     DEFAULT_MAX_COLUMNS,
@@ -119,7 +122,7 @@ def test_normalize_data(executing_kernel: Kernel) -> None:
     assert str(e.value) == "data must be a list or tuple or a dict of lists."
 
     # Test with invalid data structure
-    data3: Any = [set([1, 2, 3])]
+    data3: Any = [{1, 2, 3}]
     with pytest.raises(ValueError) as e:
         _normalize_data(data3)
     assert (
@@ -1117,7 +1120,18 @@ def test_table_with_filtered_columns(df: Any) -> None:
     table = ui.table(df)
     result = table._search(
         SearchTableArgs(
-            filters=[Condition(column_id="b", operator="contains", value="f")],
+            filters=FilterGroup(
+                type="group",
+                operator="and",
+                children=[
+                    FilterCondition(
+                        type="condition",
+                        column_id="b",
+                        operator="contains",
+                        value="f",
+                    )
+                ],
+            ),
             page_size=10,
             page_number=0,
         )
@@ -1247,6 +1261,16 @@ def test_show_download(df: Any) -> None:
 
 DOWNLOAD_FORMATS = ["csv", "json", "parquet"]
 
+# Parquet export requires pandas+pyarrow or polars (see the `_download_as`
+# short-circuit in `table.py`). In environments without those — e.g. the
+# `test` group, which has only pyarrow — skip parquet in the round-trip.
+_CAN_EXPORT_PARQUET = DependencyManager.polars.has() or (
+    DependencyManager.pandas.has() and DependencyManager.pyarrow.has()
+)
+_TESTABLE_DOWNLOAD_FORMATS = (
+    DOWNLOAD_FORMATS if _CAN_EXPORT_PARQUET else ["csv", "json"]
+)
+
 
 @pytest.mark.parametrize(
     "df",
@@ -1270,7 +1294,7 @@ def test_download_as(df: Any) -> None:
         """Helper to download and convert table data to DataFrame."""
         download_str = table_instance._download_as(
             DownloadAsArgs(format=format_type)
-        )
+        ).url
         data_bytes = from_data_uri(download_str)[1]
         buffer = io.BytesIO(data_bytes)
 
@@ -1321,7 +1345,7 @@ def test_download_as(df: Any) -> None:
         raise ValueError(f"Unsupported format: {format_type}")
 
     # Test base downloads (full data)
-    for format_type in DOWNLOAD_FORMATS:
+    for format_type in _TESTABLE_DOWNLOAD_FORMATS:
         downloaded_df = download_and_convert(format_type, table)
         downloaded_nw = nw.from_native(downloaded_df)
         assert len(downloaded_nw) == len(nw_df)
@@ -1329,7 +1353,7 @@ def test_download_as(df: Any) -> None:
 
     # Test downloads with search filter
     table._search(SearchTableArgs(query="New", page_size=10, page_number=0))
-    for format_type in DOWNLOAD_FORMATS:
+    for format_type in _TESTABLE_DOWNLOAD_FORMATS:
         filtered_df = download_and_convert(format_type, table)
         filtered_nw = nw.from_native(filtered_df)
         assert len(filtered_nw) == 2
@@ -1338,12 +1362,78 @@ def test_download_as(df: Any) -> None:
 
     # Test downloads with row selection (includes search from before)
     table._convert_value(["1"])  # select one row of the filtered view
-    for format_type in DOWNLOAD_FORMATS:
+    for format_type in _TESTABLE_DOWNLOAD_FORMATS:
         selected_df = download_and_convert(format_type, table)
         selected_nw = nw.from_native(selected_df)
         # For row selection, selection is respected (single row)
         assert len(selected_nw) == 1
         assert selected_nw["cities"][0] == "New York"
+
+
+def test_json_size_bytes_matches_payload() -> None:
+    data = [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
+    table = ui.table(data)
+    expected = len(table._manager.to_json(strict_json=True))
+    assert table._get_json_size_bytes(table._manager) == expected
+    assert expected > 0
+
+
+def test_json_size_bytes_cached_per_manager_identity() -> None:
+    table = ui.table([{"a": 1}, {"a": 2}])
+    # The constructor already primed the cache with table._manager; verify
+    # that asking again does not re-serialize, while a fresh manager does.
+    call_count = 0
+    original_to_json = type(table._manager).to_json
+
+    def counting_to_json(self: Any, **kwargs: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        return original_to_json(self, **kwargs)
+
+    other_manager = ui.table([{"a": 3, "b": 4}])._manager
+    # other_manager's construction primed the cache with a different key,
+    # so the next call on table._manager will be a fresh miss.
+    with patch.object(type(table._manager), "to_json", counting_to_json):
+        table._get_json_size_bytes(table._manager)
+        table._get_json_size_bytes(table._manager)
+        assert call_count == 1, (
+            "second call with same manager identity should hit cache"
+        )
+        table._get_json_size_bytes(other_manager)
+        assert call_count == 2, "different manager identity should recompute"
+
+
+def test_json_size_bytes_fails_open() -> None:
+    table = ui.table([{"a": 1}])
+
+    class _Boom:
+        def to_json(self, **_: Any) -> str:
+            raise RuntimeError("boom")
+
+    assert table._get_json_size_bytes(_Boom()) is None  # type: ignore[arg-type]
+
+
+def test_render_args_carry_size_bytes() -> None:
+    table = ui.table([{"a": 1}, {"a": 2}])
+    args = table._component_args  # type: ignore[attr-defined]
+    assert args["size-bytes"] == len(table._manager.to_json(strict_json=True))
+
+
+def test_search_response_carries_size_bytes() -> None:
+    data = [{"a": i} for i in range(10)]
+    table = ui.table(data)
+    # Unfiltered branch — should report _manager's size.
+    unfiltered = table._search(SearchTableArgs(page_size=5, page_number=0))
+    assert unfiltered.size_bytes == len(
+        table._manager.to_json(strict_json=True)
+    )
+    # Filtered branch — should report the searched manager's size, which
+    # differs from the full manager.
+    filtered = table._search(
+        SearchTableArgs(query="1", page_size=5, page_number=0)
+    )
+    assert filtered.size_bytes is not None
+    assert filtered.size_bytes < unfiltered.size_bytes
 
 
 def test_download_as_ignores_cell_selection() -> None:
@@ -1354,12 +1444,46 @@ def test_download_as_ignores_cell_selection() -> None:
     # Make a cell selection; download should still include the filtered view
     table._convert_value([{"rowId": "0", "columnName": "a"}])
     # Use JSON format to avoid optional dependencies
-    url = table._download_as(DownloadAsArgs(format="json"))
+    url = table._download_as(DownloadAsArgs(format="json")).url
     data_bytes = from_data_uri(url)[1]
     rows = json.loads(data_bytes)
     assert isinstance(rows, list)
     assert len(rows) == 1
     assert int(rows[0]["a"]) == 2
+
+
+def test_download_as_parquet_without_libs_reports_missing_packages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(DependencyManager.pandas, "has", lambda: False)
+    monkeypatch.setattr(DependencyManager.polars, "has", lambda: False)
+    monkeypatch.setattr(DependencyManager.pyarrow, "has", lambda: False)
+
+    table = ui.table([{"a": 1}])
+    response = table._download_as(DownloadAsArgs(format="parquet"))
+
+    assert response.url == ""
+    assert response.filename == ""
+    assert response.missing_packages == ["polars"]
+    assert response.error is not None
+    assert "polars" in response.error
+
+
+def test_download_as_parquet_with_pandas_only_prompts_pyarrow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(DependencyManager.pandas, "has", lambda: True)
+    monkeypatch.setattr(DependencyManager.polars, "has", lambda: False)
+    monkeypatch.setattr(DependencyManager.pyarrow, "has", lambda: False)
+
+    table = ui.table([{"a": 1}])
+    response = table._download_as(DownloadAsArgs(format="parquet"))
+
+    assert response.url == ""
+    assert response.filename == ""
+    assert response.missing_packages == ["pyarrow"]
+    assert response.error is not None
+    assert "pyarrow" in response.error
 
 
 @pytest.mark.skipif(
@@ -1582,7 +1706,9 @@ def test_column_clamping_with_dataframes(df: Any):
     assert table._component_args["max-columns"] == DEFAULT_MAX_COLUMNS
     json_data = json.loads(table._component_args["data"])
     headers = json_data[0].keys()
-    assert len(headers) == DEFAULT_MAX_COLUMNS  # 50 columns
+    assert (
+        len(headers) == DEFAULT_MAX_COLUMNS + 1
+    )  # 50 columns + _marimo_row_id
     # Field types are not clamped
     assert len(table._component_args["field-types"]) == 60
 
@@ -1594,7 +1720,7 @@ def test_column_clamping_with_dataframes(df: Any):
     assert table._component_args["max-columns"] == 40
     json_data = json.loads(table._component_args["data"])
     headers = json_data[0].keys()
-    assert len(headers) == 40  # 40 columns
+    assert len(headers) == 41  # 40 columns + _marimo_row_id
     # Field types aren't clamped
     assert len(table._component_args["field-types"]) == 60
 
@@ -1609,6 +1735,65 @@ def test_column_clamping_with_dataframes(df: Any):
 
     assert len(headers) == 61  # 60 columns + 1 selection column
     assert len(table._component_args["field-types"]) == 60
+
+
+@pytest.mark.parametrize(
+    "df",
+    create_dataframes(
+        {
+            "person": ["Alice", "Bob", "Charlie"],
+            "age": [20, 30, 40],
+            **{f"col{i}": [1, 2, 3] for i in range(49)},
+        },
+        exclude=NON_EAGER_LIBS,
+    ),
+)
+def test_selection_with_clamped_columns_and_filter(df: Any):
+    """Regression test for #8029: selection returns wrong row when table
+    has more columns than max_columns and is filtered."""
+    import narwhals as nw
+
+    table = ui.table(df, max_columns=50)
+
+    # The data sent to frontend should include _marimo_row_id
+    # even when columns are clamped
+    json_data = json.loads(table._component_args["data"])
+    assert INDEX_COLUMN_NAME in json_data[0]
+
+    # Apply a filter to show only rows where age >= 30
+    # (should return Bob and Charlie, with _marimo_row_id 1 and 2)
+    search_args = SearchTableArgs(
+        page_size=10,
+        page_number=0,
+        filters=FilterGroup(
+            type="group",
+            operator="and",
+            children=[
+                FilterCondition(
+                    type="condition", column_id="age", operator=">=", value=30
+                )
+            ],
+        ),
+    )
+    response = table._search(search_args)
+    result_data = json.loads(response.data)
+
+    # Filtered data should still include _marimo_row_id
+    assert INDEX_COLUMN_NAME in result_data[0]
+    assert len(result_data) == 2  # Bob and Charlie
+
+    # Select row with _marimo_row_id=2 (Charlie)
+    value = table._convert_value(["2"])
+    assert not isinstance(value, nw.DataFrame)
+    nw_value = nw.from_native(value)
+    assert nw_value["person"][0] == "Charlie"
+    assert nw_value["age"][0] == 40
+
+    # Select row with _marimo_row_id=1 (Bob)
+    value = table._convert_value(["1"])
+    nw_value = nw.from_native(value)
+    assert nw_value["person"][0] == "Bob"
+    assert nw_value["age"][0] == 30
 
 
 @pytest.mark.skipif(
@@ -1872,6 +2057,124 @@ def test_cell_styles_sorted_with_pagination(df: Any):
     assert page2.cell_styles["9"]["Value"] == {"color": "red"}
 
 
+@pytest.mark.parametrize(
+    "df",
+    create_dataframes(
+        {
+            "Name": ["alpha", "beta", "gamma", "delta"],
+            "Score": [4.0, 1.0, 3.0, 2.0],
+        },
+        exclude=NON_EAGER_LIBS,
+    ),
+)
+def test_cell_styles_descending_non_index_column(df: Any):
+    """Test that cell styles work when sorting by a non-index column.
+
+    Regression test for issue #8847 - style_cell styles lost when sorting
+    in descending order. The root cause was that _style_cells generated
+    row IDs assuming index-column ordering rather than reading actual
+    _marimo_row_id values from the sorted data.
+
+    Uses non-monotonic scores so the sorted order [0, 2, 3, 1] does NOT
+    match a reversed-sequential pattern, which the old buggy range-based
+    logic would have generated.
+    """
+
+    def style(_row_id, _col, value):
+        try:
+            v = float(value)
+            return {"color": "green" if v >= 3.0 else "red"}
+        except (TypeError, ValueError):
+            return {}
+
+    table = ui.table(df, style_cell=style)
+
+    # Sort by Score descending: 4.0 (row 0), 3.0 (row 2), 2.0 (row 3), 1.0 (row 1)
+    # Row IDs on page should be [0, 2, 3, 1] - NOT reversed sequential [3, 2, 1, 0]
+    page = table._search(
+        SearchTableArgs(
+            page_size=10,
+            page_number=0,
+            query="",
+            sort=[SortArgs(by="Score", descending=True)],
+        )
+    )
+    # All 4 original row IDs must be present
+    assert "0" in page.cell_styles
+    assert "1" in page.cell_styles
+    assert "2" in page.cell_styles
+    assert "3" in page.cell_styles
+    # alpha (row 0, score 4.0) should be green
+    assert page.cell_styles["0"]["Score"] == {"color": "green"}
+    # gamma (row 2, score 3.0) should be green
+    assert page.cell_styles["2"]["Score"] == {"color": "green"}
+    # delta (row 3, score 2.0) should be red
+    assert page.cell_styles["3"]["Score"] == {"color": "red"}
+    # beta (row 1, score 1.0) should be red
+    assert page.cell_styles["1"]["Score"] == {"color": "red"}
+
+    # Also test ascending - should produce identical styles
+    page_asc = table._search(
+        SearchTableArgs(
+            page_size=10,
+            page_number=0,
+            query="",
+            sort=[SortArgs(by="Score", descending=False)],
+        )
+    )
+    assert page_asc.cell_styles["0"]["Score"] == {"color": "green"}
+    assert page_asc.cell_styles["1"]["Score"] == {"color": "red"}
+
+
+@pytest.mark.parametrize(
+    "df",
+    create_dataframes(
+        {
+            "Index": list(range(20)),
+            "Category": [f"Label {i % 5}" for i in range(20)],
+            "Value": [i * ((-1) ** i) for i in range(20)],
+        },
+        exclude=NON_EAGER_LIBS,
+    ),
+)
+def test_cell_styles_sorted_by_value_with_pagination(df: Any):
+    """Test styles when sorting by a non-index column with pagination.
+
+    Regression test for issue #8847 - when sorting by a column that does
+    not correlate with _marimo_row_id, the page's row IDs are arbitrary
+    and must be read from the sorted data, not generated sequentially.
+    """
+
+    def cell_style(_row_id, _col, value):
+        try:
+            v = float(value)
+            return {"color": "black" if v > 0 else "red"}
+        except (TypeError, ValueError):
+            return {}
+
+    table = ui.table(df, style_cell=cell_style)
+
+    # Sort by Value descending. Top values: 18 (row 18), 16 (row 16),
+    # 14 (row 14), 12 (row 12), 10 (row 10)
+    page0 = table._search(
+        SearchTableArgs(
+            page_size=5,
+            page_number=0,
+            query="",
+            sort=[SortArgs(by="Value", descending=True)],
+        )
+    )
+    # Page 0 should have row IDs for the top-5 values (even indices)
+    assert "18" in page0.cell_styles
+    assert "16" in page0.cell_styles
+    assert "14" in page0.cell_styles
+    assert "12" in page0.cell_styles
+    assert "10" in page0.cell_styles
+    # All top-5 values are positive, so all should be black
+    assert page0.cell_styles["18"]["Value"] == {"color": "black"}
+    assert page0.cell_styles["16"]["Value"] == {"color": "black"}
+
+
 @pytest.mark.skipif(
     not DependencyManager.pandas.has(),
     reason="Pandas not installed, only pandas has multi-col idx",
@@ -2000,10 +2303,14 @@ def test_lazy_dataframe_with_non_lazy_dataframe(df: Any):
 def test_get_data_url_no_deps() -> None:
     table = ui.table([1, 2, 3])
     response = table._get_data_url({})
-    assert response.data_url.startswith("data:application/json;base64,")
-    data = json.loads(from_data_uri(response.data_url)[1])
-    assert data == [{"value": 1}, {"value": 2}, {"value": 3}]
-    assert response.format == "json"
+    # DefaultTableManager.to_csv_str uses the stdlib csv module and works
+    # without pandas/polars/pyarrow, so _to_chart_data_url returns CSV before
+    # falling through to JSON.
+    assert response.data_url.startswith("data:text/csv;base64,")
+    assert from_data_uri(response.data_url)[1].decode("utf-8") == (
+        "value\n1\n2\n3\n"
+    )
+    assert response.format == "csv"
 
 
 @pytest.mark.skipif(
@@ -2030,7 +2337,7 @@ def test_get_data_url_values() -> None:
     from pandas.testing import assert_frame_equal
 
     df = _convert_data_bytes_to_pandas_df(response.data_url, response.format)
-    expected_df = pd.DataFrame({0: [1, 2, 3]})
+    expected_df = pd.DataFrame({"value": [1, 2, 3]})
     assert_frame_equal(df, expected_df)
 
     # Test search
@@ -2069,6 +2376,119 @@ def test_calculate_top_k_rows():
     )
     assert result == CalculateTopKRowsResponse(
         data=[(3, 2), (None, 2), (1, 1)],
+    )
+
+
+_TOP_K_DATA = {
+    "role": ["admin", "admin", "user", "user", "guest"],
+    "country": ["US", "UK", "US", "US", "UK"],
+}
+
+
+def _filter_role_in(values: list[str]) -> FilterGroup:
+    return FilterGroup(
+        type="group",
+        operator="and",
+        children=[
+            FilterCondition(
+                type="condition",
+                column_id="role",
+                operator="in",
+                value=values,
+            )
+        ],
+    )
+
+
+def _filter_country_eq(value: str) -> FilterGroup:
+    return FilterGroup(
+        type="group",
+        operator="and",
+        children=[
+            FilterCondition(
+                type="condition",
+                column_id="country",
+                operator="equals",
+                value=value,
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize("df", create_dataframes(_TOP_K_DATA))
+def test_top_k_ignores_same_column_filter(df: Any) -> None:
+    """Editing a filter on a column must not hide values the filter excludes."""
+    table = ui.table(df)
+    table._search(
+        SearchTableArgs(
+            page_size=10,
+            page_number=0,
+            filters=_filter_role_in(["admin", "user"]),
+        )
+    )
+    result = table._calculate_top_k_rows(
+        CalculateTopKRowsArgs(column="role", k=10)
+    )
+    # `guest` is excluded by the active filter but must still appear,
+    # otherwise users can't broaden the filter back out.
+    assert result == CalculateTopKRowsResponse(
+        data=[("admin", 2), ("user", 2), ("guest", 1)],
+    )
+
+
+@pytest.mark.parametrize("df", create_dataframes(_TOP_K_DATA))
+def test_top_k_respects_other_column_filter(df: Any) -> None:
+    table = ui.table(df)
+    table._search(
+        SearchTableArgs(
+            page_size=10,
+            page_number=0,
+            filters=_filter_country_eq("UK"),
+        )
+    )
+    result = table._calculate_top_k_rows(
+        CalculateTopKRowsArgs(column="role", k=10)
+    )
+    # Only UK rows survive: admin (UK) and guest (UK).
+    assert result == CalculateTopKRowsResponse(
+        data=[("admin", 1), ("guest", 1)],
+    )
+
+
+@pytest.mark.parametrize("df", create_dataframes(_TOP_K_DATA))
+def test_top_k_strips_self_filter_keeps_others(df: Any) -> None:
+    table = ui.table(df)
+    table._search(
+        SearchTableArgs(
+            page_size=10,
+            page_number=0,
+            filters=FilterGroup(
+                type="group",
+                operator="and",
+                children=[
+                    FilterCondition(
+                        type="condition",
+                        column_id="role",
+                        operator="in",
+                        value=["admin", "user"],
+                    ),
+                    FilterCondition(
+                        type="condition",
+                        column_id="country",
+                        operator="equals",
+                        value="UK",
+                    ),
+                ],
+            ),
+        )
+    )
+    result = table._calculate_top_k_rows(
+        CalculateTopKRowsArgs(column="role", k=10)
+    )
+    # `role` filter is stripped, `country == UK` still applies:
+    # UK rows are admin + guest. `guest` reappears because role filter is ignored.
+    assert result == CalculateTopKRowsResponse(
+        data=[("admin", 1), ("guest", 1)],
     )
 
 
@@ -2186,7 +2606,15 @@ def test_max_columns_not_provided_with_filters(df: Any):
     search_args = SearchTableArgs(
         page_size=10,
         page_number=0,
-        filters=[Condition(column_id="col0", operator="==", value=1)],
+        filters=FilterGroup(
+            type="group",
+            operator="and",
+            children=[
+                FilterCondition(
+                    type="condition", column_id="col0", operator="==", value=1
+                )
+            ],
+        ),
         max_columns=MAX_COLUMNS_NOT_PROVIDED,
     )
     response = table._search(search_args)
@@ -2198,7 +2626,15 @@ def test_max_columns_not_provided_with_filters(df: Any):
     search_args = SearchTableArgs(
         page_size=10,
         page_number=0,
-        filters=[Condition(column_id="col0", operator="==", value=1)],
+        filters=FilterGroup(
+            type="group",
+            operator="and",
+            children=[
+                FilterCondition(
+                    type="condition", column_id="col0", operator="==", value=1
+                )
+            ],
+        ),
         max_columns=20,
     )
     response = table._search(search_args)
@@ -2210,7 +2646,15 @@ def test_max_columns_not_provided_with_filters(df: Any):
     search_args = SearchTableArgs(
         page_size=10,
         page_number=0,
-        filters=[Condition(column_id="col0", operator="==", value=1)],
+        filters=FilterGroup(
+            type="group",
+            operator="and",
+            children=[
+                FilterCondition(
+                    type="condition", column_id="col0", operator="==", value=1
+                )
+            ],
+        ),
         max_columns=None,
     )
     response = table._search(search_args)
@@ -2234,16 +2678,30 @@ def test_filters_with_nonexistent_columns(df: Any):
     search_args = SearchTableArgs(
         page_size=10,
         page_number=0,
-        filters=[
-            Condition(column_id="a", operator="==", value=1),  # exists
-            Condition(
-                column_id="nonexistent", operator="==", value=10
-            ),  # doesn't exist
-            Condition(column_id="b", operator=">=", value=4),  # exists
-            Condition(
-                column_id="missing_col", operator="!=", value=0
-            ),  # doesn't exist
-        ],
+        filters=FilterGroup(
+            type="group",
+            operator="and",
+            children=[
+                FilterCondition(
+                    type="condition", column_id="a", operator="==", value=1
+                ),  # exists
+                FilterCondition(
+                    type="condition",
+                    column_id="nonexistent",
+                    operator="==",
+                    value=10,
+                ),  # doesn't exist
+                FilterCondition(
+                    type="condition", column_id="b", operator=">=", value=4
+                ),  # exists
+                FilterCondition(
+                    type="condition",
+                    column_id="missing_col",
+                    operator="!=",
+                    value=0,
+                ),  # doesn't exist
+            ],
+        ),
     )
 
     # Should not raise an error and should apply only the valid filters
@@ -2261,10 +2719,24 @@ def test_filters_with_nonexistent_columns(df: Any):
     search_args_all_invalid = SearchTableArgs(
         page_size=10,
         page_number=0,
-        filters=[
-            Condition(column_id="nonexistent1", operator="==", value=1),
-            Condition(column_id="nonexistent2", operator="!=", value=2),
-        ],
+        filters=FilterGroup(
+            type="group",
+            operator="and",
+            children=[
+                FilterCondition(
+                    type="condition",
+                    column_id="nonexistent1",
+                    operator="==",
+                    value=1,
+                ),
+                FilterCondition(
+                    type="condition",
+                    column_id="nonexistent2",
+                    operator="!=",
+                    value=2,
+                ),
+            ],
+        ),
     )
 
     response = table._search(search_args_all_invalid)
@@ -2493,9 +2965,9 @@ def test_cell_search_df_hover_texts(df: Any):
                 "carrots",
             ]
         },
+        exclude=NON_EAGER_LIBS,
     ),
 )
-@pytest.mark.xfail(reason="Sorted rows are not supported for hover yet")
 def test_cell_search_df_hover_texts_sorted(df: Any):
     def hover_text(_row: str, _col: str, value: Any) -> str:
         return f"hover:{value}"
@@ -2506,7 +2978,7 @@ def test_cell_search_df_hover_texts_sorted(df: Any):
             page_size=2,
             page_number=0,
             query="",
-            sort=SortArgs(by="column_0", descending=True),
+            sort=[SortArgs(by="column_0", descending=True)],
         )
     )
     assert page.cell_hover_texts == {
@@ -2551,3 +3023,84 @@ def test_polars_enums_in_list():
         response_next_page.data
         == '[{"value":["C"]},{"value":["D"]},{"value":["A"]},{"value":["B"]},{"value":["C"]}]'
     )
+
+
+def test_search_returns_raw_data_with_format_mapping() -> None:
+    data = {"a": [1, 2, 3], "b": [4, 5, 6]}
+    table = ui.table(
+        data,  # pyright: ignore[reportArgumentType]
+        format_mapping={"a": lambda x: f"formatted_{x}"},
+    )
+
+    result = table._search(SearchTableArgs(page_size=10, page_number=0))
+
+    assert json.loads(result.data) == [
+        {"a": "formatted_1", "b": 4},
+        {"a": "formatted_2", "b": 5},
+        {"a": "formatted_3", "b": 6},
+    ]
+
+    assert result.raw_data is not None
+    assert json.loads(result.raw_data) == [
+        {"a": 1, "b": 4},
+        {"a": 2, "b": 5},
+        {"a": 3, "b": 6},
+    ]
+
+
+def test_search_returns_no_raw_data_without_format_mapping() -> None:
+    data = {"a": [1, 2, 3]}
+    table = ui.table(data)  # pyright: ignore[reportArgumentType]
+
+    result = table._search(SearchTableArgs(page_size=10, page_number=0))
+
+    assert result.raw_data is None
+
+
+def test_initial_args_include_raw_data_with_format_mapping() -> None:
+    data = {"a": [10, 20], "b": ["x", "y"]}
+    table = ui.table(
+        data,
+        format_mapping={"a": lambda x: x * 10},
+    )
+
+    raw_data = table._component_args["raw-data"]
+    assert isinstance(raw_data, str)
+    assert json.loads(raw_data) == [
+        {"a": 10, "b": "x"},
+        {"a": 20, "b": "y"},
+    ]
+    formatted_data = table._component_args["data"]
+    assert isinstance(formatted_data, str)
+    assert json.loads(formatted_data) == [
+        {"a": 100, "b": "x"},
+        {"a": 200, "b": "y"},
+    ]
+
+
+def test_initial_args_no_raw_data_without_format_mapping() -> None:
+    data = {"a": [1, 2]}
+    table = ui.table(data)  # pyright: ignore[reportArgumentType]
+
+    assert table._component_args["raw-data"] is None
+
+
+def test_search_raw_data_with_query_and_format_mapping() -> None:
+    data = {"name": ["alice", "bob", "charlie"], "score": [10, 20, 30]}
+    table = ui.table(
+        data,
+        format_mapping={"score": lambda x: f"{x}%"},
+    )
+
+    result = table._search(
+        SearchTableArgs(query="bob", page_size=10, page_number=0)
+    )
+
+    assert json.loads(result.data) == [
+        {"name": "bob", "score": "20%"},
+    ]
+
+    assert result.raw_data is not None
+    assert json.loads(result.raw_data) == [
+        {"name": "bob", "score": 20},
+    ]

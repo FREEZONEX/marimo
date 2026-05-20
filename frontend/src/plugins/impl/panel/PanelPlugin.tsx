@@ -1,8 +1,7 @@
 /* Copyright 2026 Marimo. All rights reserved. */
-/* eslint-disable @typescript-eslint/no-explicit-any */
+/* oxlint-disable typescript/no-explicit-any */
 
-import { useEvent } from "@dnd-kit/utilities";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { z } from "zod";
 import { MarimoIncomingMessageEvent } from "@/core/dom/events";
 import {
@@ -11,14 +10,16 @@ import {
 } from "@/hooks/useEventListener";
 import { createPlugin } from "@/plugins/core/builder";
 import { rpc } from "@/plugins/core/rpc";
+import { isTrustedVirtualFileUrl } from "@/plugins/core/trusted-url";
 import type { IPluginProps } from "@/plugins/types";
+import { Logger } from "@/utils/Logger";
 import { EventBuffer, extractBuffers, MessageSchema } from "./utils";
 
 interface BokehDocument {
   create_json_patch: (events: unknown[]) => unknown;
   apply_json_patch: (content: unknown, buffers: ArrayBuffer[]) => void;
   on_change: (callback: (event: unknown) => void) => void;
-  _all_models: Set<string>;
+  _all_models: Map<string, unknown>;
 }
 
 interface RenderItems {
@@ -64,7 +65,7 @@ declare global {
 }
 
 interface PanelData {
-  extension: string | null;
+  extensionUrl: string | null;
   docs_json: Record<string, unknown>;
   render_json: {
     roots: Record<string, string>;
@@ -74,18 +75,18 @@ interface PanelData {
 
 type T = Record<string, unknown>;
 
-// eslint-disable-next-line @typescript-eslint/consistent-type-definitions
+// oxlint-disable-next-line typescript/consistent-type-definitions
 type PluginFunctions = {
   send_to_widget: <T>(req: {
-    message?: any;
-    buffers?: any;
+    message?: unknown;
+    buffers?: unknown;
   }) => Promise<null | undefined>;
 };
 
 export const PanelPlugin = createPlugin<T>("marimo-panel")
   .withData(
     z.object({
-      extension: z.string().nullable(),
+      extensionUrl: z.string().nullable(),
       docs_json: z.record(z.string(), z.unknown()),
       render_json: z
         .object({
@@ -110,31 +111,81 @@ function isBokehLoaded() {
   return window.Bokeh != null;
 }
 
+/**
+ * Append a `<script src>` for the bokeh/panel extension.
+ *
+ * The URL must be a marimo virtual file path; anything else (e.g. an
+ * attacker-controlled URL injected via a raw `<marimo-panel>` element in a
+ * markdown cell) is refused.
+ */
+export function loadPanelExtension(extensionUrl: string | null): boolean {
+  if (!extensionUrl) {
+    return false;
+  }
+  if (!isTrustedVirtualFileUrl(extensionUrl)) {
+    Logger.error(
+      `Refusing to load Panel extension from untrusted URL: ${String(
+        extensionUrl,
+      )}`,
+    );
+    return false;
+  }
+  const script = document.createElement("script");
+  script.src = extensionUrl;
+  document.head.append(script);
+  return true;
+}
+
 const PanelSlot = (props: Props) => {
   const { data, functions, host } = props;
-  const { extension, docs_json: docsJson, render_json: renderJson } = data;
+  const { extensionUrl, docs_json: docsJson, render_json: renderJson } = data;
   const ref = useRef<HTMLDivElement>(null);
-  const docRef = useRef<BokehDocument | null>(null);
+  const rootModelIdRef = useRef<string | null>(null);
   const receiverRef = useRef<InstanceType<
     typeof window.Bokeh.protocol.Receiver
   > | null>(null);
   const [loaded, setLoaded] = useState<boolean>(false);
   const [rendered, setRendered] = useState<string | null>(null);
 
-  const processEvents = useEvent(() => {
-    if (!eventBufferRef.current || !docRef.current) {
+  // Store functions in a ref so the callback captured by EventBuffer stays current
+  const functionsRef = useRef(functions);
+  functionsRef.current = functions;
+
+  const processEvents = useCallback(() => {
+    if (!eventBufferRef.current) {
       return;
     }
 
     const events = eventBufferRef.current.getAndClear();
-    const patch = docRef.current.create_json_patch(events);
-    const message = {
-      ...window.Bokeh.protocol.Message.create("PATCH-DOC", {}, patch),
-    };
+    if (events.length === 0) {
+      return;
+    }
+
+    // Use the event's own document — it is always current, even when
+    // DynamicMap/HoloViews has replaced the document after embedding.
+    const firstEvent = events.at(0);
+    if (!isDocumentEvent(firstEvent)) {
+      return;
+    }
+    const doc = firstEvent.document;
+
+    // Keep only events that belong to this document
+    const sameDocEvents = events.filter(
+      (ev) => isDocumentEvent(ev) && ev.document === doc,
+    );
+
+    const patch = doc.create_json_patch(sameDocEvents);
+    const message = window.Bokeh.protocol.Message.create(
+      "PATCH-DOC",
+      {},
+      patch,
+    );
     const buffers: ArrayBuffer[] = [];
     message.content = extractBuffers(message.content, buffers);
-    functions.send_to_widget({ message, buffers });
-  });
+    functionsRef.current.send_to_widget({ message, buffers }).catch((error) => {
+      Logger.warn("Failed to send Panel event to backend", error);
+    });
+  }, []);
 
   const eventBufferRef = useRef<EventBuffer<unknown> | null>(
     new EventBuffer(processEvents),
@@ -148,12 +199,7 @@ const PanelSlot = (props: Props) => {
       return;
     }
 
-    // Load the extension
-    if (extension) {
-      const script = document.createElement("script");
-      script.innerHTML = extension;
-      document.head.append(script);
-    }
+    loadPanelExtension(extensionUrl);
 
     // Check if Bokeh is loaded every 10ms
     const checkBokeh = setInterval(() => {
@@ -164,7 +210,7 @@ const PanelSlot = (props: Props) => {
     }, 10);
 
     return () => clearInterval(checkBokeh);
-  }, [extension, setLoaded]);
+  }, [extensionUrl, setLoaded]);
 
   // Listen for incoming messages
   useEventListener(
@@ -178,9 +224,8 @@ const PanelSlot = (props: Props) => {
       const message = MessageSchema.parse(e.detail.message);
       const buffers = e.detail.buffers;
       const receiver = receiverRef.current;
-      const doc = docRef.current;
 
-      if (!receiver || !doc) {
+      if (!receiver) {
         return;
       }
 
@@ -190,6 +235,11 @@ const PanelSlot = (props: Props) => {
         if (eventBufferRef.current && eventBufferRef.current.size() > 0) {
           processEvents();
         }
+        return;
+      }
+
+      const doc = getDoc(rootModelIdRef.current);
+      if (!doc) {
         return;
       }
 
@@ -212,7 +262,7 @@ const PanelSlot = (props: Props) => {
       if (commMessage != null && Object.keys(commMessage.content).length > 0) {
         if (commMessage.content.events !== undefined) {
           commMessage.content.events = commMessage.content.events.filter(
-            (e: any) => doc._all_models.has(e.model.id),
+            (e) => e?.model?.id && doc._all_models.has(e.model.id),
           );
         }
         doc.apply_json_patch(commMessage.content, commMessage.buffers);
@@ -243,9 +293,17 @@ const PanelSlot = (props: Props) => {
       }
       const modelId = Object.keys(renderItem.roots)[0];
       await window.Bokeh.embed.embed_items_notebook(docsJson, [renderItem]);
-      docRef.current = window.Bokeh.index.get_by_id(modelId).model.document;
+      rootModelIdRef.current = modelId;
+      const doc = window.Bokeh.index.get_by_id(modelId).model.document;
       receiverRef.current = new window.Bokeh.protocol.Receiver();
-      docRef.current.on_change((event) => eventBufferRef.current?.add(event));
+      doc.on_change((event) => {
+        // Bokeh tags server-applied patch events with sync=false via
+        // model.setv({...}, {sync: false}) inside apply_json_patch.
+        // Only forward user-initiated events (sync=true, the default).
+        if (isSyncEvent(event) && event.sync) {
+          eventBufferRef.current?.add(event);
+        }
+      });
       setRendered(docId);
     };
 
@@ -262,5 +320,30 @@ const PanelSlot = (props: Props) => {
     </div>
   );
 };
+
+// Re-fetch the live document from the Bokeh index. DynamicMap/HoloViews
+// may replace the document after initial embedding, so a stale ref would
+// cause "Cannot create a patch using events from a different document".
+function getDoc(id: string | null): BokehDocument | null {
+  if (!id) {
+    return null;
+  }
+  try {
+    return window.Bokeh.index.get_by_id(id).model.document;
+  } catch (error) {
+    Logger.warn("Failed to get Bokeh document", error);
+    return null;
+  }
+}
+
+function isSyncEvent(x: unknown): x is { sync: boolean } {
+  const isObject = !!x && typeof x === "object";
+  return isObject && "sync" in x;
+}
+
+function isDocumentEvent(x: unknown): x is { document: BokehDocument } {
+  const isObject = !!x && typeof x === "object";
+  return isObject && "document" in x;
+}
 
 type Props = IPluginProps<T, PanelData, PluginFunctions>;

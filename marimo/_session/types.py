@@ -8,18 +8,23 @@ implementations.
 
 from __future__ import annotations
 
+import contextlib
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    import asyncio
     import threading
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
     from marimo._config.manager import MarimoConfigManager
+    from marimo._messaging.notebook.document import NotebookDocument
     from marimo._messaging.notification import NotificationMessage
     from marimo._messaging.types import KernelMessage
     from marimo._runtime import commands
     from marimo._session.consumer import SessionConsumer
+    from marimo._session.extensions.types import SessionExtension
     from marimo._session.model import (
         ConnectionState,
         SessionMode,
@@ -35,10 +40,10 @@ class QueueManager(Protocol):
     """Protocol for queue management."""
 
     control_queue: QueueType[commands.CommandMessage]
-    set_ui_element_queue: QueueType[commands.UpdateUIElementCommand]
+    set_ui_element_queue: QueueType[commands.BatchableCommand]
     completion_queue: QueueType[commands.CodeCompletionCommand]
     input_queue: QueueType[str]
-    stream_queue: Optional[QueueType[Union[KernelMessage, None]]]
+    stream_queue: QueueType[KernelMessage | None] | None
     win32_interrupt_queue: QueueType[bool] | None
 
     def close_queues(self) -> None:
@@ -57,7 +62,7 @@ class QueueManager(Protocol):
 class KernelManager(Protocol):
     """Protocol for kernel management."""
 
-    kernel_task: Optional[Union[ProcessLike, threading.Thread]]
+    kernel_task: ProcessLike | threading.Thread | None
     mode: SessionMode
 
     def start_kernel(self) -> None:
@@ -100,6 +105,25 @@ class KernelState(Enum):
     STOPPED = "stopped"
 
 
+@dataclass(frozen=True)
+class KernelExitInfo:
+    """Information about how a kernel exited.
+
+    Populated after the kernel task has stopped. ``exitcode`` follows the
+    convention of ``multiprocessing.Process.exitcode``: ``>= 0`` for a normal
+    exit with that status, and ``< 0`` if the process was terminated by signal
+    ``-exitcode``. ``None`` means the exit status is unavailable -- either the
+    task has not yet terminated, or the underlying task type does not expose
+    one (e.g. threads). ``cause`` is a short machine-readable tag and
+    ``message`` is a human-readable one-liner suitable for logs or end-user
+    display.
+    """
+
+    exitcode: int | None
+    cause: str
+    message: str
+
+
 class Session(Protocol):
     """Protocol for session management."""
 
@@ -108,6 +132,12 @@ class Session(Protocol):
     config_manager: MarimoConfigManager
     session_view: SessionView
     ttl_seconds: int
+    scratchpad_lock: asyncio.Lock
+
+    @property
+    def document(self) -> NotebookDocument:
+        """The notebook document this session reflects."""
+        ...
 
     @property
     def consumers(self) -> Mapping[SessionConsumer, ConsumerId]:
@@ -120,6 +150,13 @@ class Session(Protocol):
 
     def kernel_pid(self) -> int | None:
         """Get the PID of the kernel."""
+        ...
+
+    def kernel_exit_info(self) -> KernelExitInfo | None:
+        """Describe how the kernel exited, or ``None`` if it is still running.
+
+        Only meaningful once ``kernel_state() == KernelState.STOPPED``.
+        """
         ...
 
     def try_interrupt(self) -> None:
@@ -137,7 +174,7 @@ class Session(Protocol):
     def put_control_request(
         self,
         request: commands.CommandMessage,
-        from_consumer_id: Optional[ConsumerId],
+        from_consumer_id: ConsumerId | None,
     ) -> None:
         """Put a control request in the control queue."""
         ...
@@ -167,18 +204,26 @@ class Session(Protocol):
     def notify(
         self,
         operation: NotificationMessage | KernelMessage,
-        from_consumer_id: Optional[ConsumerId],
+        from_consumer_id: ConsumerId | None,
     ) -> None:
-        """Write an operation to the session consumer and the session view."""
+        """Broadcast a notification to session consumers."""
         ...
 
     def instantiate(
         self,
         request: Any,
         *,
-        http_request: Optional[commands.HTTPRequest],
+        http_request: commands.HTTPRequest | None,
     ) -> None:
         """Instantiate the app."""
+        ...
+
+    @contextlib.contextmanager
+    def scoped(
+        self,
+        extension: SessionExtension,
+    ) -> Iterator[SessionExtension]:
+        """Attach an extension for the duration of the context."""
         ...
 
     def close(self) -> None:

@@ -4,7 +4,8 @@ from __future__ import annotations
 import abc
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Callable, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import msgspec
 
@@ -13,11 +14,15 @@ from marimo._dependencies.dependencies import DependencyManager
 from marimo._messaging.notification import AlertNotification
 from marimo._messaging.notification_utils import broadcast_notification
 from marimo._runtime.packages.utils import append_version
+from marimo._utils.subprocess import safe_popen
 
 if TYPE_CHECKING:
     from marimo._utils.uv_tree import DependencyTreeNode
 
 LOGGER = _loggers.marimo_logger()
+
+# Default Python executable
+PY_EXE = sys.executable
 
 # Type alias for log callback function
 LogCallback = Callable[[str], None]
@@ -53,12 +58,12 @@ class PackageManager(abc.ABC):
             return True
         LOGGER.error(
             f"{self.name} is not available. "
-            f"Check out the docs for installation instructions: {self.docs_url}"  # noqa: E501
+            f"Check out the docs for installation instructions: {self.docs_url}"
         )
         return False
 
     def install_command(
-        self, package: str, *, upgrade: bool, dev: bool
+        self, package: str, *, upgrade: bool, group: str | None = None
     ) -> list[str]:
         """
         Get the shell command to install a package (where applicable).
@@ -74,22 +79,22 @@ class PackageManager(abc.ABC):
         package: str,
         *,
         upgrade: bool,
-        dev: bool,
-        log_callback: Optional[LogCallback] = None,
+        group: str | None = None,
+        log_callback: LogCallback | None = None,
     ) -> bool:
         """Installation logic."""
         return await self.run(
-            self.install_command(package, upgrade=upgrade, dev=dev),
+            self.install_command(package, upgrade=upgrade, group=group),
             log_callback=log_callback,
         )
 
     async def install(
         self,
         package: str,
-        version: Optional[str],
+        version: str | None,
         upgrade: bool = False,
-        dev: bool = False,
-        log_callback: Optional[LogCallback] = None,
+        group: str | None = None,
+        log_callback: LogCallback | None = None,
     ) -> bool:
         """Attempt to install a package that makes this module available.
 
@@ -97,7 +102,7 @@ class PackageManager(abc.ABC):
             package: The package to install
             version: Optional version specification
             upgrade: Whether to upgrade the package if already installed
-            dev: Whether to install as a dev dependency (for uv projects)
+            group: Dependency group (for uv projects)
             log_callback: Optional callback to receive log output during installation
 
         Returns True if installation succeeded, else False.
@@ -106,17 +111,17 @@ class PackageManager(abc.ABC):
         return await self._install(
             append_version(package, version),
             upgrade=upgrade,
-            dev=dev,
+            group=group,
             log_callback=log_callback,
         )
 
     @abc.abstractmethod
-    async def uninstall(self, package: str, dev: bool) -> bool:
+    async def uninstall(self, package: str, group: str | None = None) -> bool:
         """Attempt to uninstall a package
 
         Args:
             package: The package to uninstall
-            dev: Whether this is a dev dependency
+            group: dependency group
 
         Returns True if the package was uninstalled, else False.
         """
@@ -131,10 +136,12 @@ class PackageManager(abc.ABC):
         return False
 
     def _run_sync(
-        self, command: list[str], log_callback: Optional[LogCallback]
+        self, command: list[str], log_callback: LogCallback | None
     ) -> bool:
         if not self.is_manager_installed():
             return False
+
+        LOGGER.info(f"Running command: {command}")
 
         if log_callback is None:
             # Original behavior - just run the command without capturing output
@@ -142,13 +149,16 @@ class PackageManager(abc.ABC):
             return completed_process.returncode == 0
 
         # Stream output to both the callback and the terminal
-        proc = subprocess.Popen(  # noqa: ASYNC220
+        proc = safe_popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=False,  # Keep as bytes to preserve ANSI codes
             bufsize=0,  # Unbuffered for real-time output
         )
+
+        if proc is None:
+            return False
 
         if proc.stdout:
             for line in iter(proc.stdout.readline, b""):
@@ -163,7 +173,7 @@ class PackageManager(abc.ABC):
         return return_code == 0
 
     async def run(
-        self, command: list[str], log_callback: Optional[LogCallback]
+        self, command: list[str], log_callback: LogCallback | None
     ) -> bool:
         """Run a command asynchronously in a thread pool to avoid blocking the event loop."""
         import asyncio
@@ -174,10 +184,10 @@ class PackageManager(abc.ABC):
         self,
         filepath: str,
         *,
-        packages_to_add: Optional[list[str]] = None,
-        packages_to_remove: Optional[list[str]] = None,
-        import_namespaces_to_add: Optional[list[str]] = None,
-        import_namespaces_to_remove: Optional[list[str]] = None,
+        packages_to_add: list[str] | None = None,
+        packages_to_remove: list[str] | None = None,
+        import_namespaces_to_add: list[str] | None = None,
+        import_namespaces_to_remove: list[str] | None = None,
         upgrade: bool,
     ) -> bool:
         del (
@@ -207,8 +217,8 @@ class PackageManager(abc.ABC):
 
     def dependency_tree(
         self,
-        filename: Optional[str] = None,  # noqa: ARG002
-    ) -> Optional[DependencyTreeNode]:
+        filename: str | None = None,  # noqa: ARG002
+    ) -> DependencyTreeNode | None:
         """Get dependency tree for the current environment or script.
 
         Args:
@@ -240,10 +250,13 @@ class CanonicalizingPackageManager(PackageManager):
     Subclasses needs to implement _construct_module_name_mapping.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, python_exe: str | None = None) -> None:
         # Initialized lazily
         self._module_name_to_repo_name: dict[str, str] | None = None
         self._repo_name_to_module_name: dict[str, str] | None = None
+        # Python executable for targeting a specific venv (used by pip/uv)
+        # Defaults to sys.executable if not provided
+        self._python_exe = python_exe or PY_EXE
         super().__init__()
 
     @abc.abstractmethod

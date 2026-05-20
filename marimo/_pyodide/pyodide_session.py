@@ -7,7 +7,7 @@ import json
 import re
 import signal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from marimo import _loggers
 from marimo._config.config import (
@@ -17,6 +17,7 @@ from marimo._config.config import (
 )
 from marimo._convert.markdown import convert_from_ir_to_markdown
 from marimo._messaging.msgspec_encoder import encode_json_str
+from marimo._messaging.types import KernelStreams
 from marimo._pyodide.restartable_task import RestartableTask
 from marimo._pyodide.streams import (
     PyodideStderr,
@@ -27,22 +28,18 @@ from marimo._pyodide.streams import (
 from marimo._runtime import commands, handlers, patches
 from marimo._runtime.commands import (
     AppMetadata,
+    BatchableCommand,
     CodeCompletionCommand,
     CommandMessage,
-    UpdateUIElementCommand,
     UpdateUserConfigCommand,
 )
-from marimo._runtime.context.kernel_context import initialize_kernel_context
-from marimo._runtime.input_override import input_override
 from marimo._runtime.marimo_pdb import MarimoPdb
-from marimo._runtime.runtime import Kernel
-from marimo._runtime.utils.set_ui_element_request_manager import (
-    SetUIElementRequestManager,
-)
 from marimo._server.export.exporter import Exporter
 from marimo._server.files.os_file_system import OSFileSystem
 from marimo._server.models.export import ExportAsHTMLRequest
 from marimo._server.models.files import (
+    FileCopyRequest,
+    FileCopyResponse,
     FileCreateRequest,
     FileCreateResponse,
     FileDeleteRequest,
@@ -73,6 +70,8 @@ from marimo._utils.inline_script_metadata import PyProjectReader
 from marimo._utils.parse_dataclass import parse_raw
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from marimo._ast.cell import CellConfig
     from marimo._messaging.types import KernelMessage
     from marimo._session.notebook.file_manager import AppFileManager
@@ -90,9 +89,7 @@ class AsyncQueueManager:
         self.control_queue = asyncio.Queue[commands.CommandMessage]()
 
         # set UI elements duplicated in another queue so they can be batched
-        self.set_ui_element_queue = asyncio.Queue[
-            commands.UpdateUIElementCommand
-        ]()
+        self.set_ui_element_queue = asyncio.Queue[BatchableCommand]()
 
         # Code completion requests are sent through a separate queue
         self.completion_queue = asyncio.Queue[commands.CodeCompletionCommand]()
@@ -152,7 +149,10 @@ class PyodideSession:
 
     def put_control_request(self, request: commands.CommandMessage) -> None:
         self._queue_manager.control_queue.put_nowait(request)
-        if isinstance(request, commands.UpdateUIElementCommand):
+        if isinstance(
+            request,
+            (commands.UpdateUIElementCommand, commands.ModelCommand),
+        ):
             self._queue_manager.set_ui_element_queue.put_nowait(request)
 
     def put_completion_request(
@@ -363,6 +363,20 @@ class PyodideBridge:
         response = FileDeleteResponse(success=success)
         return self._dump(response)
 
+    def copy_file_or_directory(
+        self,
+        request: str,
+    ) -> str:
+        body = self._parse(request, FileCopyRequest)
+        try:
+            info = self.file_system.copy_file_or_directory(
+                body.path, body.new_path
+            )
+            response = FileCopyResponse(success=True, info=info)
+        except Exception as e:
+            response = FileCopyResponse(success=False, message=str(e))
+        return self._dump(response)
+
     def move_file_or_directory(
         self,
         request: str,
@@ -414,7 +428,7 @@ class PyodideBridge:
 
 def _launch_pyodide_kernel(
     control_queue: asyncio.Queue[CommandMessage],
-    set_ui_element_queue: asyncio.Queue[UpdateUIElementCommand],
+    set_ui_element_queue: asyncio.Queue[BatchableCommand],
     completion_queue: asyncio.Queue[CodeCompletionCommand],
     input_queue: asyncio.Queue[str],
     on_message: Callable[[KernelMessage], None],
@@ -424,71 +438,50 @@ def _launch_pyodide_kernel(
     user_config: MarimoConfig,
 ) -> RestartableTask:
     from marimo._output.formatters.formatters import register_formatters
+    from marimo._runtime.kernel_lifecycle import (
+        KernelArgs,
+        asyncio_queue_reader,
+        create_kernel,
+        listen_messages,
+        teardown_kernel,
+    )
 
-    register_formatters()
-
-    LOGGER.debug("Launching kernel")
+    register_formatters(theme=user_config["display"]["theme"])
+    LOGGER.debug("Launching pyodide kernel")
 
     # Patches for pyodide compatibility
     patches.patch_pyodide_networking()
-
     # Some libraries mess with Python's default recursion limit, which becomes
     # a problem when running with Pyodide.
     patches.patch_recursion_limit(limit=1000)
 
     is_edit_mode = session_mode == SessionMode.EDIT
 
-    # Create communication channels
     stream = PyodideStream(on_message, input_queue)
     stdout = PyodideStdout(stream)
     stderr = PyodideStderr(stream)
     stdin = PyodideStdin(stream) if is_edit_mode else None
     debugger = MarimoPdb(stdout=stdout, stdin=stdin) if is_edit_mode else None
 
-    def _enqueue_control_request(req: CommandMessage) -> None:
-        control_queue.put_nowait(req)
-        if isinstance(req, UpdateUIElementCommand):
-            set_ui_element_queue.put_nowait(req)
-
-    kernel = Kernel(
-        cell_configs=configs,
-        app_metadata=app_metadata,
-        stream=stream,
-        stdout=stdout,
-        stderr=stderr,
-        stdin=stdin,
-        module=patches.patch_main_module(
-            file=app_metadata.filename,
-            input_override=input_override,
-            print_override=None,
-        ),
-        enqueue_control_request=_enqueue_control_request,
-        debugger_override=debugger,
-        user_config=user_config,
-    )
-    ctx = initialize_kernel_context(
-        kernel=kernel,
-        stream=stream,
-        stdout=stdout,
-        stderr=stderr,
-        virtual_files_supported=False,
-        mode=session_mode,
+    kernel, ctx = create_kernel(
+        KernelArgs(
+            streams=KernelStreams(
+                stream=stream, stdout=stdout, stderr=stderr, stdin=stdin
+            ),
+            debugger=debugger,
+            configs=configs,
+            app_metadata=app_metadata,
+            user_config=user_config,
+            mode=session_mode,
+            control_queue=control_queue,
+            set_ui_element_queue=set_ui_element_queue,
+            virtual_file_storage=None,
+            print_override_fn=None,
+        )
     )
 
     if is_edit_mode:
         signal.signal(signal.SIGINT, handlers.construct_interrupt_handler(ctx))
-
-    ui_element_request_mgr = SetUIElementRequestManager(set_ui_element_queue)
-
-    async def listen_messages() -> None:
-        while True:
-            request: CommandMessage | None = await control_queue.get()
-            LOGGER.debug("received request %s", request)
-            if isinstance(request, commands.UpdateUIElementCommand):
-                request = ui_element_request_mgr.process_request(request)
-
-            if request is not None:
-                await kernel.handle_message(request)
 
     async def listen_completion() -> None:
         while True:
@@ -503,6 +496,17 @@ def _launch_pyodide_kernel(
             kernel.code_completion(request, docstrings_limit=5)
 
     async def listen() -> None:
-        await asyncio.gather(listen_messages(), listen_completion())
+        try:
+            await asyncio.gather(
+                listen_messages(
+                    kernel,
+                    control_queue,
+                    set_ui_element_queue,
+                    asyncio_queue_reader,
+                ),
+                listen_completion(),
+            )
+        finally:
+            teardown_kernel(kernel, ctx)
 
     return RestartableTask(listen)

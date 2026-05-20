@@ -1,8 +1,14 @@
 # Copyright 2026 Marimo. All rights reserved.
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "marimo",
+# ]
+# ///
 
 import marimo
 
-__generated_with = "0.17.2"
+__generated_with = "0.23.6"
 app = marimo.App(app_title="marimo for Jupyter users")
 
 
@@ -47,7 +53,7 @@ def _(mo):
     marimo 'reacts' to the change in `x` and automatically recalculates `y`!
 
     **Explanation.** marimo reads the code in your cells and understands the
-    dependences between them, based on the variables that each cell declares and
+    dependencies between them, based on the variables that each cell declares and
     references. When you execute one cell, marimo automatically executes all other
     cells that depend on it, not unlike a spreadsheet.
 
@@ -88,6 +94,7 @@ def _(mo):
 @app.cell
 def _():
     import marimo as mo
+
     return (mo,)
 
 
@@ -216,18 +223,24 @@ def _(mo):
     mo.md(rf"""
     ## Markdown
 
-    marimo only has Python cells, but you can still write Markdown: `import marimo as mo` and use `mo.md` to write Markdown.
+    marimo notebooks are stored as pure Python, but you can still write Markdown:
+    `import marimo as mo` and use `mo.md`.
+
+    /// details | What about markdown & SQL "cells"?
+
+    You may notice marimo UI has markdown and SQL cells in the editor. These are
+    conveniences that use `mo.md` and `mo.sql` under the hood, with nicer
+    ergonomics for authoring.
+    ///
     """)
     return
 
 
 @app.cell
 def _(mo, slider):
-    mo.md(
-        f"""
-        The value of {slider} is {slider.value}.
-        """
-    )
+    mo.md(f"""
+    The value of {slider} is {slider.value}.
+    """)
     return
 
 

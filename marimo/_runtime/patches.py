@@ -1,21 +1,20 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import ast
 import contextlib
 import functools
 import sys
 import textwrap
 import types
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
+from marimo._ast.parse import ast_parse
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._runtime import marimo_browser, marimo_pdb
-from marimo._utils.platform import is_pyodide
-
-Unpatch = Callable[[], None]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from jedi.inference.base_value import (  # type: ignore[import-untyped]
         ValueSet,
@@ -169,15 +168,28 @@ del Loader; del MetaPathFinder
         del glbls["sys"]
 
 
+def extract_docstring_from_header(header: str | None) -> str | None:
+    """Extract the Python docstring value from a notebook header string."""
+    if not header:
+        return None
+    try:
+        tree = ast_parse(header)
+        return ast.get_docstring(tree)
+    except (SyntaxError, ValueError):
+        return None
+
+
 def create_main_module(
     file: str | None,
     input_override: Callable[[Any], str] | None,
     print_override: Callable[[Any], None] | None,
+    doc: str | None = None,
 ) -> types.ModuleType:
     # Every kernel gets its own main module, whose __dict__ attribute
     # serves as the global namespace
     _module = types.ModuleType(
-        "__main__", doc="Created for the marimo kernel."
+        "__main__",
+        doc=doc if doc is not None else "Created for the marimo kernel.",
     )
     _module.__dict__.setdefault("__builtin__", globals()["__builtins__"])
     _module.__dict__.setdefault("__builtins__", globals()["__builtins__"])
@@ -205,13 +217,14 @@ def patch_main_module(
     file: str | None,
     input_override: Callable[[Any], str] | None,
     print_override: Callable[[Any], None] | None,
+    doc: str | None = None,
 ) -> types.ModuleType:
     """Patches __main__ module
 
     - Makes functions pickleable
     - Loads some overrides and mocks into globals
     """
-    _module = create_main_module(file, input_override, print_override)
+    _module = create_main_module(file, input_override, print_override, doc=doc)
 
     # TODO(akshayka): In run mode, this can introduce races between different
     # kernel threads, since they each share sys.modules. Unfortunately, Python
@@ -284,9 +297,7 @@ def patch_jedi_parameter_completion() -> None:
             lines = [
                 line.strip().lstrip("#") for line in maybe_comment.splitlines()
             ]
-            min_indent = min(
-                [len(line) - len(line.lstrip()) for line in lines]
-            )
+            min_indent = min(len(line) - len(line.lstrip()) for line in lines)
             return "\n".join(
                 line.strip().lstrip("#")[min_indent:]
                 for line in maybe_comment.splitlines()
@@ -443,72 +454,3 @@ def patch_jedi_parameter_completion() -> None:
         SignatureParamName.infer = wrap_infer(original_dynamic_infer)
     if not getattr(SignatureParamName.__init__, "patched", False):
         SignatureParamName.__init__ = enhanced_init
-
-
-def patch_polars_write_json() -> Unpatch:
-    """Patch polars.DataFrame.write_json to work in WASM environments.
-
-    In WASM, file system operations may fail. This patch attempts to use
-    write_json first, and if it fails, falls back to write_csv and then
-    converts the CSV to JSON.
-    """
-    if not is_pyodide():
-        return lambda: None
-
-    import io
-    import pathlib
-
-    import polars
-
-    original_write_json = polars.DataFrame.write_json
-
-    def patched_write_json(
-        self: polars.DataFrame,
-        file: io.IOBase | str | pathlib.Path | None = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> str | None:
-        try:
-            # First try the original method
-            return original_write_json(self, file, *args, **kwargs)
-        except Exception:
-            # Fallback to CSV
-            import json
-
-            buffer = io.BytesIO()
-
-            # Write to CSV
-            self.write_csv(buffer)
-
-            # Read CSV as text
-            buffer.seek(0)
-            csv_content = buffer.read().decode("utf-8")
-
-            # Parse CSV to create JSON
-            lines = csv_content.strip().split("\n")
-            json_data: list[dict[str, str]] = []
-            if lines:
-                headers: list[str] = lines[0].split(",")
-                for line in lines[1:]:
-                    values: list[str] = line.split(",")
-                    json_data.append(dict(zip(headers, values)))
-
-            if file is None:
-                return json.dumps(json_data)
-            elif isinstance(file, io.IOBase):
-                json.dump(json_data, file)
-            elif isinstance(file, pathlib.Path):
-                file.write_text(json.dumps(json_data))
-            else:
-                with open(file, "w", encoding="utf-8") as f:
-                    json.dump(json_data, f)
-
-            return None
-
-    # Apply the patch
-    polars.DataFrame.write_json = patched_write_json  # type: ignore
-
-    def unpatch_polars_write_json() -> None:
-        polars.DataFrame.write_json = original_write_json  # type: ignore
-
-    return unpatch_polars_write_json

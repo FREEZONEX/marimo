@@ -2,20 +2,20 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "boto3",
-#     "litellm",
 #     "marimo",
 # ]
 # ///
 
 import marimo
 
-__generated_with = "0.17.4"
+__generated_with = "0.19.7"
 app = marimo.App(width="medium")
 
 
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
+
     return (mo,)
 
 

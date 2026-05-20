@@ -4,12 +4,15 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import shutil
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import click
+from click.core import ParameterSource
 
 import marimo._cli.cli_validators as validators
 from marimo import _loggers
@@ -18,13 +21,21 @@ from marimo._cli.config.commands import config
 from marimo._cli.convert.commands import convert
 from marimo._cli.development.commands import development
 from marimo._cli.envinfo import get_system_info
+from marimo._cli.errors import (
+    MarimoCLIMissingDependencyError,
+    MarimoCLIRuntimeError,
+)
 from marimo._cli.export.commands import export
-from marimo._cli.file_path import validate_name
+from marimo._cli.files.file_path import validate_name
+from marimo._cli.help_formatter import ColoredGroup, RunCommand
+from marimo._cli.pair.commands import pair
 from marimo._cli.parse_args import parse_args
-from marimo._cli.print import red
+from marimo._cli.parser_ux import show_compact_usage_error
+from marimo._cli.print import bright_green, light_blue, red
 from marimo._cli.run_docker import (
     prompt_run_in_docker_container,
 )
+from marimo._cli.tips import choose_startup_tip
 from marimo._cli.upgrade import check_for_updates, print_latest_version
 from marimo._cli.utils import (
     check_app_correctness,
@@ -33,31 +44,33 @@ from marimo._cli.utils import (
 )
 from marimo._config.settings import GLOBAL_SETTINGS
 from marimo._lint import run_check
-from marimo._server.file_router import AppFileRouter
+from marimo._mcp.setup import McpType
+from marimo._server.files.directory_scanner import DirectoryScanner
+from marimo._server.models.home import MarimoFile
 from marimo._server.start import start
+from marimo._server.workspace import (
+    DirectoryWorkspace,
+    EmptyWorkspace,
+    FixedFilesWorkspace,
+    NotebookWorkspace,
+    SingleFileWorkspace,
+    flatten_files,
+    infer_workspace,
+)
 from marimo._session.model import SessionMode
 from marimo._tutorials import (
     Tutorial,
     create_temp_tutorial_file,
     tutorial_order,
 )  # type: ignore
+from marimo._utils.http import HTTPException, HTTPStatus
 from marimo._utils.marimo_path import MarimoPath, create_temp_notebook_file
 from marimo._utils.platform import is_windows
 from marimo._version import __version__
 
 
 def helpful_usage_error(self: Any, file: Any = None) -> None:
-    if file is None:
-        file = click.get_text_stream("stderr")
-    color = None
-    click.echo(
-        red("Error") + f": {self.format_message()}\n",
-        file=file,
-        color=color,
-    )
-    if self.ctx is not None:
-        color = self.ctx.color
-        click.echo(self.ctx.get_help(), file=file, color=color)
+    show_compact_usage_error(self, file=file)
 
 
 click.exceptions.UsageError.show = helpful_usage_error  # type: ignore
@@ -75,7 +88,7 @@ def _key_value_bullets(items: list[tuple[str, str]]) -> str:
         lines.append("\b")
         lines.append(
             "  * "
-            + key
+            + light_blue(key, bold=True)
             + _sep(desc)
             + " " * (max_length - len(key) + 2)
             + desc
@@ -88,7 +101,7 @@ main_help_msg = "\n".join(
         "\b",
         "Welcome to marimo!",
         "\b",
-        "Getting started:",
+        bright_green("Getting started:", bold=True),
         "",
         _key_value_bullets(
             [
@@ -97,7 +110,7 @@ main_help_msg = "\n".join(
         ),
         "\b",
         "",
-        "Example usage:",
+        bright_green("Example usage:", bold=True),
         "",
         _key_value_bullets(
             [
@@ -143,10 +156,20 @@ sandbox_message = (
 
 check_message = "Disable a static check of the notebook before running."
 
+try:
+    MAX_TERM_WIDTH = shutil.get_terminal_size().columns
+except Exception:
+    MAX_TERM_WIDTH = 80
+
 
 @click.group(
+    cls=ColoredGroup,
     help=main_help_msg,
-    context_settings={"help_option_names": ["-h", "--help"]},
+    context_settings={
+        "help_option_names": ["-h", "--help"],
+        "max_content_width": MAX_TERM_WIDTH,
+        "show_default": True,
+    },
 )
 @click.version_option(version=__version__, message="%(version)s")
 @click.option(
@@ -156,7 +179,6 @@ check_message = "Disable a static check of the notebook before running."
     type=click.Choice(
         ["DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"], case_sensitive=False
     ),
-    show_default=True,
     help="Choose logging level.",
 )
 @click.option(
@@ -164,7 +186,6 @@ check_message = "Disable a static check of the notebook before running."
     "--quiet",
     is_flag=True,
     default=False,
-    show_default=True,
     help="Suppress standard out.",
 )
 @click.option(
@@ -172,7 +193,6 @@ check_message = "Disable a static check of the notebook before running."
     "--yes",
     is_flag=True,
     default=False,
-    show_default=True,
     help="Automatic yes to prompts, running non-interactively.",
 )
 @click.option(
@@ -180,7 +200,6 @@ check_message = "Disable a static check of the notebook before running."
     "--development-mode",
     is_flag=True,
     default=False,
-    show_default=True,
     help="Run in development mode; enables debug logs and server autoreload.",
 )
 def main(
@@ -231,6 +250,8 @@ edit_help_msg = "\n".join(
     [
         "\b",
         "Create or edit notebooks.",
+        "\b",
+        "If NAME is a url, the notebook will be downloaded to a temporary file."
         "",
         _key_value_bullets(
             [
@@ -245,19 +266,35 @@ edit_help_msg = "\n".join(
 )
 
 
+class _OptionalValueOption(click.Option):
+    """A click Option that supports an optional value.
+
+    Works around a regression in click 8.3.x where the documented
+    ``is_flag=False, flag_value=...`` pattern is broken.
+    See: https://github.com/pallets/click/issues/3084
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        opt_flag_value = kwargs.pop("flag_value", None)
+        kwargs.setdefault("default", None)
+        kwargs["is_flag"] = False
+        super().__init__(*args, **kwargs)
+        self._flag_needs_value = True
+        if opt_flag_value is not None:
+            self.flag_value = opt_flag_value
+
+
 @main.command(help=edit_help_msg)
 @click.option(
     "-p",
     "--port",
     default=None,
-    show_default=True,
     type=int,
     help="Port to attach to.",
 )
 @click.option(
     "--host",
     default="127.0.0.1",
-    show_default=True,
     type=str,
     help="Host to attach to.",
 )
@@ -271,35 +308,30 @@ edit_help_msg = "\n".join(
     "--headless",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Don't launch a browser.",
 )
 @click.option(
     "--token/--no-token",
     default=True,
-    show_default=True,
     type=bool,
     help=token_message,
 )
 @click.option(
     "--token-password",
     default=None,
-    show_default=True,
     type=str,
     help=token_password_message,
 )
 @click.option(
     "--token-password-file",
     default=None,
-    show_default=True,
     type=str,
     help="Path to file containing token password, or '-' for stdin. Mutually exclusive with --token-password.",
 )
 @click.option(
     "--base-url",
     default="",
-    show_default=True,
     type=str,
     help="Base URL for the server. Should start with a /.",
     callback=validators.base_url,
@@ -314,7 +346,6 @@ edit_help_msg = "\n".join(
     "--skip-update-check",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Don't check if a new version of marimo is available for download.",
 )
@@ -322,7 +353,6 @@ edit_help_msg = "\n".join(
     "--sandbox/--no-sandbox",
     is_flag=True,
     default=None,
-    show_default=False,
     type=bool,
     help=sandbox_message,
 )
@@ -330,7 +360,6 @@ edit_help_msg = "\n".join(
     "--trusted/--untrusted",
     is_flag=True,
     default=None,
-    show_default=False,
     type=bool,
     help="Run notebooks hosted remotely on the host machine; if --untrusted, runs marimo in a Docker container.",
 )
@@ -339,7 +368,6 @@ edit_help_msg = "\n".join(
     "--watch",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Watch the file for changes and reload the code when saved in another editor.",
 )
@@ -347,7 +375,6 @@ edit_help_msg = "\n".join(
     "--skew-protection/--no-skew-protection",
     is_flag=True,
     default=True,
-    show_default=True,
     type=bool,
     help="Enable skew protection middleware to prevent version mismatch issues.",
 )
@@ -368,12 +395,20 @@ edit_help_msg = "\n".join(
 )
 @click.option(
     "--mcp",
+    cls=_OptionalValueOption,
+    flag_value="tools",
+    default=None,
+    type=click.Choice(["tools", "code-mode"]),
+    hidden=True,
+    help="Enable MCP server endpoint.",
+)
+@click.option(
+    "--mcp-allow-remote",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     hidden=True,
-    help="Enable MCP server endpoint at /mcp/server for LLM integration.",
+    help="Allow remote access to MCP server by disabling DNS rebinding protection.",
 )
 @click.option(
     "--server-startup-command",
@@ -393,14 +428,12 @@ edit_help_msg = "\n".join(
     "--timeout",
     required=False,
     default=None,
-    show_default=False,
     type=float,
     help="Enable a global timeout to shut down the server after specified number of minutes of no connection",
 )
 @click.option(
     "--session-ttl",
     default=None,
-    show_default=False,
     type=int,
     help="Seconds to wait before closing a session on websocket disconnect. If None is provided, sessions are not automatically closed.",
 )
@@ -411,29 +444,30 @@ edit_help_msg = "\n".join(
 )
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def edit(
-    port: Optional[int],
+    port: int | None,
     host: str,
-    proxy: Optional[str],
+    proxy: str | None,
     headless: bool,
     token: bool,
-    token_password: Optional[str],
-    token_password_file: Optional[str],
+    token_password: str | None,
+    token_password_file: str | None,
     base_url: str,
-    allow_origins: Optional[tuple[str, ...]],
+    allow_origins: tuple[str, ...] | None,
     skip_update_check: bool,
-    sandbox: Optional[bool],
-    trusted: Optional[bool],
-    profile_dir: Optional[str],
+    sandbox: bool | None,
+    trusted: bool | None,
+    profile_dir: str | None,
     watch: bool,
     skew_protection: bool,
-    remote_url: Optional[str],
+    remote_url: str | None,
     convert: bool,
-    mcp: bool,
-    server_startup_command: Optional[str],
-    asset_url: Optional[str],
-    timeout: Optional[float],
-    session_ttl: Optional[int],
-    name: Optional[str],
+    mcp: McpType | None,
+    mcp_allow_remote: bool,
+    server_startup_command: str | None,
+    asset_url: str | None,
+    timeout: float | None,
+    session_ttl: int | None,
+    name: str | None,
     args: tuple[str, ...],
 ) -> None:
     from marimo._cli.sandbox import SandboxMode, resolve_sandbox_mode
@@ -463,10 +497,6 @@ def edit(
         return
 
     GLOBAL_SETTINGS.PROFILE_DIR = profile_dir
-    if not skip_update_check and os.getenv("MARIMO_SKIP_UPDATE_CHECK") != "1":
-        GLOBAL_SETTINGS.CHECK_STATUS_UPDATE = True
-        # Check for version updates
-        check_for_updates(print_latest_version)
 
     if name is not None:
         # Validate name, or download from URL
@@ -519,11 +549,14 @@ def edit(
         from marimo._dependencies.dependencies import DependencyManager
 
         if not DependencyManager.zmq.has():
-            raise click.UsageError(
-                "pyzmq is required when running the marimo edit server on a directory with --sandbox.\n"
-                "Install it with: pip install 'marimo[sandbox]'\n"
-                "Or: pip install pyzmq"
+            raise MarimoCLIMissingDependencyError(
+                "pyzmq is required when running the marimo edit server on a directory with --sandbox.",
+                "marimo[sandbox]",
             )
+
+        # Enable script metadata management for sandboxed notebooks
+        os.environ["MARIMO_MANAGE_SCRIPT_METADATA"] = "true"
+        GLOBAL_SETTINGS.MANAGE_SCRIPT_METADATA = True
 
     # Check shared memory availability early (required for edit mode to
     # communicate between the server process and kernel subprocess)
@@ -531,19 +564,31 @@ def edit(
 
     shm_available, shm_error = check_shared_memory_available()
     if not shm_available:
-        _loggers.marimo_logger().error(
-            f"marimo failed to start: marimo edit requires shared memory support for multiprocessing.\n\n"
+        shm_mount_example = "--shm-size=256m or -v /dev/shm:/dev/shm"
+        docker_shm_line = " ".join(
+            [
+                "  - If running in Docker, ensure /dev/shm is mounted with sufficient size",
+                f"(e.g., {shm_mount_example})",
+            ]
+        )
+        raise MarimoCLIRuntimeError(
+            "marimo edit requires shared memory support for multiprocessing.\n\n"
             f"{shm_error}\n\n"
             "Possible solutions:\n"
-            "  - If running in Docker, ensure /dev/shm is mounted with sufficient size\n"
-            "    (e.g., --shm-size=256m or -v /dev/shm:/dev/shm)\n"
+            f"{docker_shm_line}\n"
             "  - If /dev/shm is full, clear unused shared memory segments\n"
             "  - Use 'marimo run' instead if you only need to view notebooks"
         )
-        sys.exit(1)
+
+    if not skip_update_check and os.getenv("MARIMO_SKIP_UPDATE_CHECK") != "1":
+        GLOBAL_SETTINGS.CHECK_STATUS_UPDATE = True
+        # Check for version updates after preflight checks pass.
+        check_for_updates(print_latest_version)
+
+    base_url = validators.check_proxy_base_url(proxy, base_url)
 
     start(
-        file_router=AppFileRouter.infer(name),
+        workspace=infer_workspace(name),
         development_mode=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
         quiet=GLOBAL_SETTINGS.QUIET,
         host=host,
@@ -567,10 +612,12 @@ def edit(
         ttl_seconds=session_ttl,
         remote_url=remote_url,
         mcp=mcp,
+        mcp_allow_remote=mcp_allow_remote,
         server_startup_command=server_startup_command,
         asset_url=asset_url,
         timeout=timeout,
         sandbox_mode=sandbox_mode,
+        startup_tip=choose_startup_tip(click.get_current_context()),
     )
 
 
@@ -606,14 +653,12 @@ new_help_msg = "\n".join(
     "-p",
     "--port",
     default=None,
-    show_default=True,
     type=int,
     help="Port to attach to.",
 )
 @click.option(
     "--host",
     default="127.0.0.1",
-    show_default=True,
     type=str,
     help="Host to attach to.",
 )
@@ -627,35 +672,30 @@ new_help_msg = "\n".join(
     "--headless",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Don't launch a browser.",
 )
 @click.option(
     "--token/--no-token",
     default=True,
-    show_default=True,
     type=bool,
     help=token_message,
 )
 @click.option(
     "--token-password",
     default=None,
-    show_default=True,
     type=str,
     help=token_password_message,
 )
 @click.option(
     "--token-password-file",
     default=None,
-    show_default=True,
     type=str,
     help="Path to file containing token password, or '-' for stdin. Mutually exclusive with --token-password.",
 )
 @click.option(
     "--base-url",
     default="",
-    show_default=True,
     type=str,
     help="Base URL for the server. Should start with a /.",
     callback=validators.base_url,
@@ -664,7 +704,6 @@ new_help_msg = "\n".join(
     "--sandbox/--no-sandbox",
     is_flag=True,
     default=None,
-    show_default=False,
     type=bool,
     help=sandbox_message,
 )
@@ -672,7 +711,6 @@ new_help_msg = "\n".join(
     "--skew-protection/--no-skew-protection",
     is_flag=True,
     default=True,
-    show_default=True,
     type=bool,
     help="Enable skew protection middleware to prevent version mismatch issues.",
 )
@@ -680,24 +718,23 @@ new_help_msg = "\n".join(
     "--timeout",
     required=False,
     default=None,
-    show_default=False,
     type=float,
     help="Enable a global timeout to shut down the server after specified number of minutes of no connection",
 )
 @click.argument("prompt", required=False)
 def new(
-    port: Optional[int],
+    port: int | None,
     host: str,
-    proxy: Optional[str],
+    proxy: str | None,
     headless: bool,
     token: bool,
-    token_password: Optional[str],
-    token_password_file: Optional[str],
+    token_password: str | None,
+    token_password_file: str | None,
     base_url: str,
-    sandbox: Optional[bool],
+    sandbox: bool | None,
     skew_protection: bool,
-    timeout: Optional[float],
-    prompt: Optional[str],
+    timeout: float | None,
+    prompt: str | None,
 ) -> None:
     if sandbox:
         from marimo._cli.sandbox import run_in_sandbox
@@ -706,7 +743,7 @@ def new(
         run_in_sandbox(sys.argv[1:], name=None, additional_features=["lsp"])
         return
 
-    file_router: Optional[AppFileRouter] = None
+    workspace: NotebookWorkspace | None = None
 
     if prompt is None:
         # We support unix-style prompting, cat prompt.txt | marimo new
@@ -734,7 +771,7 @@ def new(
                 suffix=".py", mode="w", encoding="utf-8", delete=False
             ) as temp_file:
                 temp_file.write(notebook_content)
-            file_router = AppFileRouter.infer(temp_file.name)
+            workspace = infer_workspace(temp_file.name)
 
             def _cleanup() -> None:
                 try:
@@ -751,14 +788,16 @@ def new(
                     pass
 
             raise click.ClickException(
-                f"Failed to generate notebook: {str(e)}"
+                f"Failed to generate notebook: {e!s}"
             ) from e
 
-    if file_router is None:
-        file_router = AppFileRouter.new_file()
+    if workspace is None:
+        workspace = EmptyWorkspace()
+
+    base_url = validators.check_proxy_base_url(proxy, base_url)
 
     start(
-        file_router=file_router,
+        workspace=workspace,
         development_mode=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
         quiet=GLOBAL_SETTINGS.QUIET,
         host=host,
@@ -780,10 +819,138 @@ def new(
         redirect_console_to_browser=True,
         ttl_seconds=None,
         timeout=timeout,
+        startup_tip=choose_startup_tip(click.get_current_context()),
     )
 
 
+@dataclass(frozen=True)
+class _CollectedRunFiles:
+    files: list[MarimoFile]
+    root_dir: str | None
+
+
+def _split_run_paths_and_args(
+    name: str,
+    args: tuple[str, ...],
+    args_after_separator: tuple[str, ...] | None = None,
+) -> tuple[list[str], tuple[str, ...]]:
+    if (
+        args_after_separator
+        and args[-len(args_after_separator) :] == args_after_separator
+    ):
+        return [
+            name,
+            *args[: -len(args_after_separator)],
+        ], args_after_separator
+
+    paths = [name]
+    for index, arg in enumerate(args):
+        if arg == "--":
+            return paths, args[index + 1 :]
+        if arg.startswith("-"):
+            return paths, args[index:]
+        paths.append(arg)
+    return paths, ()
+
+
+def _resolve_root_dir(
+    directories: list[str], files: list[MarimoFile]
+) -> str | None:
+    # Choose a "root" directory for gallery links when there is an obvious
+    # shared base directory. This lets us use relative `?file=` keys (and
+    # avoids leaking absolute paths) when possible.
+    if len(directories) == 1:
+        directory = Path(directories[0]).absolute()
+        if not files:
+            return str(directory)
+        # Only use this directory root if it contains all selected files.
+        if all(
+            Path(file.path).absolute().is_relative_to(directory)
+            for file in files
+        ):
+            return str(directory)
+        return None
+
+    if not directories:
+        if not files:
+            return None
+        parent = Path(files[0].path).absolute().parent
+        # Only use a parent root when all files are siblings.
+        if all(Path(file.path).absolute().parent == parent for file in files):
+            return str(parent)
+
+    return None
+
+
+def _collect_marimo_files(paths: list[str]) -> _CollectedRunFiles:
+    directories: list[str] = []
+    files_by_path: dict[str, MarimoFile] = {}
+
+    for path in paths:
+        if Path(path).is_dir():
+            directories.append(path)
+            directory = Path(path).absolute()
+            scanner = DirectoryScanner(path, include_markdown=True)
+            try:
+                file_infos = scanner.scan()
+            except HTTPException as exc:
+                if exc.status_code != HTTPStatus.REQUEST_TIMEOUT:
+                    raise
+                file_infos = scanner.partial_results
+            for file_info in flatten_files(file_infos):
+                if not file_info.is_marimo_file:
+                    continue
+                if "__marimo__" in Path(file_info.path).parts:
+                    continue
+                absolute_path = str(directory / file_info.path)
+                files_by_path[absolute_path] = MarimoFile(
+                    name=file_info.name,
+                    path=absolute_path,
+                    last_modified=file_info.last_modified,
+                )
+        else:
+            marimo_path = MarimoPath(path)
+            files_by_path[marimo_path.absolute_name] = MarimoFile(
+                name=marimo_path.relative_name,
+                path=marimo_path.absolute_name,
+                last_modified=marimo_path.last_modified,
+            )
+
+    files = sorted(files_by_path.values(), key=lambda file: file.path)
+    root_dir = _resolve_root_dir(directories, files)
+    return _CollectedRunFiles(files=files, root_dir=root_dir)
+
+
+def _create_run_workspace(
+    validated_paths: list[str], *, watch: bool
+) -> NotebookWorkspace:
+    """Create the workspace for `marimo run`.
+
+    For `--watch` with a single directory, use a directory workspace so the
+    gallery index can reflect file additions/deletions on subsequent requests.
+    For all other invocation shapes, preserve static snapshot behavior.
+    """
+    if (
+        watch
+        and len(validated_paths) == 1
+        and Path(validated_paths[0]).is_dir()
+    ):
+        return DirectoryWorkspace(validated_paths[0], include_markdown=True)
+
+    has_directory = any(Path(path).is_dir() for path in validated_paths)
+    is_multi = has_directory or len(validated_paths) > 1
+    if is_multi:
+        marimo_files = _collect_marimo_files(validated_paths)
+        return FixedFilesWorkspace(
+            marimo_files.files,
+            directory=marimo_files.root_dir,
+        )
+
+    return SingleFileWorkspace.from_path(MarimoPath(validated_paths[0]))
+
+
 @main.command(
+    cls=RunCommand,
     help="""Run a notebook as an app in read-only mode.
 
 If NAME is a url, the notebook will be downloaded to a temporary file.
@@ -791,20 +958,20 @@ If NAME is a url, the notebook will be downloaded to a temporary file.
 Example:
 
     marimo run notebook.py
-"""
+    marimo run folder another_folder
+    marimo run app.py -- --arg value
+""",
 )
 @click.option(
     "-p",
     "--port",
     default=None,
-    show_default=True,
     type=int,
     help="Port to attach to.",
 )
 @click.option(
     "--host",
     default="127.0.0.1",
-    show_default=True,
     type=str,
     help="Host to attach to.",
 )
@@ -818,28 +985,24 @@ Example:
     "--headless",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Don't launch a browser.",
 )
 @click.option(
     "--token/--no-token",
     default=False,
-    show_default=True,
     type=bool,
     help=token_message,
 )
 @click.option(
     "--token-password",
     default=None,
-    show_default=True,
     type=str,
     help=token_password_message,
 )
 @click.option(
     "--token-password-file",
     default=None,
-    show_default=True,
     type=str,
     help="Path to file containing token password, or '-' for stdin. Mutually exclusive with --token-password.",
 )
@@ -847,14 +1010,15 @@ Example:
     "--include-code",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
-    help="Include notebook code in the app.",
+    help=(
+        "Send notebook source code to the client. "
+        "By default, code is not sent to the client and cannot be viewed in the browser."
+    ),
 )
 @click.option(
     "--session-ttl",
     default=120,
-    show_default=True,
     type=int,
     help=("Seconds to wait before closing a session on websocket disconnect."),
 )
@@ -862,7 +1026,6 @@ Example:
     "--watch",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help=(
         "Watch the file for changes and reload the app. "
@@ -874,14 +1037,12 @@ Example:
     "--skew-protection/--no-skew-protection",
     is_flag=True,
     default=True,
-    show_default=True,
     type=bool,
     help="Enable skew protection middleware to prevent version mismatch issues.",
 )
 @click.option(
     "--base-url",
     default="",
-    show_default=True,
     type=str,
     help="Base URL for the server. Should start with a /.",
     callback=validators.base_url,
@@ -896,7 +1057,6 @@ Example:
     "--redirect-console-to-browser",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Redirect console logs to the browser console.",
 )
@@ -904,7 +1064,6 @@ Example:
     "--sandbox/--no-sandbox",
     is_flag=True,
     default=None,
-    show_default=False,
     type=bool,
     help=sandbox_message,
 )
@@ -912,7 +1071,6 @@ Example:
     "--check/--no-check",
     is_flag=True,
     default=True,
-    show_default=False,
     type=bool,
     help=check_message,
 )
@@ -920,7 +1078,6 @@ Example:
     "--trusted/--untrusted",
     is_flag=True,
     default=None,
-    show_default=False,
     type=bool,
     help="Run notebooks hosted remotely on the host machine; if --untrusted, runs marimo in a Docker container.",
 )
@@ -938,6 +1095,14 @@ Example:
     hidden=True,
     help="Custom asset URL for loading static resources. Can include {version} placeholder.",
 )
+@click.option(
+    "--show-tracebacks/--no-show-tracebacks",
+    is_flag=True,
+    default=None,
+    type=bool,
+    help="Show detailed error tracebacks in a modal when exceptions occur.",
+)
+@click.pass_context
 @click.argument(
     "name",
     required=True,
@@ -945,13 +1110,14 @@ Example:
 )
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def run(
-    port: Optional[int],
+    ctx: click.Context,
+    port: int | None,
     host: str,
-    proxy: Optional[str],
+    proxy: str | None,
     headless: bool,
     token: bool,
-    token_password: Optional[str],
-    token_password_file: Optional[str],
+    token_password: str | None,
+    token_password_file: str | None,
     include_code: bool,
     session_ttl: int,
     watch: bool,
@@ -959,11 +1125,12 @@ def run(
     base_url: str,
     allow_origins: tuple[str, ...],
     redirect_console_to_browser: bool,
-    sandbox: Optional[bool],
+    sandbox: bool | None,
     check: bool,
-    trusted: Optional[bool],
-    server_startup_command: Optional[str],
-    asset_url: Optional[str],
+    trusted: bool | None,
+    server_startup_command: str | None,
+    asset_url: str | None,
+    show_tracebacks: bool | None,
     name: str,
     args: tuple[str, ...],
 ) -> None:
@@ -973,11 +1140,26 @@ def run(
         run_in_sandbox,
     )
 
-    if prompt_run_in_docker_container(name, trusted=trusted):
+    # click consumes `--` as an option terminator and does not pass it
+    # through to `args`. `RunCommand` records the raw tail so splitting
+    # logic can preserve "args after --" semantics without reading process-
+    # global argv state.
+    args_after_separator = ctx.meta.get("marimo_run_args_after_separator")
+    paths, notebook_args = _split_run_paths_and_args(
+        name,
+        args,
+        args_after_separator
+        if isinstance(args_after_separator, tuple)
+        else None,
+    )
+
+    if len(paths) == 1 and prompt_run_in_docker_container(
+        paths[0], trusted=trusted
+    ):
         from marimo._cli.run_docker import run_in_docker
 
         run_in_docker(
-            name,
+            paths[0],
             "run",
             port=port,
             debug=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
@@ -988,31 +1170,84 @@ def run(
     # The second return value is an optional temporary directory. It is unused,
     # but must be kept around because its lifetime on disk is bound to the life
     # of the Python object
-    name, _ = validate_name(name, allow_new_file=False, allow_directory=False)
+    validated_paths: list[str] = []
+    temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
+    for path in paths:
+        validated_path, temp_dir = validate_name(
+            path, allow_new_file=False, allow_directory=True
+        )
+        if temp_dir is not None:
+            temp_dirs.append(temp_dir)
+        validated_paths.append(validated_path)
+
+    has_directory = any(Path(path).is_dir() for path in validated_paths)
+    is_multi = has_directory or len(validated_paths) > 1
+
+    check_source = ctx.get_parameter_source("check")
+    check_explicit = check_source not in (
+        ParameterSource.DEFAULT,
+        ParameterSource.DEFAULT_MAP,
+    )
+
+    if is_multi and check and check_explicit:
+        raise click.UsageError(
+            "--check is only supported when running a single notebook file."
+        )
 
     # correctness check - don't start the server if we can't import the module
-    check_app_correctness(name)
-    file = MarimoPath(name)
-    if check:
-        from marimo._lint import collect_messages
+    for path in validated_paths:
+        if Path(path).is_file():
+            check_app_correctness(path)
+            if check and not has_directory:
+                from marimo._lint import collect_messages
 
-        linter, message = collect_messages(file.absolute_name)
-        if linter.errored:
-            raise click.ClickException(
-                red("Failure")
-                + ": The notebook has errors, fix them before running.\n"
-                + message.strip()
-            )
+                file = MarimoPath(path)
+                linter, message = collect_messages(file.absolute_name)
+                if linter.errored:
+                    raise click.ClickException(
+                        red("Failure")
+                        + ": The notebook has errors, fix them before running.\n"
+                        + message.strip()
+                    )
 
     # We check this after name validation, because this will convert
     # URLs into local file paths
-    # For run command, only single-file sandbox is possible (no directory support)
-    if resolve_sandbox_mode(sandbox=sandbox, name=name) is SandboxMode.SINGLE:
-        run_in_sandbox(sys.argv[1:], name=name)
-        return
+    if is_multi:
+        # Gallery mode: use MULTI sandbox (IPC kernels) or None
+        sandbox_mode = SandboxMode.MULTI if sandbox else None
+    else:
+        sandbox_mode = resolve_sandbox_mode(
+            sandbox=sandbox, name=validated_paths[0]
+        )
+        if sandbox_mode is SandboxMode.SINGLE:
+            run_in_sandbox(sys.argv[1:], name=validated_paths[0])
+            return
+
+    # Multi-file sandbox: use IPC kernels with per-notebook sandboxed venvs
+    if sandbox_mode is SandboxMode.MULTI:
+        # Check for pyzmq dependency
+        from marimo._dependencies.dependencies import DependencyManager
+
+        if not DependencyManager.zmq.has():
+            raise MarimoCLIMissingDependencyError(
+                "pyzmq is required when running a gallery with --sandbox.",
+                "marimo[sandbox]",
+            )
+    elif is_multi:
+        from marimo._dependencies.dependencies import DependencyManager
+
+        if not DependencyManager.zmq.has():
+            raise MarimoCLIMissingDependencyError(
+                "pyzmq is required for running multiple notebooks.",
+                "pyzmq",
+            )
+
+    workspace = _create_run_workspace(validated_paths, watch=watch)
+
+    base_url = validators.check_proxy_base_url(proxy, base_url)
 
     start(
-        file_router=AppFileRouter.from_filename(file),
+        workspace=workspace,
         development_mode=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
         quiet=GLOBAL_SETTINGS.QUIET,
         host=host,
@@ -1026,8 +1261,8 @@ def run(
         skew_protection=skew_protection,
         base_url=base_url,
         allow_origins=allow_origins,
-        cli_args=parse_args(args),
-        argv=list(args),
+        cli_args=parse_args(notebook_args),
+        argv=list(notebook_args),
         auth_token=resolve_token(
             token,
             token_password=token_password,
@@ -1036,10 +1271,26 @@ def run(
         redirect_console_to_browser=redirect_console_to_browser,
         server_startup_command=server_startup_command,
         asset_url=asset_url,
+        sandbox_mode=sandbox_mode,
+        startup_tip=choose_startup_tip(click.get_current_context()),
+        show_tracebacks=show_tracebacks,
     )
 
 
-@main.command(help="Recover a marimo notebook from JSON.")
+@main.command(
+    help="""Recover a marimo notebook from a JSON file.
+
+When the frontend loses its connection to the kernel, marimo auto-saves
+unsaved cell changes to a JSON recovery file. Use this command to convert
+that JSON file back into a marimo notebook (.py), printing the recovered
+source to stdout.
+
+Example:
+
+    \b
+    marimo recover notebook_recovery.json > recovered_notebook.py
+"""
+)
 @click.argument(
     "name",
     required=True,
@@ -1071,14 +1322,12 @@ Recommended sequence:
     "-p",
     "--port",
     default=None,
-    show_default=True,
     type=int,
     help="Port to attach to.",
 )
 @click.option(
     "--host",
     default="127.0.0.1",
-    show_default=True,
     type=str,
     help="Host to attach to.",
 )
@@ -1092,28 +1341,24 @@ Recommended sequence:
     "--headless",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Don't launch a browser.",
 )
 @click.option(
     "--token/--no-token",
     default=True,
-    show_default=True,
     type=bool,
     help=token_message,
 )
 @click.option(
     "--token-password",
     default=None,
-    show_default=True,
     type=str,
     help=token_password_message,
 )
 @click.option(
     "--token-password-file",
     default=None,
-    show_default=True,
     type=str,
     help="Path to file containing token password, or '-' for stdin. Mutually exclusive with --token-password.",
 )
@@ -1121,7 +1366,6 @@ Recommended sequence:
     "--skew-protection/--no-skew-protection",
     is_flag=True,
     default=True,
-    show_default=True,
     type=bool,
     help="Enable skew protection middleware to prevent version mismatch issues.",
 )
@@ -1131,21 +1375,23 @@ Recommended sequence:
     type=click.Choice(tutorial_order),
 )
 def tutorial(
-    port: Optional[int],
+    port: int | None,
     host: str,
-    proxy: Optional[str],
+    proxy: str | None,
     headless: bool,
     token: bool,
-    token_password: Optional[str],
-    token_password_file: Optional[str],
+    token_password: str | None,
+    token_password_file: str | None,
     skew_protection: bool,
     name: Tutorial,
 ) -> None:
     temp_dir = tempfile.TemporaryDirectory()
     path = create_temp_tutorial_file(name, temp_dir)
 
+    base_url = validators.check_proxy_base_url(proxy, "")
+
     start(
-        file_router=AppFileRouter.from_filename(path),
+        workspace=SingleFileWorkspace.from_path(path),
         development_mode=GLOBAL_SETTINGS.DEVELOPMENT_MODE,
         quiet=GLOBAL_SETTINGS.QUIET,
         host=host,
@@ -1163,8 +1409,10 @@ def tutorial(
             token_password=token_password,
             token_password_file=token_password_file,
         ),
+        base_url=base_url,
         redirect_console_to_browser=False,
         ttl_seconds=None,
+        startup_tip=choose_startup_tip(click.get_current_context()),
     )
 
 
@@ -1180,7 +1428,7 @@ def env() -> None:
 def shell_completion() -> None:
     shell = os.environ.get("SHELL", "")
     if not shell:
-        raise click.UsageError(
+        raise MarimoCLIRuntimeError(
             "Could not determine shell. Please set $SHELL environment variable.",
         )
 
@@ -1205,10 +1453,9 @@ def shell_completion() -> None:
 
     if shell_name not in commands:
         supported = ", ".join(commands.keys())
-        raise click.UsageError(
+        raise MarimoCLIRuntimeError(
             f"Unsupported shell: {shell_name} (from $SHELL). Supported shells: {supported}",
         )
-        return
 
     cmd, rc_file = commands[shell_name]
     click.secho("Run this command to enable completions:", fg="green")
@@ -1226,7 +1473,6 @@ def shell_completion() -> None:
     "--fix",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Whether to in place update files.",
 )
@@ -1234,7 +1480,6 @@ def shell_completion() -> None:
     "--strict",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Whether warnings return a non-zero exit code.",
 )
@@ -1243,7 +1488,6 @@ def shell_completion() -> None:
     "--verbose/--quiet",
     is_flag=True,
     default=True,
-    show_default=True,
     type=bool,
     help="Whether to print detailed messages.",
 )
@@ -1251,7 +1495,6 @@ def shell_completion() -> None:
     "--unsafe-fixes",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Enable fixes that may change code behavior (e.g., removing empty cells).",
 )
@@ -1259,7 +1502,6 @@ def shell_completion() -> None:
     "--ignore-scripts",
     is_flag=True,
     default=False,
-    show_default=True,
     type=bool,
     help="Ignore files that are not recognizable as marimo notebooks.",
 )
@@ -1267,9 +1509,28 @@ def shell_completion() -> None:
     "--format",
     "formatter",
     default="full",
-    show_default=True,
     type=click.Choice(["full", "json"], case_sensitive=False),
     help="Output format for diagnostics.",
+)
+@click.option(
+    "--select",
+    "select_rules",
+    default=None,
+    type=str,
+    help=(
+        "Comma-separated rule codes/prefixes to enable, replacing config. "
+        "e.g. --select MB,MR001"
+    ),
+)
+@click.option(
+    "--ignore",
+    "ignore_rules",
+    default=None,
+    type=str,
+    help=(
+        "Comma-separated rule codes/prefixes to ignore. "
+        "e.g. --ignore MF004,MF007"
+    ),
 )
 @click.argument("files", nargs=-1, type=click.UNPROCESSED)
 def check(
@@ -1279,11 +1540,17 @@ def check(
     unsafe_fixes: bool,
     ignore_scripts: bool,
     formatter: str,
+    select_rules: str | None,
+    ignore_rules: str | None,
     files: tuple[str, ...],
 ) -> None:
     if not files:
         # If no files are provided, we lint the current directory
         files = ("**/*.py", "**/*.md", "**/*.qmd")
+
+    from marimo._lint import resolve_lint_config
+
+    lint_config = resolve_lint_config(select_rules, ignore_rules)
 
     # Pass click.echo directly as pipe for streaming output, or None for JSON
     pipe = click.echo if verbose and formatter != "json" else None
@@ -1294,6 +1561,7 @@ def check(
         unsafe_fixes=unsafe_fixes,
         ignore_scripts=ignore_scripts,
         formatter=formatter,
+        lint_config=lint_config,
     )
 
     if formatter == "json":
@@ -1322,3 +1590,4 @@ main.command()(convert)
 main.add_command(export)
 main.add_command(config)
 main.add_command(development)
+main.add_command(pair)

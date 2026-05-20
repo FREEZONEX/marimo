@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from marimo import _loggers
 from marimo._config.config import Theme
@@ -17,6 +17,8 @@ from marimo._output.formatters.arviz_formatters import ArviZFormatter
 from marimo._output.formatters.bokeh_formatters import BokehFormatter
 from marimo._output.formatters.cell import CellFormatter
 from marimo._output.formatters.df_formatters import (
+    DataFusionFormatter,
+    DuckDBFormatter,
     IbisFormatter,
     PolarsFormatter,
     PyArrowFormatter,
@@ -34,6 +36,7 @@ from marimo._output.formatters.panel_formatters import PanelFormatter
 from marimo._output.formatters.plotly_formatters import PlotlyFormatter
 from marimo._output.formatters.pyecharts_formatters import PyechartsFormatter
 from marimo._output.formatters.pygwalker_formatters import PygWalkerFormatter
+from marimo._output.formatters.pytorch_formatters import PyTorchFormatter
 from marimo._output.formatters.seaborn_formatters import SeabornFormatter
 from marimo._output.formatters.structures import StructuresFormatter
 from marimo._output.formatters.sympy_formatters import SympyFormatter
@@ -43,7 +46,7 @@ from marimo._utils.site_packages import is_local_module
 LOGGER = _loggers.marimo_logger()
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 # Map from formatter factory's package name to formatter, for third-party
 # modules. These formatters will be registered if and when their associated
@@ -51,6 +54,8 @@ if TYPE_CHECKING:
 THIRD_PARTY_FACTORIES: dict[str, FormatterFactory] = {
     AltairFormatter.package_name(): AltairFormatter(),
     MatplotlibFormatter.package_name(): MatplotlibFormatter(),
+    DataFusionFormatter.package_name(): DataFusionFormatter(),
+    DuckDBFormatter.package_name(): DuckDBFormatter(),
     IbisFormatter.package_name(): IbisFormatter(),
     PandasFormatter.package_name(): PandasFormatter(),
     PolarsFormatter.package_name(): PolarsFormatter(),
@@ -74,6 +79,7 @@ THIRD_PARTY_FACTORIES: dict[str, FormatterFactory] = {
     GoogleAiFormatter.package_name(): GoogleAiFormatter(),
     OpenAIFormatter.package_name(): OpenAIFormatter(),
     TransformersFormatter.package_name(): TransformersFormatter(),
+    PyTorchFormatter.package_name(): PyTorchFormatter(),
 }
 
 # Formatters for builtin types and other things that don't require a
@@ -165,7 +171,7 @@ def patch_finder(
     if module_name != find_spec.__module__:
         # Use the __get__ descriptor to bind find_spec to this finder object,
         # to make sure self/cls gets passed
-        finder.find_spec = find_spec.__get__(finder)  # type: ignore[method-assign]  # noqa: E501
+        finder.find_spec = find_spec.__get__(finder)  # type: ignore[method-assign]
 
 
 def register_formatters(theme: Theme = "light") -> None:

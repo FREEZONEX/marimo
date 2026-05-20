@@ -32,6 +32,9 @@ export const Objects = {
   keys<K extends string | number>(obj: Record<K, unknown>): K[] {
     return Object.keys(obj) as K[];
   },
+  size<K extends string | number>(obj: Record<K, unknown>): number {
+    return Object.keys(obj).length;
+  },
   /**
    * Type-safe keyBy
    */
@@ -101,5 +104,19 @@ export const Objects = {
   ): Partial<V> {
     const set = new Set<K>(keys);
     return Objects.filter(obj, (_, key) => !set.has(key));
+  },
+
+  // oxlint-disable-next-line typescript/no-explicit-any
+  pick<V extends Record<string, any>, K extends string>(
+    obj: V,
+    keys: readonly K[],
+  ): Pick<V, K & keyof V> {
+    const result = {} as Record<string, unknown>;
+    for (const key of keys) {
+      if (Object.hasOwn(obj, key)) {
+        result[key] = obj[key];
+      }
+    }
+    return result as Pick<V, K & keyof V>;
   },
 };

@@ -1,16 +1,30 @@
 ---
+title: marimo - Documentation for the Reactive Python Notebook
+description: "marimo is an open-source reactive Python notebook. Run a cell or interact with a UI element, and marimo automatically runs dependent cells, keeping code and outputs consistent."
 hide:
   - navigation
 ---
 <style>
-  .md-typeset h1,
+  .md-typeset h1 {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
   .md-content__button {
     display: none;
   }
 </style>
 
+# marimo: The Reactive Python Notebook
+
 <p align="center" style="margin-top: 40px; margin-bottom: 40px;">
-  <img src="_static/marimo-logotype-thick.svg" width="210px">
+  <img src="_static/marimo-logotype-thick.svg" width="210px" alt="marimo - reactive Python notebook">
 </p>
 
 marimo is an [open-source](https://github.com/marimo-team/marimo) reactive
@@ -27,6 +41,11 @@ support for SQL](guides/working_with_data/sql.md).
 
 marimo was built from the ground up to solve <a href="faq.html#faq-jupyter">well-known problems associated with traditional notebooks</a>.
 ///
+
+_Get started instantly with [molab, our free online
+notebook](https://molab.marimo.io/notebooks). Or get started
+locally by installing marimo with your favorite package manager:_
+
 
 /// tab | install with pip
 
@@ -55,6 +74,7 @@ conda install -c conda-forge marimo && marimo tutorial intro
 Developer experience is core to marimo, with an emphasis on
 reproducibility, maintainability, composability, and shareability.
 
+
 ## Highlights
 
 - 🚀 **batteries-included:** replaces `jupyter`, `streamlit`, `jupytext`, `ipywidgets`, `papermill`, and more
@@ -62,7 +82,7 @@ reproducibility, maintainability, composability, and shareability.
 - 🖐️ **interactive:** [bind sliders, tables, plots, and more](guides/interactivity.md) to Python — no callbacks required
 - 🐍 **git-friendly:** stored as `.py` files
 - 🛢️ **designed for data**: query dataframes, databases, warehouses, and lakehouses [with SQL](guides/working_with_data/sql.md); filter and search [dataframes](guides/working_with_data/dataframes.md)
-- 🤖 **AI-native**: [generate cells with AI](https://docs.marimo.io/guides/generate_with_ai/) tailored for data work
+- 🤖 **AI-native**: [connect agent CLIs](guides/generate_with_ai/marimo_pair/) like Claude Code to notebooks, or use our editor's [built-in AI features](guides/editor_features/ai_completion/)
 - 🔬 **reproducible:** [no hidden state](guides/reactivity.md), deterministic execution, [built-in package management](guides/editor_features/package_management.md)
 - 🏃 **executable:** [execute as a Python script](guides/scripts.md), parameterized by CLI args
 - 🛜 **shareable**: [deploy as an interactive web app](guides/apps.md) or [slides](guides/apps.md#slides-layout), [run in the browser via WASM](guides/wasm.md)
@@ -116,11 +136,15 @@ millions of rows blazingly fast, no code required.
   <source src="/_static/docs-df.webm" type="video/webm">
 </video>
 
-**Generate cells with data-aware AI.** [Generate code with an AI
-assistant](https://docs.marimo.io/guides/editor_features/ai_completion/) that is highly
-specialized for working with data, with context about your variables in memory;
-[zero-shot entire notebooks](https://docs.marimo.io/guides/generate_with_ai/text_to_notebook/).
-Customize the system prompt, bring your own API keys, or use local models.
+
+**Generate cells with data-aware AI.** Collaborate on marimo notebooks with
+your favorite agent, such as Claude Code, Codex, or OpenCode, using [marimo
+pair](guides/generate_with_ai/marimo_pair/). Or,
+generate code [in the marimo editor with an AI
+assistant](guides/editor_features/ai_completion/) that
+is highly specialized for working with data, with context about your variables
+in memory. Customize the system prompt, bring your own API keys, or use local
+models.
 
 <video autoplay muted loop playsinline width="700px" align="center">
   <source src="/_static/readme-generate-with-ai.mp4" type="video/mp4">
@@ -131,7 +155,7 @@ that depend on Python values and execute them against dataframes, databases, lak
 CSVs, Google Sheets, or anything else using our built-in SQL engine, which
 returns the result as a Python dataframe.
 
-<img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/readme-sql-cell.png" width="700px" />
+<img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/readme-sql-cell.png" width="700px" alt="SQL cell in marimo querying a dataframe" />
 
 Your notebooks are still pure Python, even if they use SQL.
 
@@ -187,8 +211,8 @@ Create or edit notebooks with
 marimo edit
 ```
 
-**Run apps.** Run your notebook as a web app, with Python
-code hidden and uneditable:
+**Run apps.** Run your notebook as a web app. By default, the Python
+source code is not sent to the browser, so it stays hidden and uneditable:
 
 ```bash
 marimo run your_notebook.py
@@ -235,7 +259,7 @@ See our [FAQ](faq.md).
 
 marimo is easy to get started with, with lots of room for power users.
 For example, here's an embedding visualizer made in marimo
-([video](https://marimo.io/videos/landing/full.mp4)):
+([try the notebook live on molab!](https://molab.marimo.io/notebooks/nb_jJiFFtznAy4BxkrrZA1o9b/app?show-code=true)):
 
 <video autoplay muted loop playsinline width="700px" align="center">
   <source src="/_static/embedding.mp4" type="video/mp4">
@@ -296,23 +320,23 @@ and our [gallery](https://marimo.io/gallery) to learn more.
   </tr>
   <tr>
     <td>
-      <a target="_blank" href="https://marimo.app/l/c7h6pz">
-        <img src="https://marimo.io/shield.svg"/>
+      <a target="_blank" href="https://molab.marimo.io/notebooks/nb_TWVGCgZZK4L8zj5ziUBNVL">
+        <img src="https://marimo.io/molab-shield.svg" alt="Open in molab"/>
       </a>
     </td>
     <td>
-      <a target="_blank" href="https://marimo.app/l/0ue871">
-        <img src="https://marimo.io/shield.svg"/>
+      <a target="_blank" href="https://molab.marimo.io/notebooks/nb_WuoXgs7mjg5yqrMxJXjRpF">
+        <img src="https://marimo.io/molab-shield.svg" alt="Open in molab"/>
       </a>
     </td>
     <td>
-      <a target="_blank" href="https://marimo.app/l/lxp1jk">
-        <img src="https://marimo.io/shield.svg"/>
+      <a target="_blank" href="https://molab.marimo.io/notebooks/nb_vXxD13t2RoMTLjC89qdn6c">
+        <img src="https://marimo.io/molab-shield.svg" alt="Open in molab"/>
       </a>
     </td>
     <td>
-      <a target="_blank" href="https://marimo.app/l/14ovyr">
-        <img src="https://marimo.io/shield.svg"/>
+      <a target="_blank" href="https://molab.marimo.io/notebooks/nb_XpXx8MX99dWAjn4k1b3xiU">
+        <img src="https://marimo.io/molab-shield.svg" alt="Open in molab"/>
       </a>
     </td>
   </tr>
@@ -339,13 +363,14 @@ We're building a community. Come hang out with us!
 - 🐦 [Follow us on Twitter](https://twitter.com/marimo_io)
 - 🎥 [Subscribe on YouTube](https://www.youtube.com/@marimo-team)
 - 💬 [Follow us on Mastodon](https://mastodon.social/@marimo_io)
+- 🤖 [Follow us on Reddit](https://www.reddit.com/r/marimo_notebook)
 - 🕴️ [Follow us on LinkedIn](https://www.linkedin.com/company/marimo-io)
 
 **A NumFOCUS affiliated project.** marimo is a core part of the broader Python
 ecosystem and is a member of the NumFOCUS community, which includes projects
 such as NumPy, SciPy, and Matplotlib.
 
-<img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/numfocus_affiliated_project.png" style="height:40px" />
+<img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/numfocus_affiliated_project.png" style="height:40px" alt="NumFOCUS affiliated project" />
 
 ## Inspiration ✨
 
@@ -371,5 +396,5 @@ declarative, and reactive programming are transforming a broad range of tools
 for the better.
 
 <p align="right">
-  <img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/marimo-logotype-horizontal.png" style="height:200px">
+  <img src="https://raw.githubusercontent.com/marimo-team/marimo/main/docs/_static/marimo-logotype-horizontal.png" style="height:200px" alt="marimo logo">
 </p>

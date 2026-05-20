@@ -6,6 +6,7 @@ from __future__ import annotations
 import collections
 import datetime
 import decimal
+import enum
 import fractions
 import uuid
 from math import isnan
@@ -18,6 +19,7 @@ import msgspec.json
 from marimo import _loggers
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._plugins.core.media import io_to_data_url
+from marimo._utils.methods import getcallable
 
 LOGGER = _loggers.marimo_logger()
 
@@ -25,11 +27,11 @@ LOGGER = _loggers.marimo_logger()
 def enc_hook(obj: Any) -> Any:
     """Custom encoding hook for marimo types."""
 
-    if hasattr(obj, "_marimo_serialize_"):
-        return obj._marimo_serialize_()
+    if serialize := getcallable(obj, "_marimo_serialize_"):
+        return serialize()
 
-    if hasattr(obj, "_mime_"):
-        mimetype, data = obj._mime_()
+    if mime := getcallable(obj, "_mime_"):
+        mimetype, data = mime()
         return {"mimetype": mimetype, "data": data}
 
     if isinstance(obj, range):
@@ -169,6 +171,7 @@ def enc_hook(obj: Any) -> Any:
             if isinstance(obj, matplotlib.figure.Figure):
                 html = as_html(vstack([str(obj), obj]))
                 mimetype, data = html._mime_()
+                return {"mimetype": mimetype, "data": data}
 
             if isinstance(obj, Axes):
                 html = as_html(vstack([str(obj), obj]))
@@ -180,8 +183,16 @@ def enc_hook(obj: Any) -> Any:
                 exc_info=True,
             )
 
+    # Encode Enum members as their str form (e.g. "TestEnum.ONE"). Without
+    # this, plain Enum members reach the __dict__ fallback and leak internals
+    # (_value_, _name_, ...).
+    if isinstance(obj, enum.Enum):
+        return str(obj)
+
     # Handle objects with __slots__
-    slots = getattr(obj, "__slots__", None)
+    # Check on type(obj) to avoid triggering __getattr__ on objects that
+    # implement it
+    slots = getattr(type(obj), "__slots__", None)
     if slots is not None:
         try:
             slots = iter(slots)
@@ -206,10 +217,10 @@ def enc_hook(obj: Any) -> Any:
 
     # Handle collections types
     if isinstance(obj, (list, tuple, set, frozenset)):
-        return list([enc_hook(item) for item in obj])
+        return [enc_hook(item) for item in obj]
 
     if isinstance(obj, collections.deque):
-        return list([enc_hook(item) for item in obj])
+        return [enc_hook(item) for item in obj]
 
     # Handle dict and dict-like types
     if isinstance(

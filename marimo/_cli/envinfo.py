@@ -4,7 +4,7 @@ from __future__ import annotations
 import platform
 import sys
 from pathlib import Path
-from typing import Any, Union, cast
+from typing import Any, cast
 
 from marimo import _loggers
 from marimo._config.manager import get_default_config_manager
@@ -13,6 +13,7 @@ from marimo._utils.health import (
     get_node_version,
     get_optional_modules_list,
     get_required_modules_list,
+    get_uv_version,
 )
 from marimo._utils.versions import is_editable
 from marimo._version import __version__
@@ -32,7 +33,7 @@ def is_win11() -> bool:
     return False
 
 
-def get_experimental_flags() -> dict[str, Union[str, bool, dict[str, Any]]]:
+def get_experimental_flags() -> dict[str, str | bool | dict[str, Any]]:
     try:
         config = get_default_config_manager(current_path=None).get_config()
         experimental_config = config.get("experimental", {})
@@ -50,19 +51,38 @@ def get_default_locale() -> str:
     try:
         import locale
 
-        default_locale, _ = locale.getdefaultlocale()
-        return default_locale or "--"
+        # getdefaultlocale is deprecated in 3.13+ and removed in 3.15
+        # Use getlocale() with LC_ALL as a fallback chain
+        loc = locale.getlocale(locale.LC_ALL)
+        if loc[0]:
+            return loc[0]
+        # Try LC_MESSAGES on Unix-like systems
+        try:
+            loc = locale.getlocale(locale.LC_MESSAGES)
+            if loc[0]:
+                return loc[0]
+        except AttributeError:
+            pass
+        # Fall back to environment variable check
+        import os
+
+        for env_var in ("LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"):
+            val = os.environ.get(env_var)
+            if val:
+                # Extract locale name (e.g., "en_US" from "en_US.UTF-8")
+                return val.split(".")[0]
+        return "--"
     except Exception:
         return "--"
 
 
-def get_system_info() -> dict[str, Union[str, bool, dict[str, Any]]]:
+def get_system_info() -> dict[str, str | bool | dict[str, Any]]:
     os_version = platform.release()
     if platform.system() == "Windows" and is_win11():
         os_version = "11"
 
     location = Path(__file__).parent.parent.as_posix()
-    info: dict[str, Union[str, bool, dict[str, Any]]] = {
+    info: dict[str, str | bool | dict[str, Any]] = {
         "marimo": __version__,
         "editable": is_editable("marimo"),
         "location": location,
@@ -79,6 +99,7 @@ def get_system_info() -> dict[str, Union[str, bool, dict[str, Any]]]:
         # back-filled in frontend
         "Browser": get_chrome_version() or "--",
         "Node": get_node_version() or "--",
+        "uv": get_uv_version() or "--",
     }
 
     requirements = get_required_modules_list()

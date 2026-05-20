@@ -43,7 +43,7 @@ export class TreeNode<T> {
     const stack = [...this.children];
 
     while (stack.length > 0) {
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      // oxlint-disable-next-line typescript/no-non-null-assertion
       const node = stack.pop()!;
       count++;
 
@@ -62,7 +62,7 @@ export class TreeNode<T> {
     const stack = [...this.children];
 
     while (stack.length > 0) {
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      // oxlint-disable-next-line typescript/no-non-null-assertion
       const node = stack.pop()!;
       result.push(node.value);
 
@@ -360,7 +360,8 @@ export class CollapsibleTree<T> {
   }
 
   /**
-   * Expand a node and all of its children
+   * Expand a node and all of its children.
+   * If the node is already expanded, returns the same tree (no-op).
    */
   expand(id: T): CollapsibleTree<T> {
     const nodeIndex = this.nodes.findIndex((n) => n.value === id);
@@ -373,7 +374,8 @@ export class CollapsibleTree<T> {
     let nodes = [...this.nodes];
     const node = nodes[nodeIndex];
     if (!node.isCollapsed) {
-      throw new Error(`Node ${id} is already expanded`);
+      // Already expanded, no-op
+      return this;
     }
 
     nodes[nodeIndex] = new TreeNode(node.value, false, []);
@@ -495,13 +497,9 @@ export class CollapsibleTree<T> {
    */
   deleteAtIndex(idx: number): CollapsibleTree<T> {
     const id = this.atOrThrow(idx);
-    let tree = this.withNodes(this.nodes);
-    try {
-      tree = tree.expand(id);
-    } catch {
-      // Don't care if its not expanded
-    }
-    return this.withNodes(arrayDelete(tree.nodes, idx));
+    // Expand the node first (if collapsed) to bring children back to top level
+    const tree = this.expand(id);
+    return tree.withNodes(arrayDelete(tree.nodes, idx));
   }
 
   delete(id: T): CollapsibleTree<T> {
@@ -524,16 +522,10 @@ export class CollapsibleTree<T> {
     if (found.length === 0) {
       return this;
     }
-    let result = this.withNodes(this.nodes);
-    for (const node of found) {
-      try {
-        result = result.expand(node);
-      } catch {
-        // Don't care if its the last node and its not expanded
-      }
-    }
-
-    return result;
+    return found.reduce<CollapsibleTree<T>>(
+      (acc, node) => acc.expand(node),
+      this,
+    );
   }
 
   /**
@@ -869,6 +861,67 @@ export class MultiColumn<T> {
     return new MultiColumn(newColumns);
   }
 
+  /**
+   * Move multiple cells to be immediately before (or after) a target cell.
+   * Cells are inserted in their original order.
+   *
+   * @throws Error if any cellId is not found in any column.
+   * If targetId is among the moved cells, cells are inserted at the end of the target column.
+   */
+  moveCellsRelativeTo(
+    cellIds: T[],
+    targetId: T,
+    position: "before" | "after",
+  ): MultiColumn<T> {
+    if (cellIds.length === 0) {
+      return this;
+    }
+
+    const cellIdSet = new Set(cellIds);
+    const targetColumn = this.findWithId(targetId);
+    const targetColIndex = this.indexOfOrThrow(targetColumn.id);
+
+    // Collect nodes to move
+    const nodesToMove: TreeNode<T>[] = [];
+    for (const id of cellIds) {
+      const col = this.findWithId(id);
+      const node = col.nodes.find((n) => n.value === id);
+      if (!node) {
+        throw new Error(`Node ${id} not found in column ${col.id}`);
+      }
+      nodesToMove.push(node);
+    }
+
+    // Remove moved cells from all columns
+    const columnsWithRemovals = this.columns.map((col) =>
+      col.withNodes(col.nodes.filter((n) => !cellIdSet.has(n.value))),
+    );
+
+    // Find target index in the cleaned column
+    const cleanedTargetCol = columnsWithRemovals[targetColIndex];
+    let insertIndex = cleanedTargetCol.nodes.findIndex(
+      (n) => n.value === targetId,
+    );
+
+    // If target was one of the moved cells, insert at end
+    if (insertIndex === -1) {
+      insertIndex = cleanedTargetCol.nodes.length;
+    } else if (position === "after") {
+      insertIndex += 1;
+    }
+
+    // Insert all moved nodes at target position
+    const newTargetNodes = arrayInsertMany(
+      cleanedTargetCol.nodes,
+      insertIndex,
+      nodesToMove,
+    );
+    columnsWithRemovals[targetColIndex] =
+      cleanedTargetCol.withNodes(newTargetNodes);
+
+    return new MultiColumn(columnsWithRemovals);
+  }
+
   indexOfOrThrow(id: CellColumnId): number {
     const index = this.columns.findIndex((c) => c.id === id);
     if (index === -1) {
@@ -969,6 +1022,34 @@ export class MultiColumn<T> {
 
   deleteById(cellId: T): MultiColumn<T> {
     return this.transformWithCellId(cellId, (c) => c.delete(cellId));
+  }
+
+  /**
+   * Remove the given cells from the tree, then re-insert each at its
+   * (columnId, index). Used to undo a move (e.g. cut-paste) by restoring
+   * cells to their previous positions. Placements are sorted by
+   * (columnId, index) so insert order keeps indices valid.
+   */
+  placeCells(
+    placements: Array<{ id: T; columnId: CellColumnId; index: CellIndex }>,
+  ): MultiColumn<T> {
+    if (placements.length === 0) {
+      return this;
+    }
+    let result = this.deleteById(placements[0].id);
+    for (const { id } of placements.slice(1)) {
+      result = result.deleteById(id);
+    }
+    const sorted = [...placements].toSorted((a, b) => {
+      if (a.columnId !== b.columnId) {
+        return a.columnId.localeCompare(b.columnId);
+      }
+      return (a.index as number) - (b.index as number);
+    });
+    for (const { id, columnId, index } of sorted) {
+      result = result.insertId(id, columnId, index);
+    }
+    return result;
   }
 
   compact(): MultiColumn<T> {

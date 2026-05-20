@@ -3,18 +3,27 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import re
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Union
+from typing import Any
+
+from pymdownx.superfences import RE_NESTED_FENCE_START  # type: ignore
 
 from marimo._ast.cell import CellConfig
 from marimo._ast.compiler import compile_cell
+from marimo._ast.names import DEFAULT_CELL_NAME
 from marimo._ast.transformers import NameTransformer, RemoveImportTransformer
 from marimo._ast.variables import is_local
 from marimo._ast.visitor import Block, NamedNode, ScopedVisitor
-from marimo._convert.common.format import markdown_to_marimo
+from marimo._convert.common.format import (
+    DEFAULT_MARKDOWN_PREFIX,
+    markdown_to_marimo,
+)
+from marimo._convert.ipynb.from_ir import NBCONVERT_REMOVE_INPUT_TAG
 from marimo._runtime.dataflow import DirectedGraph
 from marimo._schemas.serialization import (
     AppInstantiation,
@@ -31,10 +40,104 @@ Transform = Callable[[list[str]], list[str]]
 @dataclass
 class CodeCell:
     source: str
+    name: str = field(default_factory=lambda: DEFAULT_CELL_NAME)
     config: CellConfig = field(default_factory=CellConfig)
 
 
-# Define a type for transforms that add/remove cells
+# Regex patterns for stripping bare <p>/<\/p> tags from Jupyter markdown cells.
+# Only match bare <p> (no attributes) — styled tags like <p style="color: red">
+# carry semantic meaning and must be preserved.
+_BARE_OPEN_P_RE = re.compile(r"<p\s*>", re.IGNORECASE)
+_ANY_OPEN_P_RE = re.compile(r"<p(?:\s[^>]*)?>", re.IGNORECASE)
+_CLOSE_P_RE = re.compile(r"</p>", re.IGNORECASE)
+
+
+def _strip_paragraph_tags(source: str) -> str:
+    """Remove bare ``<p>`` / ``</p>`` HTML tags from markdown source.
+
+    Jupyter markdown cells often wrap content in ``<p>…</p>`` tags which are
+    redundant in plain markdown and can break LaTeX rendering inside
+    ``mo.md()``.
+
+    Only bare ``<p>`` tags (without attributes) are removed.  Styled tags such
+    as ``<p style="color: red">`` are preserved because they carry semantic
+    meaning.  The matching ``</p>`` is only removed when it closes a bare
+    ``<p>``.
+
+    Closing ``</p>`` tags for bare opens are replaced with a newline to
+    preserve paragraph separation.  Content inside fenced code blocks is
+    left untouched.
+    """
+    # Collect fenced code block spans so we can skip them.
+    # Uses RE_NESTED_FENCE_START from pymdownx.superfences (already a marimo
+    # dependency) instead of a hand-rolled regex.
+    protected: list[tuple[int, int]] = []
+    fence_marker: str | None = None
+    block_start = 0
+    pos = 0
+    for line in source.split("\n"):
+        if fence_marker is None:
+            m = RE_NESTED_FENCE_START.match(line)
+            if m:
+                fence_marker = m.group("fence")
+                block_start = pos
+        else:
+            stripped = line.strip()
+            if stripped == fence_marker or (
+                stripped.startswith(fence_marker)
+                and stripped == stripped[0] * len(stripped)
+            ):
+                protected.append((block_start, pos + len(line)))
+                fence_marker = None
+        pos += len(line) + 1  # +1 for the newline
+
+    def _in_protected(pos: int) -> bool:
+        return any(s <= pos < e for s, e in protected)
+
+    # Pair opening <p> tags with closing </p> using a simple stack.
+    # Only mark pairs for removal when the opening tag is bare (no attrs).
+    opens = list(_ANY_OPEN_P_RE.finditer(source))
+    closes = list(_CLOSE_P_RE.finditer(source))
+
+    remove_opens: list[re.Match[str]] = []
+    remove_closes: list[re.Match[str]] = []
+    stack: list[re.Match[str]] = []
+
+    # Walk all tags in document order
+    all_tags: list[tuple[int, str, re.Match[str]]] = []
+    for m in opens:
+        all_tags.append((m.start(), "open", m))
+    for m in closes:
+        all_tags.append((m.start(), "close", m))
+    all_tags.sort(key=lambda t: t[0])
+
+    for _pos, kind, match in all_tags:
+        if _in_protected(match.start()):
+            continue
+        if kind == "open":
+            stack.append(match)
+        elif kind == "close" and stack:
+            opener = stack.pop()
+            if _BARE_OPEN_P_RE.fullmatch(opener.group()):
+                remove_opens.append(opener)
+                remove_closes.append(match)
+
+    # Build set of (start, end) spans to remove, sorted end-to-start
+    removals: list[tuple[int, int, str]] = []
+    for m in remove_opens:
+        removals.append((m.start(), m.end(), ""))
+    for m in remove_closes:
+        removals.append((m.start(), m.end(), "\n"))
+    removals.sort(key=lambda t: t[0], reverse=True)
+
+    for start, end, replacement in removals:
+        source = source[:start] + replacement + source[end:]
+
+    # Clean up excessive blank lines introduced by replacements
+    source = re.sub(r"\n{3,}", "\n\n", source)
+    return source.strip()
+
+
 CellsTransform = Callable[[list[CodeCell]], list[CodeCell]]
 
 
@@ -102,15 +205,13 @@ def transform_add_marimo_import(sources: list[CodeCell]) -> list[CodeCell]:
         def is_in_import_line(line: str) -> bool:
             if line.startswith("import marimo as mo"):
                 return True
-            if line.startswith("import ") or line.startswith("from "):
+            if line.startswith(("import ", "from ")):
                 return "import marimo as mo" in line
             return False
 
         # Slow check
         lines = cell.strip().split("\n")
-        if any(is_in_import_line(line) for line in lines):
-            return True
-        return False
+        return any(is_in_import_line(line) for line in lines)
 
     already_has_marimo_import = any(
         has_marimo_import(cell.source) for cell in sources
@@ -141,15 +242,11 @@ def transform_add_subprocess_import(
 
         def is_in_import_line(line: str) -> bool:
             stripped = line.strip()
-            if stripped.startswith("import subprocess"):
-                return True
-            return False
+            return stripped.startswith("import subprocess")
 
         # Slow check
         lines = cell.strip().split("\n")
-        if any(is_in_import_line(line) for line in lines):
-            return True
-        return False
+        return any(is_in_import_line(line) for line in lines)
 
     already_has_subprocess_import = any(
         has_subprocess_import(cell.source) for cell in sources
@@ -212,13 +309,13 @@ def transform_magic_commands(sources: list[str]) -> list[str]:
         if not double:
             return "\n".join(
                 [
-                    "# magic command not supported in marimo; please file an issue to add support",  # noqa: E501
+                    "# magic command not supported in marimo; please file an issue to add support",
                     f"# {command + ' ' + source}",
                 ]
             )
 
         result = [
-            "# magic command not supported in marimo; please file an issue to add support",  # noqa: E501
+            "# magic command not supported in marimo; please file an issue to add support",
             f"# {command}",
         ]
         if source:
@@ -403,6 +500,12 @@ class ExclamationMarkResult:
     needs_subprocess: bool
 
 
+def _pass_if_indented(indent_level: int) -> str:
+    if indent_level > 0:
+        return "pass  "
+    return ""
+
+
 def _normalize_git_url_package(package: str) -> str:
     """
     Normalize git URL packages to PEP 508 format.
@@ -439,8 +542,7 @@ def _normalize_git_url_package(package: str) -> str:
         repo_name = path.rstrip("/").split("/")[-1]
 
         # Remove .git extension if present
-        if repo_name.endswith(".git"):
-            repo_name = repo_name[:-4]
+        repo_name = repo_name.removesuffix(".git")
 
         # If we couldn't extract a name, use a placeholder
         if not repo_name:
@@ -456,42 +558,114 @@ def _normalize_git_url_package(package: str) -> str:
 
 
 def _extract_pip_install(
-    command_line: str, command_tokens: list[str]
+    command_line: str, command_tokens: list[str], indent_level: int = 0
 ) -> ExclamationCommandResult:
     pip_packages: list[str] = []
     if "install" not in command_tokens:
-        return _shlex_to_subprocess_call(command_line, command_tokens)
+        return _shlex_to_subprocess_call(
+            command_line, command_tokens, indent_level
+        )
 
     install_idx = command_tokens.index("install")
-    packages = [
-        p for p in command_tokens[install_idx + 1 :] if not p.startswith("-")
-    ]
+
+    # Collect packages and items for display, skipping flags
+    packages = []  # Actual packages (no templates)
+    templates = []  # Template placeholders
+    for token in command_tokens[install_idx + 1 :]:
+        # Skip flags (starting with -)
+        if token.startswith("-"):
+            continue
+        # Template placeholders stop package collection
+        if token.startswith("{") and token.endswith("}"):
+            templates.append(token)
+            break
+        packages.append(token)
+
     # Normalize git URLs to PEP 508 format
     pip_packages = [_normalize_git_url_package(p) for p in packages]
 
-    # Comment out the pip command
+    # For display: show templates only if there are no real packages
+    display_items = packages if packages else templates
+
+    # Comment out the pip command, showing items in comment
+    # Add pass for indented commands to prevent empty blocks
     replacement = (
-        "# packages added via marimo's package management: "
-        f"{' '.join(packages)} !{command_line}"
+        f"{_pass_if_indented(indent_level)}# packages added via marimo's "
+        f"package management: {' '.join(display_items)} !{command_line}"
     )
     return ExclamationCommandResult(replacement, pip_packages, False)
 
 
+def _is_compilable_expression(expr: str) -> bool:
+    """Check if expression is valid Python that can be compiled.
+
+    Args:
+        expr: The expression to check (without surrounding braces)
+
+    Returns:
+        True if the expression can be compiled as valid Python, False otherwise
+    """
+    try:
+        compile(expr, "<string>", "eval")
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+
 def _shlex_to_subprocess_call(
-    command_line: str, command_tokens: list[str]
+    command_line: str, command_tokens: list[str], indent_level: int = 0
 ) -> ExclamationCommandResult:
-    """Convert a shell command to subprocess.call([...])"""
+    """Convert a shell command to subprocess.call([...])
+
+    Template placeholders {expr} are converted to str(expr) if expr is valid Python.
+    If any template contains invalid Python, the entire command is commented out.
+
+    Args:
+        command_line: The command string
+        command_tokens: Tokenized command
+        indent_level: Number of indents for the examined line.
+    """
+    # First pass: check if any template is invalid
+    for token in command_tokens:
+        if token.startswith("{") and token.endswith("}"):
+            expr = token[1:-1]
+            if not _is_compilable_expression(expr):
+                # Comment out entire command if any template is invalid
+                # Always add pass to prevent empty blocks
+                return ExclamationCommandResult(
+                    f"# Note: Command contains invalid template expression\n"
+                    f"{_pass_if_indented(indent_level)}# !{command_line}",
+                    [],
+                    False,  # No subprocess needed
+                )
+
+    # Second pass: convert templates to str() calls
+    processed_tokens = []
+    for token in command_tokens:
+        if token.startswith("{") and token.endswith("}"):
+            expr = token[1:-1]
+            # Convert to str() call
+            processed_tokens.append(f"str({expr})")
+        else:
+            processed_tokens.append(repr(token))
+
+    # Build the subprocess call with processed tokens
+    tokens_str = "[" + ", ".join(processed_tokens) + "]"
     command = "\n".join(
-        [f"#! {command_line}", f"subprocess.call({command_tokens!r})"]
+        [f"#! {command_line}", f"subprocess.call({tokens_str})"]
     )
     return ExclamationCommandResult(command, [], True)
 
 
 def _handle_exclamation_command(
-    command_line: str,
+    command_line: str, indent_level: int = 0
 ) -> ExclamationCommandResult:
     """
     Process an exclamation command line.
+
+    Args:
+        command_line: The command to process (without the leading !)
+        indent_level: Column position of the ! (0 = top-level, >0 = indented)
 
     Returns: (replacement_text, pip_packages, needs_subprocess)
     """
@@ -510,10 +684,135 @@ def _handle_exclamation_command(
     # For instance in the case `uv pip install ...`
     for i, token in enumerate(command_tokens):
         if token.startswith("pip"):
-            return _extract_pip_install(command_line, command_tokens[i:])
+            # Pip installs always use marimo's package management (never subprocess)
+            return _extract_pip_install(
+                command_line, command_tokens[i:], indent_level
+            )
 
     # Replace with subprocess.call()
-    return _shlex_to_subprocess_call(command_line, command_tokens)
+    return _shlex_to_subprocess_call(
+        command_line, command_tokens, indent_level
+    )
+
+
+def _normalize_package_name(name: str) -> str:
+    """Normalize a package name per PEP 503.
+
+    PEP 503 specifies that package names should be normalized by:
+    - Converting to lowercase
+    - Replacing underscores, periods, and consecutive dashes with single dashes
+
+    Args:
+        name: Package name to normalize
+
+    Returns:
+        Normalized package name
+    """
+    return re.sub(r"[-_.]+", "-", name.lower())
+
+
+def _extract_package_name(pkg: str) -> str:
+    """Extract and normalize the base package name from a package specification.
+
+    Handles version specifiers, extras, and VCS URLs.
+    Returns normalized names per PEP 503.
+
+    Args:
+        pkg: Package specification (e.g., "numpy>=1.0", "package[extra]", "name @ git+...")
+
+    Returns:
+        Normalized base package name (e.g., "numpy", "package", "name")
+    """
+    # Handle PEP 508 URL format: "name @ git+..."
+    if " @ " in pkg:
+        name = pkg.split(" @ ")[0].strip()
+        return _normalize_package_name(name)
+
+    # Strip version specifiers and extras
+    name = re.split(r"[=<>~\[]+", pkg)[0].strip()
+    return _normalize_package_name(name)
+
+
+def _resolve_pip_packages(packages: list[str]) -> list[str]:
+    """Resolve pip packages using uv for validation, returning only direct packages.
+
+    Uses uv pip compile to validate packages and resolve conflicts, but filters
+    the output to only include packages that were originally requested (not
+    transitive dependencies).
+
+    For git URLs, preserves the full PEP 508 format (e.g., "name @ git+...").
+
+    Args:
+        packages: List of package specifications (may have duplicates/conflicts)
+
+    Returns:
+        Resolved and sorted list of direct packages only
+    """
+    if not packages:
+        return []
+
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    # Build a mapping from normalized name to original package spec
+    # For git URLs, we want to preserve the full URL format
+    original_specs: dict[str, str] = {}
+    for pkg in packages:
+        name = _extract_package_name(pkg)
+        # For git URLs (PEP 508 format), preserve the full spec
+        if " @ " in pkg:
+            original_specs[name] = pkg
+        else:
+            # For regular packages, just use the normalized name
+            original_specs[name] = name
+
+    original_names = set(original_specs.keys())
+
+    # Try using uv pip compile to validate/resolve conflicts
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            req_file = Path(tmpdir) / "requirements.in"
+            out_file = Path(tmpdir) / "requirements.txt"
+
+            # Write packages to temp file
+            req_file.write_text("\n".join(packages))
+
+            # Run uv pip compile
+            result = subprocess.run(
+                [
+                    "uv",
+                    "pip",
+                    "compile",
+                    str(req_file),
+                    "--output-file",
+                    str(out_file),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            if result.returncode == 0 and out_file.exists():
+                # Parse resolved requirements, filtering to only direct packages
+                resolved = []
+                for line in out_file.read_text().splitlines():
+                    line = line.strip()
+                    # Skip comments and empty lines
+                    if line and not line.startswith("#"):
+                        # Extract package name
+                        pkg_name = _extract_package_name(line)
+                        # Only include if it was in the original request
+                        if pkg_name in original_names:
+                            # Use the original spec (preserves git URLs)
+                            resolved.append(original_specs[pkg_name])
+                return sorted(set(resolved))
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        # uv not available or failed, fall through to unpinning
+        pass
+
+    # Fallback: deduplicate and return original specs
+    return sorted(original_specs.values())
 
 
 def transform_exclamation_mark(sources: list[str]) -> ExclamationMarkResult:
@@ -553,6 +852,7 @@ def transform_exclamation_mark(sources: list[str]) -> ExclamationMarkResult:
         exclaim_tokens: list[TokenInfo] = []
         trailing_comment = None
         exclaim_line_num = None
+        exclaim_indent_level = 0
 
         for i, token in enumerate(tokens):
             # Check for newline + ! pattern (or ! at start after ENCODING)
@@ -568,6 +868,9 @@ def transform_exclamation_mark(sources: list[str]) -> ExclamationMarkResult:
                 exclaim_tokens = []
                 trailing_comment = None
                 exclaim_line_num = token.start[0]
+                exclaim_indent_level = token.start[
+                    1
+                ]  # Column position = indentation
                 continue  # Skip the ! token
 
             elif in_exclaim:
@@ -577,20 +880,58 @@ def transform_exclamation_mark(sources: list[str]) -> ExclamationMarkResult:
                     if exclaim_tokens and exclaim_tokens[-1].type == COMMENT:
                         trailing_comment = exclaim_tokens.pop()
 
-                    # Extract command from collected tokens by joining their strings
+                    # Extract command from collected tokens by reconstructing from source
                     if exclaim_tokens:
-                        # Reconstruct command from tokens
+                        # Reconstruct command from original source using token positions
+                        # This properly handles multi-line commands with backslash continuations
                         first_token = exclaim_tokens[0]
                         last_token = exclaim_tokens[-1]
-                        # Get the source line and extract the command portion
-                        line_text = first_token.line
+
+                        # Get line numbers (1-indexed)
+                        start_line_num = first_token.start[0]
+                        end_line_num = last_token.end[0]
                         start_col = first_token.start[1]
                         end_col = last_token.end[1]
-                        command_line = line_text[start_col:end_col].strip()
+
+                        # Split cell into lines for extraction
+                        cell_lines = cell.split("\n")
+
+                        if start_line_num == end_line_num:
+                            # Single line command
+                            command_line = cell_lines[start_line_num - 1][
+                                start_col:end_col
+                            ].strip()
+                        else:
+                            # Multi-line command - extract across lines
+                            parts = []
+                            # First line
+                            parts.append(
+                                cell_lines[start_line_num - 1][start_col:]
+                            )
+                            # Middle lines
+                            for line_idx in range(
+                                start_line_num, end_line_num - 1
+                            ):
+                                parts.append(cell_lines[line_idx])
+                            # Last line
+                            parts.append(
+                                cell_lines[end_line_num - 1][:end_col]
+                            )
+
+                            # Join and remove backslash continuations
+                            full_text = "\n".join(parts)
+                            # Remove backslash line continuations
+                            command_line = full_text.replace(
+                                "\\\n", " "
+                            ).strip()
+                            # Normalize whitespace
+                            command_line = " ".join(command_line.split())
                     else:
                         command_line = ""
 
-                    result = _handle_exclamation_command(command_line)
+                    result = _handle_exclamation_command(
+                        command_line, indent_level=exclaim_indent_level
+                    )
 
                     all_pip_packages.extend(result.pip_packages)
                     any_needs_subprocess |= result.needs_subprocess
@@ -605,6 +946,16 @@ def transform_exclamation_mark(sources: list[str]) -> ExclamationMarkResult:
                                 "\n" + trailing_comment.string
                             )
 
+                        # For multi-line commands, mark continuation lines for removal
+                        if exclaim_tokens:
+                            last_token = exclaim_tokens[-1]
+                            end_line_num = last_token.end[0]
+                            # Mark all continuation lines (after the first) as removed
+                            for line_num in range(
+                                exclaim_line_num + 1, end_line_num + 1
+                            ):
+                                line_replacements[line_num] = None  # type: ignore
+
                     in_exclaim = False
                 else:
                     # Collect tokens that are part of the command
@@ -616,9 +967,13 @@ def transform_exclamation_mark(sources: list[str]) -> ExclamationMarkResult:
             new_lines = []
             for line_num, line in enumerate(lines, start=1):
                 if line_num in line_replacements:
+                    replacement = line_replacements[line_num]
+                    # None means skip this line (multi-line continuation)
+                    if replacement is None:
+                        continue
                     # Preserve indentation from original line
                     indent = (len(line) - len(line.lstrip())) * " "
-                    replacements = line_replacements[line_num].split("\n")
+                    replacements = replacement.split("\n")
                     # Add indentation to replacement
                     indented_replacement = [
                         indent + replacement for replacement in replacements
@@ -630,9 +985,12 @@ def transform_exclamation_mark(sources: list[str]) -> ExclamationMarkResult:
         else:
             transformed_sources.append(cell)
 
+    # Resolve packages using uv (or unpin if unavailable)
+    resolved_packages = _resolve_pip_packages(all_pip_packages)
+
     return ExclamationMarkResult(
         transformed_sources=transformed_sources,
-        pip_packages=all_pip_packages,
+        pip_packages=resolved_packages,
         needs_subprocess=any_needs_subprocess,
     )
 
@@ -871,7 +1229,13 @@ def transform_duplicate_definitions(sources: list[str]) -> list[str]:
         visitor = ScopedVisitor(
             ignore_local=True, on_def=on_def, on_ref=on_ref
         )
-        new_tree = visitor.visit(tree)
+        try:
+            new_tree = visitor.visit(tree)
+        except SyntaxError:
+            # Cell contains constructs like `import *` that marimo
+            # doesn't support — skip renaming but keep the cell as-is
+            new_sources[cell_idx] = source
+            continue
 
         # Don't unparse if no changes were made
         if not renamer.made_changes:
@@ -900,31 +1264,52 @@ def bind_cell_metadata(
 
     This marks the boundary between source-only transformations and cell-level transformations.
 
-    - If "hide-cell" is present in the tags, the cell is marked hidden (and removed)
+    - If "hide-cell" or the standard nbconvert "remove-input" tag is present,
+      the cell is marked hidden (and the tag is consumed).
+    - The Jupyter UI hint ``metadata.jupyter.source_hidden`` is also treated as
+      a hidden-code signal.
     - Remaining tags (if any) are inserted as a comment at the top of the source.
     - If marimo-specific metadata is present, it is used to restore cell config.
     """
     cells: list[CodeCell] = []
-    for source, meta, hide_code in zip(sources, metadata, hide_flags):
+    for source, meta, hide_code in zip(
+        sources, metadata, hide_flags, strict=False
+    ):
         tags: set[str] = set(meta.get("tags", []))
-        if "hide-cell" in tags:
-            tags.discard("hide-cell")
-            hide_code = True
-        if tags:
-            source = f"# Cell tags: {', '.join(sorted(tags))}\n{source}"
+
+        # The `remove-input` tag and `jupyter.source_hidden` flag are emitted by
+        # marimo's ipynb exporter (and recognized by nbconvert / JupyterLab /
+        # VS Code) to indicate hidden code. Consume them here so they don't
+        # leak back into the .py source as a stray comment.
+        had_remove_input = NBCONVERT_REMOVE_INPUT_TAG in tags
+        tags.discard(NBCONVERT_REMOVE_INPUT_TAG)
+        source_hidden = bool(meta.get("jupyter", {}).get("source_hidden"))
 
         # Extract marimo-specific cell config if present
         marimo_meta = meta.get("marimo", {})
         marimo_config = marimo_meta.get("config", {})
+        name = marimo_meta.get("name", DEFAULT_CELL_NAME)
 
-        # Merge marimo config with existing flags
-        # marimo config takes precedence for hide_code if present
+        # Determine hide_code with priority: marimo config > tags > hide_flags default
         if "hide_code" in marimo_config:
             hide_code = marimo_config["hide_code"]
+        elif "hide-cell" in tags:
+            tags.discard("hide-cell")
+            hide_code = True
+        elif had_remove_input or source_hidden:
+            hide_code = True
+        elif "marimo" in meta:
+            # Cell was created by marimo; marimo would have stored hide_code=True
+            # explicitly if needed, so default to False instead of is_markdown
+            hide_code = False
+
+        if tags:
+            source = f"# Cell tags: {', '.join(sorted(tags))}\n{source}"
 
         cells.append(
             CodeCell(
                 source=source,
+                name=name,
                 config=CellConfig(
                     hide_code=hide_code,
                     column=marimo_config.get("column"),
@@ -1056,6 +1441,8 @@ def _transform_sources(
     """
     from marimo._convert.common.comment_preserver import CommentPreserver
 
+    logger = logging.getLogger(__name__)
+
     # Define transforms that don't need comment preservation
     simple_transforms = [
         transform_strip_whitespace,
@@ -1069,13 +1456,45 @@ def _transform_sources(
         transform_duplicate_definitions,
     ]
 
+    _REPORT_URL = "https://github.com/marimo-team/marimo/issues"
+
+    def _run_transform(
+        name: str,
+        fn: Callable[[list[str]], list[str]],
+        sources: list[str],
+    ) -> list[str]:
+        try:
+            new_sources = fn(sources)
+        except Exception:
+            logger.warning(
+                "Notebook conversion transform '%s' failed; "
+                "skipping this optimization. "
+                "Please report this at %s",
+                name,
+                _REPORT_URL,
+                exc_info=True,
+            )
+            return sources
+
+        if len(new_sources) != len(sources):
+            logger.warning(
+                "Notebook conversion transform '%s' changed cell count "
+                "(%d -> %d); skipping this optimization. "
+                "Please report this at %s",
+                name,
+                len(sources),
+                len(new_sources),
+                _REPORT_URL,
+            )
+            return sources
+
+        return new_sources
+
     # Run simple transforms first (no comment preservation needed)
     for source_transform in simple_transforms:
-        new_sources = source_transform(sources)
-        assert len(new_sources) == len(sources), (
-            f"{source_transform.__name__} changed cell count"
+        sources = _run_transform(
+            source_transform.__name__, source_transform, sources
         )
-        sources = new_sources
 
     # Create comment preserver from the simplified sources
     comment_preserver = CommentPreserver(sources)
@@ -1083,11 +1502,7 @@ def _transform_sources(
     # Run comment-preserving transforms
     for base_transform in comment_preserving_transforms:
         transform = comment_preserver(base_transform)
-        new_sources = transform(sources)
-        assert len(new_sources) == len(sources), (
-            f"{base_transform.__name__} changed cell count"
-        )
-        sources = new_sources
+        sources = _run_transform(base_transform.__name__, transform, sources)
 
     # Handle exclamation_mark specially since it returns ExclamationMarkResult
     exclamation_result = transform_exclamation_mark(sources)
@@ -1121,7 +1536,7 @@ def convert_from_ipynb_to_notebook_ir(
     sources: list[str] = []
     metadata: list[dict[str, Any]] = []
     hide_flags: list[bool] = []
-    inline_meta: Union[str, None] = None
+    inline_meta: str | None = None
 
     for cell in notebook["cells"]:
         source = (
@@ -1131,7 +1546,12 @@ def convert_from_ipynb_to_notebook_ir(
         )
         is_markdown: bool = cell["cell_type"] == "markdown"
         if is_markdown:
-            source = markdown_to_marimo(source)
+            source = _strip_paragraph_tags(source)
+            cell_meta = cell.get("metadata", {})
+            md_prefix = cell_meta.get("marimo", {}).get(
+                "md_prefix", DEFAULT_MARKDOWN_PREFIX
+            )
+            source = markdown_to_marimo(source, prefix=md_prefix)
         elif inline_meta is None:
             # Eagerly find PEP 723 metadata, first match wins
             inline_meta, source = extract_inline_meta(source)
@@ -1158,6 +1578,7 @@ def convert_from_ipynb_to_notebook_ir(
         cells=[
             CellDef(
                 code=cell.source,
+                name=cell.name,
                 options=cell.config.asdict(),
             )
             for cell in transformed_cells

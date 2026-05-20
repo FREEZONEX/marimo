@@ -233,6 +233,14 @@ export default defineConfig({
         target: TARGET,
         changeOrigin: true,
       },
+      "/mpl": {
+        target: TARGET,
+        ws: true,
+        changeOrigin: true,
+        headers: {
+          origin: TARGET,
+        },
+      },
       "/custom.css": {
         target: TARGET,
         changeOrigin: true,
@@ -282,11 +290,22 @@ export default defineConfig({
       ? JSON.stringify(process.env.VITE_MARIMO_VERSION)
       : JSON.stringify("latest"),
     "process.env.NODE_ENV": JSON.stringify(process.env.NODE_ENV),
+    "process.env.DEBUG": JSON.stringify(process.env.DEBUG ?? ""),
   },
   build: {
     minify: isDev ? false : "oxc", // default is "oxc"
     sourcemap: isDev,
     rollupOptions: {
+      onwarn(warning, warn) {
+        if (
+          warning.message?.includes(
+            "has been externalized for browser compatibility",
+          )
+        ) {
+          return;
+        }
+        warn(warning);
+      },
       output: {
         // 合并明确无 top-level-await 的微小 util 库，缓解首次加载 HTTP/2 排队
         // （详见 Tier0 根仓库 bug/bug10）。

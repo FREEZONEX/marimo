@@ -5,6 +5,7 @@ import { EditorView } from "@codemirror/view";
 import { getDefaultStore } from "jotai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MockNotebook } from "@/__mocks__/notebook";
+import { cellId } from "@/__tests__/branded";
 import { notebookAtom } from "@/core/cells/cells";
 import type { CellId } from "@/core/cells/ids";
 import { updateEditorCodeFromPython } from "@/core/codemirror/language/utils";
@@ -32,7 +33,7 @@ function createMockEditorView(code: string): EditorView {
       doc: code,
       extensions: [
         adaptiveLanguageConfiguration({
-          cellId: "cell1" as CellId,
+          cellId: cellId("cell1"),
           completionConfig: {
             copilot: false,
             activate_on_typing: true,
@@ -44,6 +45,7 @@ function createMockEditorView(code: string): EditorView {
           lspConfig: {},
         }),
         cellConfigExtension({
+          cellId: cellId("cell1"),
           completionConfig: {
             copilot: false,
             activate_on_typing: true,
@@ -92,9 +94,9 @@ describe("EditNotebookTool", () => {
     };
     tool = new EditNotebookTool();
 
-    cellId1 = "cell-1" as CellId;
-    cellId2 = "cell-2" as CellId;
-    cellId3 = "cell-3" as CellId;
+    cellId1 = cellId("cell-1");
+    cellId2 = cellId("cell-2");
+    cellId3 = cellId("cell-3");
 
     // Reset mocks
     vi.clearAllMocks();
@@ -177,6 +179,85 @@ describe("EditNotebookTool", () => {
       });
     });
 
+    it("should skip no-op edits where code hasn't changed", async () => {
+      const code = "x = 1";
+
+      const editorView = createMockEditorView(code);
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code },
+        },
+      });
+      notebook.cellHandles[cellId1] = { current: { editorView } } as never;
+      store.set(notebookAtom, notebook);
+
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "update_cell",
+            position: { type: "relative", cellId: cellId1 },
+            code: code, // Same code as current
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+
+      // Should NOT stage the cell or update the editor
+      expect(toolContext.addStagedCell).not.toHaveBeenCalled();
+      expect(vi.mocked(updateEditorCodeFromPython)).not.toHaveBeenCalled();
+
+      // No staged cells
+      const stagedCells = store.get(stagedAICellsAtom);
+      expect(stagedCells.size).toBe(0);
+    });
+
+    it("should skip no-op edits that revert to original code", async () => {
+      const originalCode = "x = 1";
+      const modifiedCode = "x = 2";
+
+      const editorView = createMockEditorView(originalCode);
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: originalCode },
+        },
+      });
+      notebook.cellHandles[cellId1] = { current: { editorView } } as never;
+      store.set(notebookAtom, notebook);
+
+      // First edit: change the code
+      await tool.handler(
+        {
+          edit: {
+            type: "update_cell",
+            position: { type: "relative", cellId: cellId1 },
+            code: modifiedCode,
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(toolContext.addStagedCell).toHaveBeenCalledTimes(1);
+
+      // Second edit: revert back to the original code
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "update_cell",
+            position: { type: "relative", cellId: cellId1 },
+            code: originalCode, // Same as the previousCode
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+
+      // addStagedCell should not be called again (still 1 from the first edit)
+      expect(toolContext.addStagedCell).toHaveBeenCalledTimes(1);
+    });
+
     it("should throw error when cell ID doesn't exist", async () => {
       const notebook = MockNotebook.notebookState({
         cellData: {
@@ -190,7 +271,7 @@ describe("EditNotebookTool", () => {
           {
             edit: {
               type: "update_cell",
-              position: { cellId: "nonexistent" as CellId },
+              position: { cellId: cellId("nonexistent") },
               code: "x = 2",
             },
           },
@@ -203,7 +284,7 @@ describe("EditNotebookTool", () => {
           {
             edit: {
               type: "update_cell",
-              position: { cellId: "nonexistent" as CellId },
+              position: { cellId: cellId("nonexistent") },
               code: "x = 2",
             },
           },
@@ -416,7 +497,7 @@ describe("EditNotebookTool", () => {
               type: "add_cell",
               position: {
                 type: "relative",
-                cellId: "nonexistent" as CellId,
+                cellId: cellId("nonexistent"),
                 before: true,
               },
               code: "y = 2",
@@ -580,7 +661,7 @@ describe("EditNotebookTool", () => {
           {
             edit: {
               type: "delete_cell",
-              position: { cellId: "nonexistent" as CellId },
+              position: { cellId: cellId("nonexistent") },
             },
           },
           toolContext as never,

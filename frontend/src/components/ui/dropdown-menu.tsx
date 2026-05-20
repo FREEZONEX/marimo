@@ -1,7 +1,8 @@
 /* Copyright 2026 Marimo. All rights reserved. */
-import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
+
 import type { VariantProps } from "class-variance-authority";
 import { Check, ChevronRight, Circle } from "lucide-react";
+import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui";
 import React from "react";
 import { StyleNamespace } from "@/theme/namespace";
 import { cn } from "@/utils/cn";
@@ -83,7 +84,7 @@ const DropdownMenuContent = React.forwardRef<
         sideOffset={sideOffset}
         className={cn(
           menuContentCommon(),
-          "animate-in data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+          "animate-in data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 print:hidden",
           scrollable && "overflow-auto",
           className,
         )}

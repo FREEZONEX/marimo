@@ -4,7 +4,7 @@ from __future__ import annotations
 import functools
 import io
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import narwhals.stable.v2 as nw
 
@@ -29,10 +29,48 @@ from marimo._plugins.ui._impl.tables.table_manager import (
 if TYPE_CHECKING:
     import pandas as pd
 
+    from marimo._plugins.ui._impl.table import SortArgs
+
 LOGGER = _loggers.marimo_logger()
 
 if TYPE_CHECKING:
     from pandas._typing import DtypeObj
+
+
+def _trivial_range_index(index: pd.Index) -> bool:
+    import pandas as pd
+
+    # A trivial index is an unnamed RangeIndex (0, 1, 2, ...)
+    return isinstance(index, pd.RangeIndex) and index.name is None
+
+
+def _resolve_index_name(name: object, columns: set[str]) -> str:
+    """Return a non-conflicting index name by appending '_index' if needed."""
+    return f"{name}_index" if name in columns else str(name)
+
+
+def _resolve_index_column_conflicts(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename index names that conflict with column names by appending '_index'.
+
+    Avoids 'ValueError: cannot insert x, already exists' on reset_index().
+    Modifies the DataFrame in-place and returns it.
+    """
+    import pandas as pd
+
+    index_names = df.index.names
+    conflicting_names = set(index_names) & set(df.columns)
+    if not conflicting_names:
+        return df
+
+    columns = set(df.columns)
+    new_names = [_resolve_index_name(name, columns) for name in index_names]
+
+    if isinstance(df.index, pd.MultiIndex):
+        df.index = df.index.set_names(new_names)
+    else:
+        df.index = df.index.rename(new_names[0])
+
+    return df
 
 
 def _maybe_convert_geopandas_to_pandas(data: pd.DataFrame) -> pd.DataFrame:
@@ -71,19 +109,71 @@ class PandasTableManagerFactory(TableManagerFactory):
             def schema(self) -> pd.Series[Any]:
                 return self._original_data.dtypes  # type: ignore
 
+            def sort_values(self, by: list[SortArgs]) -> TableManager[Any]:
+                if not by:
+                    return self
+
+                columns = [sort_arg.by for sort_arg in by]
+                descending = [sort_arg.descending for sort_arg in by]
+
+                # Object-dtype columns may contain mixed Python types
+                # (e.g. int + str) that can't be compared directly.
+                # Cast those to string via temp columns before sorting.
+                dtypes = self._original_data.dtypes
+                mixed_cols = [
+                    col for col in columns if dtypes[col] == "object"
+                ]
+
+                if not mixed_cols:
+                    return super().sort_values(by)
+
+                df = self.data
+                temp_cols: list[str] = []
+                sort_cols: list[str] = []
+                for col in columns:
+                    if col in mixed_cols:
+                        temp = f"__sort_{col}"
+                        # Preserve nulls so nulls_last=True works.
+                        # On pandas <3.0, cast(String) turns None
+                        # into the string "None" instead of null.
+                        df = df.with_columns(
+                            nw.when(nw.col(col).is_null())
+                            .then(None)
+                            .otherwise(nw.col(col).cast(nw.String))
+                            .alias(temp)
+                        )
+                        temp_cols.append(temp)
+                        sort_cols.append(temp)
+                    else:
+                        sort_cols.append(col)
+
+                df = df.sort(
+                    sort_cols,
+                    descending=descending,
+                    nulls_last=True,
+                ).drop(temp_cols)
+                return self.with_new_data(df)
+
             # We override narwhals's to_csv_str to handle pandas
             # headers
             def to_csv_str(
-                self, format_mapping: Optional[FormatMapping] = None
+                self,
+                format_mapping: FormatMapping | None = None,
+                separator: str | None = None,
             ) -> str:
                 has_headers = len(self.get_row_headers()) > 0
+                resolved_separator = (
+                    separator if separator is not None else ","
+                )
                 return self.apply_formatting(
                     format_mapping
-                )._original_data.to_csv(index=has_headers)
+                )._original_data.to_csv(
+                    index=has_headers, sep=resolved_separator
+                )
 
             def to_json_str(
                 self,
-                format_mapping: Optional[FormatMapping] = None,
+                format_mapping: FormatMapping | None = None,
                 strict_json: bool = False,
                 ensure_ascii: bool = True,
             ) -> str:
@@ -156,38 +246,16 @@ class PandasTableManagerFactory(TableManagerFactory):
                 # Only skip reset for unnamed default RangeIndex (0, 1, 2, ...)
                 if isinstance(result.index, pd.MultiIndex) or (
                     isinstance(result.index, pd.Index)
-                    and not (
-                        isinstance(result.index, pd.RangeIndex)
-                        and result.index.name is None
-                    )
+                    and not _trivial_range_index(result.index)
                 ):
-                    index_names = result.index.names
                     unnamed_indexes = any(
                         idx is None for idx in result.index.names
                     )
 
                     index_levels = result.index.nlevels
 
-                    # Check for name conflicts between index names and column names
-                    # to avoid "cannot insert x, already exists" error
-                    conflicting_names = set(index_names) & set(result.columns)
-                    if conflicting_names:
-                        # Create new names, handling None values
-                        new_names: list[str] = []
-                        for name in result.index.names:
-                            if name in conflicting_names:
-                                new_names.append(f"{name}_index")
-                            else:
-                                new_names.append(str(name))
-
-                        # Rename the index to avoid conflict
-                        if isinstance(result.index, pd.MultiIndex):
-                            result.index = result.index.set_names(new_names)
-                        else:
-                            result.index = result.index.rename(new_names[0])
-
-                        # Update index_names to reflect the rename
-                        index_names = result.index.names
+                    _resolve_index_column_conflicts(result)
+                    index_names = result.index.names
 
                     result = result.reset_index()
 
@@ -218,11 +286,28 @@ class PandasTableManagerFactory(TableManagerFactory):
 
             def to_arrow_ipc(self) -> bytes:
                 out = io.BytesIO()
-                self._original_data.to_feather(out, compression="uncompressed")
+                try:
+                    self._original_data.to_feather(
+                        out, compression="uncompressed"
+                    )
+                except Exception:
+                    # Fall back: convert extension-type columns that
+                    # PyArrow cannot handle (e.g. pint-pandas) to plain
+                    # values so the feather write can succeed.
+                    import pyarrow as pa
+
+                    out = io.BytesIO()
+                    df = self._original_data.copy()
+                    for col in df.columns:
+                        try:
+                            pa.Array.from_pandas(df[col])
+                        except Exception:
+                            df[col] = df[col].astype(object).infer_objects()
+                    df.to_feather(out, compression="uncompressed")
                 return out.getvalue()
 
             def apply_formatting(
-                self, format_mapping: Optional[FormatMapping]
+                self, format_mapping: FormatMapping | None
             ) -> PandasTableManager:
                 if not format_mapping:
                     return self
@@ -292,9 +377,52 @@ class PandasTableManagerFactory(TableManagerFactory):
             # We override the default implementation to use pandas
             # headers
             def get_row_headers(self) -> FieldTypes:
-                return self._get_row_headers_for_index(
+                headers = self._get_row_headers_for_index(
                     self._original_data.index
                 )
+                # Rename headers that collide with column names so the
+                # frontend receives names consistent with to_json_str().
+                columns = set(self._original_data.columns)
+                return [
+                    (_resolve_index_name(name, columns), ft)
+                    for name, ft in headers
+                ]
+
+            def _has_non_trivial_index(self) -> bool:
+                """Check if the DataFrame has a non-trivial index that should be searched."""
+                index = self._original_data.index
+                return not _trivial_range_index(index)
+
+            def search(self, query: str) -> PandasTableManager:
+                # If there's a non-trivial index, include it in the search
+                # by resetting the index first
+                if self._has_non_trivial_index():
+                    index = self._original_data.index
+                    num_levels = index.nlevels
+                    original_names = list(index.names)
+
+                    working = self._original_data.copy()
+                    _resolve_index_column_conflicts(working)
+                    df_with_index = working.reset_index()
+                    manager = PandasTableManager(df_with_index)
+
+                    # Get index column names AFTER manager init, since
+                    # _handle_non_string_column_names may have converted
+                    # non-string column names to strings
+                    index_columns = list(
+                        manager._original_data.columns[:num_levels]
+                    )
+
+                    result = super(PandasTableManager, manager).search(query)
+                    native_df: pd.DataFrame = nw.to_native(result.data)
+
+                    # Restore the original index structure
+                    native_df = native_df.set_index(index_columns)
+                    native_df.index.names = original_names
+                    return PandasTableManager(native_df)
+                result = super().search(query)
+                native_df = nw.to_native(result.data)
+                return PandasTableManager(native_df)
 
             @staticmethod
             def is_type(value: Any) -> bool:
@@ -304,7 +432,7 @@ class PandasTableManagerFactory(TableManagerFactory):
                 self, index: pd.Index[Any]
             ) -> FieldTypes:
                 # Ignore if it's the default index with no name
-                if index.name is None and isinstance(index, pd.RangeIndex):
+                if _trivial_range_index(index):
                     return []
 
                 if isinstance(index, pd.MultiIndex):
@@ -344,9 +472,7 @@ class PandasTableManagerFactory(TableManagerFactory):
 
                 if lower_dtype.startswith("interval"):
                     return ("string", dtype)
-                if lower_dtype.startswith("int") or lower_dtype.startswith(
-                    "uint"
-                ):
+                if lower_dtype.startswith(("int", "uint")):
                     return ("integer", dtype)
                 if lower_dtype.startswith("float"):
                     return ("number", dtype)
@@ -360,11 +486,11 @@ class PandasTableManagerFactory(TableManagerFactory):
                     return ("date", dtype)
                 if lower_dtype == "time":
                     return ("time", dtype)
-                if lower_dtype == "timedelta64[ns]":
+                if lower_dtype.startswith("timedelta"):
                     return ("string", dtype)
                 if lower_dtype == "category":
                     return ("string", dtype)
-                if lower_dtype == "string":
+                if lower_dtype == "string" or lower_dtype == "str":
                     return ("string", dtype)
                 if lower_dtype.startswith("complex"):
                     return ("unknown", dtype)

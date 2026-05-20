@@ -16,6 +16,7 @@ import {
   LinkIcon,
   MessagesSquareIcon,
   OrbitIcon,
+  PackageIcon,
   YoutubeIcon,
 } from "lucide-react";
 import type React from "react";
@@ -32,6 +33,7 @@ import { useRequestClient } from "@/core/network/requests";
 import type { TutorialId } from "@/core/network/types";
 import { openNotebook } from "@/utils/links";
 import { Objects } from "@/utils/objects";
+import { MarimoPlusIcon } from "../icons/marimo-icons";
 
 const TUTORIALS: Record<
   TutorialId,
@@ -57,6 +59,11 @@ const TUTORIALS: Record<
     FileIcon,
     "Understand marimo's pure-Python file format",
   ],
+  "external-dependencies": [
+    "External dependencies",
+    PackageIcon,
+    "Declare dependencies with Python script metadata",
+  ],
   "for-jupyter-users": [
     "For Jupyter users",
     OrbitIcon,
@@ -80,7 +87,7 @@ export const OpenTutorialDropDown: React.FC = () => {
           <CaretDownIcon className="w-3 h-3 ml-1" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent side="bottom" align="end" className="no-print">
+      <DropdownMenuContent side="bottom" align="end" className="print:hidden">
         {Objects.entries(TUTORIALS).map(
           ([tutorialId, [label, Icon, description]]) => (
             <DropdownMenuItem
@@ -131,6 +138,12 @@ const RESOURCES = [
     description: "Join the marimo Discord community",
     icon: MessagesSquareIcon,
     url: Constants.discordLink,
+  },
+  {
+    title: "molab",
+    description: "Run marimo notebooks in the cloud",
+    icon: MarimoPlusIcon,
+    url: Constants.molab,
   },
   {
     title: "YouTube",

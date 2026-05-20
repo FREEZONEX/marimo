@@ -1,11 +1,21 @@
 /* Copyright 2026 Marimo. All rights reserved. */
-/** biome-ignore-all lint/suspicious/noConsole: for debugging */
+/* oxlint-disable no-console -- for debugging */
 import { type Mock, vi } from "vitest";
 import { invariant } from "@/utils/invariant";
 
+interface MockLogger {
+  debug: Mock;
+  log: Mock;
+  warn: Mock;
+  error: Mock;
+  trace: Mock;
+  get: Mock;
+  disabled: Mock;
+}
+
 // Common mock factories
 export const Mocks = {
-  quietLogger: () => ({
+  quietLogger: (): MockLogger => ({
     debug: vi.fn(),
     log: vi.fn(),
     warn: vi.fn(),
@@ -15,7 +25,7 @@ export const Mocks = {
     disabled: vi.fn(),
   }),
 
-  logger: () => ({
+  logger: (): MockLogger => ({
     debug: vi.fn().mockImplementation(console.debug),
     log: vi.fn().mockImplementation(console.log),
     warn: vi.fn().mockImplementation(console.warn),
@@ -70,8 +80,33 @@ export const Mocks = {
     },
 };
 
+// Common mock modules for vi.mock() calls
+export const MockModules = {
+  toast: () => ({ toast: vi.fn() }),
+  toastWithControls: () => {
+    const dismiss = vi.fn();
+    const update = vi.fn();
+    return {
+      mock: { toast: vi.fn(() => ({ dismiss, update })) },
+      dismiss,
+      update,
+    };
+  },
+};
+
 // Global mock setup functions
 export const SetupMocks = {
+  resizeObserver: () => {
+    const observe = vi.fn();
+    const unobserve = vi.fn();
+    const disconnect = vi.fn();
+    global.ResizeObserver = class MockResizeObserver {
+      observe = observe;
+      unobserve = unobserve;
+      disconnect = disconnect;
+    } as unknown as typeof ResizeObserver;
+    return { observe, unobserve, disconnect };
+  },
   clipboard: (mockClipboard = Mocks.clipboard()) => {
     Object.defineProperty(navigator, "clipboard", {
       value: mockClipboard,
@@ -79,12 +114,10 @@ export const SetupMocks = {
     });
 
     // Mock ClipboardItem
-    // @ts-expect-error - ClipboardItem types not exact
-    global.ClipboardItem = vi
-      .fn()
-      .mockImplementation((data) => Mocks.clipboardItem(data));
-
-    global.ClipboardItem.supports = vi.fn().mockReturnValue(true);
+    global.ClipboardItem = Object.assign(
+      vi.fn().mockImplementation((data) => Mocks.clipboardItem(data)),
+      { supports: vi.fn().mockReturnValue(true) },
+    ) as unknown as typeof ClipboardItem;
 
     // Mock Blob
     global.Blob = vi
@@ -104,12 +137,12 @@ export const SetupMocks = {
           store[key] = value;
         }),
         removeItem: vi.fn((key: string) => {
-          // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+          // oxlint-disable-next-line typescript/no-dynamic-delete
           delete store[key];
         }),
         clear: vi.fn(() => {
           for (const key of Object.keys(store)) {
-            // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+            // oxlint-disable-next-line typescript/no-dynamic-delete
             delete store[key];
           }
         }),
@@ -146,7 +179,7 @@ export const SetupMocks = {
   },
 };
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+// oxlint-disable-next-line typescript/no-explicit-any
 export function asMock<T extends (...args: any[]) => unknown>(fn: T): Mock<T> {
   invariant(
     "mock" in fn,

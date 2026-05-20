@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from collections import deque
+from typing import TYPE_CHECKING, Any
 
 from marimo._ast.names import SETUP_CELL_NAME
 from marimo._dependencies.dependencies import DependencyManager
@@ -25,11 +26,14 @@ from marimo._runtime.executor import (
 )
 from marimo._runtime.patches import (
     create_main_module,
+    extract_docstring_from_header,
     patch_main_module_context,
 )
 from marimo._types.ids import CellId_t
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from marimo._ast.app import InternalApp
 
 
@@ -40,10 +44,11 @@ class AppScriptRunner:
         self,
         app: InternalApp,
         filename: str | None,
-        glbls: Optional[dict[str, Any]] = None,
+        glbls: dict[str, Any] | None = None,
     ) -> None:
         self.app = app
         self.filename = filename
+        self._docstring = extract_docstring_from_header(app._app._header)
         self.cells_cancelled: set[CellId_t] = set()
         self._glbls = glbls if glbls else {}
 
@@ -56,22 +61,20 @@ class AppScriptRunner:
             excluded=CellId_t(SETUP_CELL_NAME),
         )
 
-        self.cells_to_run = [
+        self.cells_to_run: deque[CellId_t] = deque(
             cid
             for cid in pruned_execution_order
             if app.cell_manager.cell_data_at(cid).cell is not None
             and not self.app.graph.is_disabled(cid)
-        ]
+        )
         self._executor = get_executor(ExecutionConfig())
 
     def _cancel(self, cell_id: CellId_t) -> None:
-        cancelled = set(
+        cancelled = {
             cid
-            for cid in dataflow.transitive_closure(
-                self.app.graph, set([cell_id])
-            )
+            for cid in dataflow.transitive_closure(self.app.graph, {cell_id})
             if cid in self.cells_to_run
-        )
+        }
         for cid in cancelled:
             self.app.graph.cells[cid].set_run_result_status("cancelled")
         self.cells_cancelled |= cancelled
@@ -82,7 +85,10 @@ class AppScriptRunner:
     ) -> RunOutput:
         with patch_main_module_context(
             create_main_module(
-                file=self.filename, input_override=None, print_override=None
+                file=self.filename,
+                input_override=None,
+                print_override=None,
+                doc=self._docstring,
             )
         ) as module:
             glbls = module.__dict__
@@ -90,7 +96,7 @@ class AppScriptRunner:
 
             outputs: dict[CellId_t, Any] = {}
             while self.cells_to_run:
-                cid = self.cells_to_run.pop(0)
+                cid = self.cells_to_run.popleft()
                 if cid in self.cells_cancelled:
                     continue
                 # Set up has already run in this case.
@@ -112,7 +118,7 @@ class AppScriptRunner:
                         if isinstance(unwrapped_exception, MarimoStopError):
                             self._cancel(cid)
                         else:
-                            raise e
+                            raise
                     finally:
                         for hook in post_execute_hooks:
                             hook()
@@ -124,7 +130,10 @@ class AppScriptRunner:
     ) -> RunOutput:
         with patch_main_module_context(
             create_main_module(
-                file=self.filename, input_override=None, print_override=None
+                file=self.filename,
+                input_override=None,
+                print_override=None,
+                doc=self._docstring,
             )
         ) as module:
             glbls = module.__dict__
@@ -133,7 +142,7 @@ class AppScriptRunner:
             outputs: dict[CellId_t, Any] = {}
 
             while self.cells_to_run:
-                cid = self.cells_to_run.pop(0)
+                cid = self.cells_to_run.popleft()
                 if cid in self.cells_cancelled:
                     continue
 
@@ -155,7 +164,7 @@ class AppScriptRunner:
                         if isinstance(unwrapped_exception, MarimoStopError):
                             self._cancel(cid)
                         else:
-                            raise e
+                            raise
                     finally:
                         for hook in post_execute_hooks:
                             hook()
@@ -198,7 +207,11 @@ class AppScriptRunner:
             from marimo._output.formatting import FORMATTERS
 
             if not FORMATTERS.is_empty():
-                register_formatters()
+                from marimo._runtime.context import get_context
+
+                register_formatters(
+                    theme=get_context().marimo_config["display"]["theme"]
+                )
 
             post_execute_hooks = []
             if DependencyManager.matplotlib.has():

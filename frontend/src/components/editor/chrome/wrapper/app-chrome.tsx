@@ -14,9 +14,13 @@ import {
 import { Footer } from "./footer";
 import { Sidebar } from "./sidebar";
 import "./app-chrome.css";
-import { TooltipProvider } from "@radix-ui/react-tooltip";
+import { Tooltip } from "radix-ui";
+
+const TooltipProvider = Tooltip.Provider;
+
 import { useAtom, useAtomValue } from "jotai";
 import { XIcon } from "lucide-react";
+import useEvent from "react-use-event-hook";
 import { Button } from "@/components/ui/button";
 import { ReorderableList } from "@/components/ui/reorderable-list";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -26,6 +30,7 @@ import { capabilitiesAtom } from "@/core/config/capabilities";
 import { getFeatureFlag } from "@/core/config/feature-flag";
 import { cn } from "@/utils/cn";
 import { ErrorBoundary } from "../../boundary/ErrorBoundary";
+import { raf2 } from "../../navigation/focus-utils";
 import { ContextAwarePanel } from "../panels/context-aware-panel/context-aware-panel";
 import { PanelSectionProvider } from "../panels/panel-context";
 import { panelLayoutAtom, useChromeActions, useChromeState } from "../state";
@@ -37,6 +42,7 @@ import {
   type PanelType,
 } from "../types";
 import { BackendConnectionStatus } from "./footer-items/backend-status";
+import { LspStatus } from "./footer-items/lsp-status";
 import { PanelsWrapper } from "./panels";
 import { PendingAICells } from "./pending-ai-cells";
 import { useAiPanelTab } from "./useAiPanel";
@@ -146,6 +152,14 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
     });
   }, [panelLayout.sidebar, capabilities]);
 
+  const emitResizeEvent = useEvent(() => {
+    // HACK: Unfortunately, we have to do this twice to make sure the
+    // panel is fully expanded before we dispatch the resize event
+    raf2(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+  });
+
   // sync sidebar
   useEffect(() => {
     if (!sidebarRef.current) {
@@ -161,13 +175,7 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
     }
 
     // Dispatch a resize event so widgets know to resize
-    requestAnimationFrame(() => {
-      // HACK: Unfortunately, we have to do this twice to make sure it the
-      // panel is fully expanded before we dispatch the resize event
-      requestAnimationFrame(() => {
-        window.dispatchEvent(new Event("resize"));
-      });
-    });
+    emitResizeEvent();
   }, [isSidebarOpen]);
 
   // sync panel
@@ -185,13 +193,7 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
     }
 
     // Dispatch a resize event so widgets know to resize
-    requestAnimationFrame(() => {
-      // HACK: Unfortunately, we have to do this twice to make sure it the
-      // panel is fully expanded before we dispatch the resize event
-      requestAnimationFrame(() => {
-        window.dispatchEvent(new Event("resize"));
-      });
-    });
+    emitResizeEvent();
   }, [isDeveloperPanelOpen]);
 
   // Auto-correct developer panel selection when the selected tab is no longer available
@@ -225,9 +227,11 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
 
   const helperResizeHandle = (
     <PanelResizeHandle
+      disabled={!isSidebarOpen}
       onDragging={handleDragging}
+      hitAreaMargins={{ coarse: 15, fine: 2 }}
       className={cn(
-        "border-border no-print z-10",
+        "border-border print:hidden z-10",
         isSidebarOpen ? "resize-handle" : "resize-handle-collapsed",
         "vertical",
       )}
@@ -236,9 +240,10 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
 
   const panelResizeHandle = (
     <PanelResizeHandle
+      disabled={!isDeveloperPanelOpen}
       onDragging={handleDragging}
       className={cn(
-        "border-border no-print z-20",
+        "border-border print:hidden z-20",
         isDeveloperPanelOpen ? "resize-handle" : "resize-handle-collapsed",
         "horizontal",
       )}
@@ -382,7 +387,7 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
       collapsedSize={0}
       collapsible={true}
       className={cn(
-        "dark:bg-(--slate-1) no-print print:hidden hide-on-fullscreen",
+        "dark:bg-(--slate-1) print:hidden hide-on-fullscreen",
         isSidebarOpen && "border-r border-l border-(--slate-7)",
       )}
       minSize={10}
@@ -427,7 +432,7 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
       collapsedSize={0}
       collapsible={true}
       className={cn(
-        "dark:bg-(--slate-1) no-print print:hidden hide-on-fullscreen",
+        "dark:bg-(--slate-1) print:hidden hide-on-fullscreen",
         isDeveloperPanelOpen && "border-t",
       )}
       minSize={10}
@@ -490,6 +495,7 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
           />
           <div className="border-l border-border h-4 mx-1" />
           <BackendConnectionStatus />
+          <LspStatus />
           <div className="flex-1" />
           <Button
             size="xs"
@@ -531,6 +537,7 @@ export const AppChrome: React.FC<PropsWithChildren> = ({ children }) => {
         {helperPanel}
         <Panel
           id="app-chrome-body"
+          data-testid="chrome-body"
           className={cn(isDeveloperPanelOpen && !isSidebarOpen && "border-l")}
         >
           <PanelGroup autoSaveId="marimo:chrome:v1:l1" direction="vertical">

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from enum import Enum
-from typing import Any, Union
+from typing import Any
 
 import msgspec
 
@@ -33,7 +33,7 @@ class CellOutput(msgspec.Struct):
     # descriptive name about the kind of output: e.g., stdout, stderr, ...
     channel: CellChannel
     mimetype: KnownMimeType
-    data: Union[str, list[Error], dict[str, Any]]
+    data: str | list[Error] | dict[str, Any]
     timestamp: float = msgspec.field(default_factory=lambda: time.time())
 
     def __repr__(self) -> str:
@@ -63,9 +63,11 @@ class CellOutput(msgspec.Struct):
         )
 
     @staticmethod
-    def stdin(data: str) -> CellOutput:
+    def stdin(data: str, password: bool = False) -> CellOutput:
         return CellOutput(
-            channel=CellChannel.STDIN, mimetype="text/plain", data=data
+            channel=CellChannel.STDIN,
+            mimetype="text/password" if password else "text/plain",
+            data=data,
         )
 
     @staticmethod

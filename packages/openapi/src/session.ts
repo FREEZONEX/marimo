@@ -35,6 +35,7 @@ export interface components {
     };
     NotebookSessionMetadata: {
       marimo_version: string | null;
+      script_metadata_hash: string | null;
     };
     NotebookSessionV1: {
       cells: components["schemas"]["Cell"][];
@@ -51,6 +52,8 @@ export interface components {
         | "application/vnd.marimo+mimebundle"
         | "application/vnd.vega.v5+json"
         | "application/vnd.vegalite.v5+json"
+        | "application/vnd.vega.v6+json"
+        | "application/vnd.vegalite.v6+json"
         | "application/vnd.jupyter.widget-view+json"
         | "image/png"
         | "image/svg+xml"
@@ -63,6 +66,7 @@ export interface components {
         | "video/mpeg"
         | "text/html"
         | "text/plain"
+        | "text/password"
         | "text/markdown"
         | "text/latex"
         | "text/csv";
@@ -80,6 +84,8 @@ export interface components {
         | "application/vnd.marimo+mimebundle"
         | "application/vnd.vega.v5+json"
         | "application/vnd.vegalite.v5+json"
+        | "application/vnd.vega.v6+json"
+        | "application/vnd.vegalite.v6+json"
         | "application/vnd.jupyter.widget-view+json"
         | "image/png"
         | "image/svg+xml"
@@ -92,6 +98,7 @@ export interface components {
         | "video/mpeg"
         | "text/html"
         | "text/plain"
+        | "text/password"
         | "text/markdown"
         | "text/latex"
         | "text/csv"

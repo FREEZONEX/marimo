@@ -1,6 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-import { atom } from "jotai";
+import { atom, useAtomValue } from "jotai";
 import { isIslands } from "@/core/islands/utils";
 import { assertExists } from "@/utils/assertExists";
 import { invariant } from "@/utils/invariant";
@@ -13,8 +13,9 @@ import { store } from "./state/jotai";
  * - `edit`: A user is editing the notebook. Can switch to present mode.
  * - `present`: A user is presenting the notebook, it looks like read mode but with some editing features. Cannot switch to present mode.
  * - `home`: A user is in the home page.
+ * - `gallery`: A user is in the gallery page.
  */
-export type AppMode = "read" | "edit" | "present" | "home";
+export type AppMode = "read" | "edit" | "present" | "home" | "gallery";
 
 export function getInitialAppMode(): Exclude<AppMode, "present"> {
   const initialMode = store.get(initialModeAtom);
@@ -28,8 +29,8 @@ export function getInitialAppMode(): Exclude<AppMode, "present"> {
 
 export function toggleAppMode(mode: AppMode): AppMode {
   // Can't switch to present mode.
-  if (mode === "read") {
-    return "read";
+  if (mode === "read" || mode === "home" || mode === "gallery") {
+    return mode;
   }
 
   return mode === "edit" ? "present" : "edit";
@@ -78,3 +79,12 @@ export const viewStateAtom = atom<ViewState>({
 export const initialModeAtom = atom<AppMode | undefined>(undefined);
 
 export const kioskModeAtom = atom<boolean>(false);
+
+/**
+ * Whether installing packages is allowed in the current view. False in read
+ * mode, since end-users of a deployed notebook cannot mutate its environment.
+ */
+export function useInstallAllowed(): boolean {
+  const { mode } = useAtomValue(viewStateAtom);
+  return mode !== "read";
+}

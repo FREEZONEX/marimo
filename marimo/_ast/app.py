@@ -7,10 +7,11 @@ import os
 import sys
 import threading
 from collections.abc import (
+    Callable,
     Iterable,
     Iterator,
     Mapping,
-    Sequence,  # noqa: TC003
+    Sequence,
 )
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,13 +19,10 @@ from textwrap import dedent
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Literal,
-    Optional,
     ParamSpec,
     TypeAlias,
     TypeVar,
-    Union,
     cast,
     overload,
 )
@@ -44,6 +42,7 @@ from marimo._ast.parse import ast_parse
 from marimo._ast.variables import BUILTINS
 from marimo._convert.converters import MarimoConvert
 from marimo._messaging.mimetypes import KnownMimeType
+from marimo._messaging.notebook.changes import SetConfig, Transaction
 from marimo._output.hypertext import Html
 from marimo._output.rich_help import mddoc
 from marimo._runtime import dataflow
@@ -69,6 +68,9 @@ from marimo._types.ids import CellId_t
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from types import FrameType, TracebackType
+    from typing import TypeGuard
+
+    from typing_extensions import TypeIs
 
     from marimo._messaging.notification import HumanReadableStatus
     from marimo._plugins.core.web_component import JSONType
@@ -120,7 +122,7 @@ class _SetupContext:
         self._cell = cell
         self._hide_code = hide_code
         self._glbls: dict[str, Any] = {}
-        self._frame: Optional[FrameType] = None
+        self._frame: FrameType | None = None
         self._previous: dict[str, Any] = {}
 
     def __enter__(self) -> None:
@@ -148,9 +150,9 @@ class _SetupContext:
 
     def __exit__(
         self,
-        exception: Optional[type[BaseException]],
-        instance: Optional[BaseException],
-        _traceback: Optional[TracebackType],
+        exception: type[BaseException] | None,
+        instance: BaseException | None,
+        _traceback: TracebackType | None,
     ) -> Literal[False]:
         if exception is not None:
             # Always should fail, since static loading still allows bad apps to
@@ -171,16 +173,30 @@ class _SetupContext:
         hide_code: bool = False,
         **kwargs: Any,  # noqa: ARG002
     ) -> _SetupContext:
-        """When called with parameters, create a new context with those parameters."""
-        cell = self._app._cell_manager.cell_context(
-            app=InternalApp(self._app),
-            frame=inspect.stack()[1].frame,
-            config=CellConfig(hide_code=hide_code),
+        """When called with parameters, update the setup cell config.
+
+        The setup cell was already registered when ``app.setup`` ran
+        (the property getter); this call updates that cell's config in
+        place rather than re-registering.
+        """
+        cm = self._app._cell_manager
+        existing_cfg = cm.document.get_cell(cm.setup_cell_id).config
+        cm.document.apply(
+            Transaction(
+                changes=(
+                    SetConfig(
+                        cell_id=cm.setup_cell_id,
+                        column=existing_cfg.column,
+                        disabled=existing_cfg.disabled,
+                        hide_code=hide_code,
+                    ),
+                ),
+                source="cell-manager",
+            )
         )
-        self._app._setup = _SetupContext(
-            app=self._app, cell=cell, hide_code=hide_code
-        )
-        return self._app._setup
+        self._cell._cell.configure({"hide_code": hide_code})
+        self._hide_code = hide_code
+        return self
 
 
 @dataclass
@@ -256,7 +272,7 @@ class App:
         # injection hook to rewrite cells for pytest
         self._pytest_rewrite = False
         # setup context for script mode and module imports
-        self._setup: Optional[_SetupContext] = None
+        self._setup: _SetupContext | None = None
 
         # Filename is derived from the callsite of the app
         # unless explicitly set (e.g. for static loading case)
@@ -290,9 +306,10 @@ class App:
             self._cell_manager.codes(),
             self._cell_manager.names(),
             self._cell_manager.configs(),
+            strict=False,
         ):
             cell = None
-            cell_data = self._cell_manager._cell_data.get(cell_id)
+            cell_data = self._cell_manager.get_cell_data(cell_id)
             new_cell_id = app._cell_manager.create_cell_id()
             # If the cell exists, the cell data should be set (ie not None).
             if cell_data is not None:
@@ -347,7 +364,7 @@ class App:
         self,
         func: Fn[P, R] | None = None,
         *,
-        column: Optional[int] = None,
+        column: int | None = None,
         disabled: bool = False,
         hide_code: bool = False,
         **kwargs: Any,
@@ -381,11 +398,21 @@ class App:
         del kwargs
 
         return cast(
-            Union[Cell, Callable[[Fn[P, R]], Cell]],
+            Cell | Callable[[Fn[P, R]], Cell],
             self._cell_manager.cell_decorator(
                 func, column, disabled, hide_code, app=InternalApp(self)
             ),
         )
+
+    @overload
+    def function(  # type: ignore[overload-overlap]
+        self, func: Callable[P, TypeIs[R]]
+    ) -> Callable[P, TypeIs[R]]: ...
+
+    @overload
+    def function(
+        self, func: Callable[P, TypeGuard[R]]
+    ) -> Callable[P, TypeGuard[R]]: ...
 
     @overload
     def function(self, func: Fn[P, R]) -> Fn[P, R]: ...
@@ -397,7 +424,7 @@ class App:
         self,
         func: Fn[P, R] | None = None,
         *,
-        column: Optional[int] = None,
+        column: int | None = None,
         disabled: bool = False,
         hide_code: bool = False,
         **kwargs: Any,
@@ -433,7 +460,7 @@ class App:
         del kwargs
 
         return cast(
-            Union[Fn[P, R], Callable[[Fn[P, R]], Fn[P, R]]],
+            Fn[P, R] | Callable[[Fn[P, R]], Fn[P, R]],
             self._cell_manager.cell_decorator(
                 func,
                 column,
@@ -454,7 +481,7 @@ class App:
         self,
         cls: Cls | None = None,
         *,
-        column: Optional[int] = None,
+        column: int | None = None,
         disabled: bool = False,
         hide_code: bool = False,
         **kwargs: Any,
@@ -488,7 +515,7 @@ class App:
         del kwargs
 
         return cast(
-            Union[Cls, Callable[[Cls], Cls]],
+            Cls | Callable[[Cls], Cls],
             self._cell_manager.cell_decorator(
                 cls,
                 column,
@@ -537,7 +564,7 @@ class App:
     def _unparsable_cell(
         self,
         code: str,
-        name: Optional[str] = None,
+        name: str | None = None,
         **config: Any,
     ) -> None:
         self._cell_manager.register_unparsable_cell(
@@ -723,7 +750,7 @@ class App:
 
             if self._filename is not None:
                 # Run linting checks to provide better error messages for breaking errors.
-                linter, messages = collect_messages(self._filename)
+                _linter, messages = collect_messages(self._filename)
                 if messages:
                     sys.stderr.write(messages)
                 # Re-raise the original exception but without trace
@@ -767,10 +794,15 @@ class App:
         return output, _Namespace(defs, owner=self)
 
     async def _set_ui_element_value(
-        self, request: UpdateUIElementCommand
+        self,
+        request: UpdateUIElementCommand,
+        *,
+        notify_frontend: bool,
     ) -> bool:
         app_kernel_runner = self._get_kernel_runner()
-        return await app_kernel_runner.set_ui_element_value(request)
+        return await app_kernel_runner.set_ui_element_value(
+            request, notify_frontend=notify_frontend
+        )
 
     async def _function_call(
         self, request: InvokeFunctionCommand
@@ -997,23 +1029,31 @@ class InternalApp:
         names: Iterable[str],
         configs: Iterable[CellConfig],
     ) -> InternalApp:
-        new_cell_manager = CellManager()
+        """Rewrite the cell list from textual fields, in place.
+
+        Mutates ``self._app._cell_manager`` rather than replacing it,
+        so any caller holding ``app.cell_manager`` or
+        ``app.cell_manager.document`` (notably ``Session.document``)
+        continues to see live state without rebinding.
+
+        Cells that survive the rewrite keep their compiled ``Cell``;
+        callers from save flows pass the frontend's snapshot, which
+        renames/reorders/reconfigures cells but doesn't recompile.
+        """
+        cm = self._app._cell_manager
+        prev_compiled = dict(cm._compiled_cells)
+        rebuilt = CellManager(prefix=cm.prefix)
         for cell_id, code, name, config in zip(
-            cell_ids, codes, names, configs
+            cell_ids, codes, names, configs, strict=False
         ):
-            cell = None
-            # If the cell exists, the cell data should be set.
-            cell_data = self._app._cell_manager._cell_data.get(cell_id)
-            if cell_data is not None:
-                cell = cell_data.cell
-            new_cell_manager.register_cell(
+            rebuilt.register_cell(
                 cell_id=cell_id,
                 code=code,
                 name=name,
                 config=config,
-                cell=cell,
+                cell=prev_compiled.get(cell_id),
             )
-        self._app._cell_manager = new_cell_manager
+        cm._replace_state_from(rebuilt)
         return self
 
     async def run_cell_async(
@@ -1027,9 +1067,14 @@ class InternalApp:
         return self._app._run_cell_sync(cell, kwargs)
 
     async def set_ui_element_value(
-        self, request: UpdateUIElementCommand
+        self,
+        request: UpdateUIElementCommand,
+        *,
+        notify_frontend: bool,
     ) -> bool:
-        return await self._app._set_ui_element_value(request)
+        return await self._app._set_ui_element_value(
+            request, notify_frontend=notify_frontend
+        )
 
     async def function_call(
         self, request: InvokeFunctionCommand
@@ -1051,7 +1096,7 @@ class InternalApp:
                     name=cell_data.name,
                     options=cell_data.config.asdict(),
                 )
-                for cell_data in self._app._cell_manager._cell_data.values()
+                for cell_data in self._app._cell_manager.cell_data()
             ],
             app=AppInstantiation(
                 options=self._app._config.asdict(),

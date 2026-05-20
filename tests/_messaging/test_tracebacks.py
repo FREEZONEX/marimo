@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from marimo._messaging.context import HTTP_REQUEST_CTX, is_code_mode_request
 from marimo._messaging.tracebacks import (
     _highlight_traceback,
     _trim_traceback,
@@ -10,6 +11,7 @@ from marimo._messaging.tracebacks import (
     write_traceback,
 )
 from marimo._messaging.types import Stderr
+from marimo._runtime.commands import HTTPRequest
 
 
 class TestTracebacks:
@@ -80,6 +82,145 @@ class TestTracebacks:
         assert is_code_highlighting("<span>code</span>") is False
         assert is_code_highlighting("") is False
         assert is_code_highlighting('class="not-codehilite"') is False
+
+    def test_write_traceback_plain_text_in_code_mode(self) -> None:
+        """When request is from /api/kernel/execute, use plain text."""
+        mock_stderr = MagicMock(spec=Stderr)
+        req = HTTPRequest(
+            url={"path": "/api/kernel/execute"},
+            base_url={},
+            headers={},
+            query_params={},
+            path_params={},
+            cookies={},
+            meta={},
+            user=None,
+        )
+        token = HTTP_REQUEST_CTX.set(req)
+        try:
+            with patch("sys.stderr", mock_stderr):
+                traceback = 'Traceback (most recent call last):\n  File "<stdin>", line 1, in <module>\nValueError: bad'
+                write_traceback(traceback)
+                mock_stderr.write.assert_called_once()
+                mock_stderr._write_with_mimetype.assert_not_called()
+        finally:
+            HTTP_REQUEST_CTX.reset(token)
+
+    def test_write_traceback_html_for_regular_http_request(self) -> None:
+        """Regular HTTP requests (no code-mode header) get HTML tracebacks."""
+        mock_stderr = MagicMock(spec=Stderr)
+        req = HTTPRequest(
+            url={},
+            base_url={},
+            headers={"accept": "application/json"},
+            query_params={},
+            path_params={},
+            cookies={},
+            meta={},
+            user=None,
+        )
+        token = HTTP_REQUEST_CTX.set(req)
+        try:
+            with patch("sys.stderr", mock_stderr):
+                traceback = 'Traceback (most recent call last):\n  File "<stdin>", line 1, in <module>\nValueError: bad'
+                write_traceback(traceback)
+                mock_stderr._write_with_mimetype.assert_called_once()
+                mock_stderr.write.assert_not_called()
+        finally:
+            HTTP_REQUEST_CTX.reset(token)
+
+    def test_write_traceback_suppressed_in_run_mode(self) -> None:
+        """In run mode with show_tracebacks=False, nothing is sent to the frontend."""
+        mock_stderr = MagicMock(spec=Stderr)
+        with (
+            patch("sys.stderr", mock_stderr),
+            patch("marimo._messaging.tracebacks.get_mode", return_value="run"),
+            patch(
+                "marimo._messaging.tracebacks._show_tracebacks_enabled",
+                return_value=False,
+            ),
+        ):
+            write_traceback(
+                'Traceback (most recent call last):\n  File "<stdin>", line 1, in <module>\nRuntimeError: secret'
+            )
+            mock_stderr._write_with_mimetype.assert_not_called()
+            mock_stderr.write.assert_not_called()
+
+    def test_write_traceback_forwarded_in_run_mode_with_show_tracebacks(
+        self,
+    ) -> None:
+        """In run mode with show_tracebacks=True, traceback is sent to the frontend."""
+        mock_stderr = MagicMock(spec=Stderr)
+        with (
+            patch("sys.stderr", mock_stderr),
+            patch("marimo._messaging.tracebacks.get_mode", return_value="run"),
+            patch(
+                "marimo._messaging.tracebacks._show_tracebacks_enabled",
+                return_value=True,
+            ),
+        ):
+            write_traceback(
+                'Traceback (most recent call last):\n  File "<stdin>", line 1, in <module>\nRuntimeError: visible'
+            )
+            mock_stderr._write_with_mimetype.assert_called_once()
+            _, kwargs = mock_stderr._write_with_mimetype.call_args
+            assert kwargs["mimetype"] == "application/vnd.marimo+traceback"
+
+
+class TestIsCodeModeRequest:
+    def test_no_request_context(self) -> None:
+        assert is_code_mode_request() is False
+
+    def test_execute_endpoint(self) -> None:
+        req = HTTPRequest(
+            url={"path": "/api/kernel/execute"},
+            base_url={},
+            headers={},
+            query_params={},
+            path_params={},
+            cookies={},
+            meta={},
+            user=None,
+        )
+        token = HTTP_REQUEST_CTX.set(req)
+        try:
+            assert is_code_mode_request() is True
+        finally:
+            HTTP_REQUEST_CTX.reset(token)
+
+    def test_run_endpoint(self) -> None:
+        req = HTTPRequest(
+            url={"path": "/api/kernel/run"},
+            base_url={},
+            headers={},
+            query_params={},
+            path_params={},
+            cookies={},
+            meta={},
+            user=None,
+        )
+        token = HTTP_REQUEST_CTX.set(req)
+        try:
+            assert is_code_mode_request() is False
+        finally:
+            HTTP_REQUEST_CTX.reset(token)
+
+    def test_empty_url(self) -> None:
+        req = HTTPRequest(
+            url={},
+            base_url={},
+            headers={},
+            query_params={},
+            path_params={},
+            cookies={},
+            meta={},
+            user=None,
+        )
+        token = HTTP_REQUEST_CTX.set(req)
+        try:
+            assert is_code_mode_request() is False
+        finally:
+            HTTP_REQUEST_CTX.reset(token)
 
     def test_trim(self) -> None:
         prefix = "Traceback (most recent call last):\n"

@@ -13,6 +13,7 @@ export const DATA_TYPES = [
   "time",
   "unknown",
 ] as const;
+export type ModelLifecycle = NotificationMessageData<"model-lifecycle">;
 export type Banner = NotificationMessageData<"banner">;
 export type AiInlineCompletionRequest = schemas["AiInlineCompletionRequest"];
 export type DataTableColumn = schemas["DataTableColumn"];
@@ -40,6 +41,8 @@ export type DataColumnPreview = NotificationMessageData<"data-column-preview">;
 export type SQLTablePreview = NotificationMessageData<"sql-table-preview">;
 export type SQLTableListPreview =
   NotificationMessageData<"sql-table-list-preview">;
+export type SQLSchemaListPreview =
+  NotificationMessageData<"sql-schema-list-preview">;
 export type ValidateSQLResult = NotificationMessageData<"validate-sql-result">;
 export type SecretKeysResult = NotificationMessageData<"secret-keys-result">;
 export type StartupLogs = NotificationMessageData<"startup-logs">;

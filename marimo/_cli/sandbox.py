@@ -11,11 +11,12 @@ import sys
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
 import click
 
 from marimo import _loggers
+from marimo._cli.errors import MarimoCLIMissingDependencyError
 from marimo._cli.print import bold, echo, green, muted
 from marimo._config.settings import GLOBAL_SETTINGS
 from marimo._dependencies.dependencies import DependencyManager
@@ -181,6 +182,24 @@ def _normalize_sandbox_dependencies(
     return filtered + [include_features(chosen, additional_features)]
 
 
+def _resolve_local_path_line(line: str, script_dir: Path) -> str:
+    """Resolve a relative local-path requirement to an absolute path.
+
+    >>> _resolve_local_path_line(
+    ...     "-e ../pkg ; py<'3.12' # via foo", Path("/a/b")
+    ... )
+    '-e /a/pkg ; py<\\'3.12\\' # via foo'
+    """
+    rest = line.removeprefix("-e ")
+    path_and_comment, _, _ = rest.partition(";")
+    path_token, _, _ = path_and_comment.partition(" #")
+    path_token = path_token.rstrip()
+    if not path_token.startswith("."):
+        return line
+    resolved = str((script_dir / path_token).resolve())
+    return line.replace(path_token, resolved, 1)
+
+
 def _uv_export_script_requirements_txt(
     name: str | None,
 ) -> list[str]:
@@ -201,7 +220,11 @@ def _uv_export_script_requirements_txt(
         capture_output=True,
         text=True,
     )
-    return result.stdout.split("\n")
+    script_dir = Path(name).resolve().parent
+    return [
+        _resolve_local_path_line(line, script_dir)
+        for line in result.stdout.split("\n")
+    ]
 
 
 def _resolve_requirements_txt_lines(pyproject: PyProjectReader) -> list[str]:
@@ -222,6 +245,7 @@ def construct_uv_flags(
     temp_file: "tempfile._TemporaryFileWrapper[str]",  # noqa: UP037
     additional_features: list[DepFeatures],
     additional_deps: list[str],
+    python_version_override: str | None = None,
 ) -> list[str]:
     # NB. Used in quarto plugin
 
@@ -260,11 +284,15 @@ def construct_uv_flags(
     if uv_needs_refresh:
         uv_flags.append("--refresh")
 
-    # We use the specified Python version (if any), otherwise
-    # the current Python version
-    python_version = pyproject.python_version
-    if python_version:
-        uv_flags.extend(["--python", python_version])
+    # Python version: explicit override > script metadata > current interpreter.
+    # The override deliberately wins over the script's `requires-python` —
+    # `html-wasm --execute` needs the sandbox interpreter to match Pyodide
+    # (3.12), even if the script declares something else. Any resulting
+    # desync from the script's stated requirement is by design.
+    if python_version_override:
+        uv_flags.extend(["--python", python_version_override])
+    elif pyproject.python_version:
+        uv_flags.extend(["--python", pyproject.python_version])
     else:
         uv_flags.extend(["--python", platform.python_version()])
 
@@ -291,6 +319,7 @@ def construct_uv_command(
     name: str | None,
     additional_features: list[DepFeatures],
     additional_deps: list[str],
+    python_version_override: str | None = None,
 ) -> list[str]:
     cmd = ["marimo"] + args
     if "--sandbox" in cmd:
@@ -309,7 +338,11 @@ def construct_uv_command(
         temp_file_path = temp_file.name
         uv_cmd.extend(
             construct_uv_flags(
-                pyproject, temp_file, additional_features, additional_deps
+                pyproject,
+                temp_file,
+                additional_features,
+                additional_deps,
+                python_version_override=python_version_override,
             )
         )
     # Clean up the temporary file after the subprocess has run
@@ -320,35 +353,87 @@ def construct_uv_command(
     return uv_cmd + cmd
 
 
-def _ensure_marimo_in_script_metadata(name: str | None) -> None:
-    """Ensure marimo is in the script metadata if metadata exists.
+def _ensure_python_version_in_script_metadata(name: str) -> None:
+    """Add requires-python to script metadata if not present.
 
-    If the file has PEP 723 script metadata but marimo is not listed
-    as a dependency, add it using uv.
+    Inserts a requires-python line directly into the existing PEP 723
+    metadata block without re-serializing, to avoid reformatting diffs.
     """
+    import re
 
+    from marimo._utils.scripts import read_pyproject_from_script
+
+    with open(name, encoding="utf-8") as f:
+        content = f.read()
+
+    project = read_pyproject_from_script(content)
+    if project is None:
+        # No script metadata exists
+        return
+
+    if "requires-python" in project:
+        return
+
+    version_tuple = platform.python_version_tuple()
+    requires_line = (
+        f'# requires-python = ">={version_tuple[0]}.{version_tuple[1]}"\n'
+    )
+
+    # Insert directly after the opening "# /// script" marker to avoid
+    # re-serializing the entire block and causing formatting churn.
+    new_content = re.sub(
+        r"^# /// script$",
+        "# /// script\n" + requires_line.rstrip(),
+        content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    if new_content != content:
+        with open(name, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+
+def _ensure_marimo_in_script_metadata(name: str | None) -> None:
+    """Ensure marimo is in the script metadata.
+
+    If the file has no PEP 723 script metadata or marimo is not listed
+    as a dependency, add marimo using uv.
+    """
     # Only applicable to `.py` files.
     if name is None or not name.endswith(".py"):
+        return
+
+    # If the file doesn't exist or is empty, don't create it here - let marimo
+    # create the notebook normally with proper structure
+    if not os.path.exists(name) or os.path.getsize(name) == 0:
         return
 
     # Check if script metadata exists and whether marimo is present
     # Returns: True (has marimo), False (no marimo), None (no metadata)
     has_marimo = has_marimo_in_script_metadata(name)
-    if has_marimo is not False:
-        # Either marimo is present (True) or no metadata exists (None)
+    if has_marimo is True:
+        # marimo is already present
         return
 
     # Add marimo to script metadata using uv
+    # This will create the script metadata block if it doesn't exist
     try:
         result = subprocess.run(
             [find_uv_bin(), "add", "--script", name, "marimo"],
             check=True,
             capture_output=True,
             text=True,
+            # stdin=DEVNULL prevents hanging on Windows when uv might
+            # wait for input
+            stdin=subprocess.DEVNULL,
+            timeout=30,
         )
         LOGGER.info(f"Added marimo to script metadata: {result.stdout}")
     except subprocess.CalledProcessError as e:
         LOGGER.warning(f"Failed to add marimo to script metadata: {e.stderr}")
+    except subprocess.TimeoutExpired:
+        LOGGER.warning("Timed out adding marimo to script metadata")
     except Exception as e:
         LOGGER.warning(f"Failed to add marimo to script metadata: {e}")
 
@@ -356,9 +441,12 @@ def _ensure_marimo_in_script_metadata(name: str | None) -> None:
 def run_in_sandbox(
     args: list[str],
     *,
-    name: Optional[str] = None,
-    additional_features: Optional[list[DepFeatures]] = None,
-    additional_deps: Optional[list[str]] = None,
+    name: str | None = None,
+    additional_features: list[DepFeatures] | None = None,
+    additional_deps: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    python_version_override: str | None = None,
+    pyodide_constraints: bool = False,
 ) -> int:
     """Run marimo in a sandboxed uv environment.
 
@@ -371,35 +459,84 @@ def run_in_sandbox(
     """
     # If we fall back to the plain "uv" path, ensure it's actually on the system
     if find_uv_bin() == "uv" and not DependencyManager.which("uv"):
-        raise click.UsageError("uv must be installed to use --sandbox")
+        raise MarimoCLIMissingDependencyError(
+            "uv must be installed to use --sandbox.",
+            "uv",
+            additional_tip="Install uv from https://github.com/astral-sh/uv",
+        )
 
-    # Ensure marimo is in the script metadata before running
+    # Ensure marimo and python version are in the script metadata before running
     _ensure_marimo_in_script_metadata(name)
+    if name is not None and name.endswith(".py"):
+        _ensure_python_version_in_script_metadata(name)
 
     uv_cmd = construct_uv_command(
-        args, name, additional_features or [], additional_deps or []
+        args,
+        name,
+        additional_features or [],
+        additional_deps or [],
+        python_version_override=python_version_override,
     )
 
     echo(f"Running in a sandbox: {muted(' '.join(uv_cmd))}", err=True)
 
     env = os.environ.copy()
     env["MARIMO_MANAGE_SCRIPT_METADATA"] = "true"
+    # Let the inner marimo server poll for our PID so it can shut down if we
+    # get SIGKILLed (signal handlers below can't catch uncatchable signals).
+    env["MARIMO_ANCESTOR_PID"] = str(os.getpid())
+    if extra_env:
+        env.update(extra_env)
 
-    process = subprocess.Popen(uv_cmd, env=env)
+    if pyodide_constraints:
+        from marimo._pyodide.pyodide_constraints import (
+            write_constraint_file,
+        )
+
+        constraint_tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            suffix="-pyodide-constraints.txt",
+            encoding="utf-8",
+        )
+        constraint_tmp.close()
+        constraint_path = constraint_tmp.name
+        if write_constraint_file(constraint_path):
+            env["UV_CONSTRAINT"] = constraint_path
+
+        def cleanup_constraint_file() -> None:
+            try:
+                os.unlink(constraint_path)
+            except FileNotFoundError:
+                pass
+
+        atexit.register(cleanup_constraint_file)
+
+    # On Unix, run `uv` in its own session so that (a) the tty no longer
+    # delivers SIGINT/SIGTERM to it directly and (b) we can signal the whole
+    # subtree with a single killpg. The signal handlers below are then the
+    # sole path for forwarding signals from the CLI down to uv, the inner
+    # marimo server, and the kernel.
+    if sys.platform == "win32":
+        process = subprocess.Popen(uv_cmd, env=env)
+    else:
+        process = subprocess.Popen(uv_cmd, env=env, start_new_session=True)
 
     def handler(sig: int, frame: object) -> None:
-        del sig
         del frame
         try:
             if sys.platform == "win32":
                 os.kill(process.pid, signal.CTRL_C_EVENT)
             else:
-                os.kill(process.pid, signal.SIGINT)
+                os.killpg(process.pid, sig)
         except ProcessLookupError:
             # Process may have already been terminated.
             pass
 
     signal.signal(signal.SIGINT, handler)
+    if sys.platform != "win32":
+        signal.signal(signal.SIGTERM, handler)
+        signal.signal(signal.SIGHUP, handler)
 
     return process.wait()
 

@@ -5,7 +5,7 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from marimo._ast.app import AppKernelRunnerRegistry
 from marimo._cli.parse_args import args_from_argv
@@ -77,7 +77,7 @@ class ScriptRuntimeContext(RuntimeContext):
         return self._cached_config
 
     @property
-    def cell_id(self) -> Optional[CellId_t]:
+    def cell_id(self) -> CellId_t | None:
         """Get the cell id of the currently executing cell, if any."""
         if self.execution_context is not None:
             return self.execution_context.cell_id
@@ -150,6 +150,7 @@ def initialize_script_context(
         InMemoryStorage,
         VirtualFileRegistry,
     )
+    from marimo._save.cache import CacheState
     from marimo._save.stores import get_store
 
     runtime_context = ScriptRuntimeContext(
@@ -157,7 +158,7 @@ def initialize_script_context(
         ui_element_registry=UIElementRegistry(),
         state_registry=StateRegistry(),
         function_registry=FunctionRegistry(),
-        cache_store=get_store(filename),
+        cache=CacheState(store=get_store(filename)),
         cell_lifecycle_registry=CellLifecycleRegistry(),
         app_kernel_runner_registry=AppKernelRunnerRegistry(),
         virtual_file_registry=VirtualFileRegistry(storage=InMemoryStorage()),

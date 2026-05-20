@@ -11,7 +11,8 @@ import os
 import signal
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Optional, Union, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from marimo import _loggers
 from marimo._cli.sandbox import (
@@ -32,8 +33,9 @@ from marimo._session._venv import (
     install_marimo_into_venv,
 )
 from marimo._session.model import SessionMode
-from marimo._session.queue import ProcessLike, QueueType
+from marimo._session.queue import ProcessLike, QueueType, route_control_request
 from marimo._session.types import KernelManager, QueueManager
+from marimo._utils.subprocess import try_kill_process_and_group
 from marimo._utils.typed_connection import TypedConnection
 
 if TYPE_CHECKING:
@@ -80,7 +82,7 @@ class IPCQueueManagerImpl(QueueManager):
     @property
     def set_ui_element_queue(  # type: ignore[override]
         self,
-    ) -> QueueType[commands.UpdateUIElementCommand]:
+    ) -> QueueType[commands.BatchableCommand]:
         return self._ipc.set_ui_element_queue
 
     @property
@@ -98,34 +100,77 @@ class IPCQueueManagerImpl(QueueManager):
     @property
     def stream_queue(  # type: ignore[override]
         self,
-    ) -> QueueType[Union[KernelMessage, None]]:
+    ) -> QueueType[KernelMessage | None]:
         return cast(
-            QueueType[Union[KernelMessage, None]],
+            QueueType[KernelMessage | None],
             self._ipc.stream_queue,
         )
 
     @property
     def win32_interrupt_queue(  # type: ignore[override]
         self,
-    ) -> Optional[QueueType[bool]]:
+    ) -> QueueType[bool] | None:
         return self._ipc.win32_interrupt_queue
 
     def close_queues(self) -> None:
         self._ipc.close_queues()
 
     def put_control_request(self, request: commands.CommandMessage) -> None:
-        # Completions are on their own queue
-        if isinstance(request, commands.CodeCompletionCommand):
-            self.completion_queue.put(request)
-            return
-
-        self.control_queue.put(request)
-        # Update UI elements are on both queues so they can be batched
-        if isinstance(request, commands.UpdateUIElementCommand):
-            self.set_ui_element_queue.put(request)
+        route_control_request(
+            request,
+            self.control_queue,
+            self.completion_queue,
+            self.set_ui_element_queue,
+        )
 
     def put_input(self, text: str) -> None:
         self.input_queue.put(text)
+
+
+def construct_kernel_env(
+    base_env: dict[str, str],
+    venv_python: str,
+    *,
+    is_ephemeral_sandbox: bool,
+    writable: bool,
+    kernel_pythonpath: str | None = None,
+) -> dict[str, str]:
+    """Build environment variables for a kernel subprocess.
+
+    Args:
+        base_env: Starting environment (typically ``os.environ.copy()``).
+        venv_python: Path to the Python executable in the target venv.
+        is_ephemeral_sandbox: Whether this is an ephemeral sandbox venv
+            built by ``build_sandbox_venv``.
+        writable: Whether the kernel venv supports package installs.
+        kernel_pythonpath: Extra PYTHONPATH entries for read-only
+            configured venvs that don't have marimo installed.
+
+    Returns:
+        A **new** dict with the appropriate overrides applied.
+    """
+    env = dict(base_env)
+
+    if kernel_pythonpath is not None:
+        existing = env.get("PYTHONPATH", "")
+        if existing:
+            env["PYTHONPATH"] = f"{kernel_pythonpath}{os.pathsep}{existing}"
+        else:
+            env["PYTHONPATH"] = kernel_pythonpath
+
+    if is_ephemeral_sandbox:
+        # Override UV env vars so the kernel subprocess sees the sandbox
+        # venv as its environment, not the outer uv project.
+        env["VIRTUAL_ENV"] = str(Path(venv_python).parent.parent)
+        env.pop("UV_PROJECT_ENVIRONMENT", None)
+
+    if writable:
+        # Setting this attempts to make auto-installations work even if
+        # other normally detected criteria are not true.
+        # IPC by itself does not seem to trigger them.
+        env["MARIMO_MANAGE_SCRIPT_METADATA"] = "true"
+
+    return env
 
 
 class IPCKernelManagerImpl(KernelManager):
@@ -144,7 +189,6 @@ class IPCKernelManagerImpl(KernelManager):
         configs: dict[CellId_t, CellConfig],
         app_metadata: AppMetadata,
         config_manager: MarimoConfigReader,
-        virtual_files_supported: bool = True,
         redirect_console_to_browser: bool = True,
     ) -> None:
         self.queue_manager = queue_manager
@@ -153,12 +197,12 @@ class IPCKernelManagerImpl(KernelManager):
         self.configs = configs
         self.app_metadata = app_metadata
         self.config_manager = config_manager
-        self.virtual_files_supported = virtual_files_supported
         self.redirect_console_to_browser = redirect_console_to_browser
 
         self._process: subprocess.Popen[bytes] | None = None
         self.kernel_task: ProcessLike | None = None
         self._sandbox_dir: str | None = None
+        self._venv_python: str | None = None
 
     def start_kernel(self) -> None:
         from marimo._cli.print import echo, muted
@@ -171,11 +215,10 @@ class IPCKernelManagerImpl(KernelManager):
             log_level=GLOBAL_SETTINGS.LOG_LEVEL,
             profile_path=None,
             connection_info=self.connection_info,
-            virtual_files_supported=self.virtual_files_supported,
+            is_run_mode=self.mode == SessionMode.RUN,
             redirect_console_to_browser=self.redirect_console_to_browser,
+            parent_pid=os.getpid(),
         )
-
-        env = os.environ.copy()
 
         venv_config = _get_venv_config(self.config_manager)
         try:
@@ -188,6 +231,8 @@ class IPCKernelManagerImpl(KernelManager):
         # Ephemeral sandboxes are always writable; configured venvs respect the
         # flag.
         writable = True
+        is_ephemeral_sandbox = False
+        kernel_pythonpath: str | None = None
 
         # An explicitly configured venv takes precedence over an ephemeral
         # sandbox.
@@ -231,18 +276,14 @@ class IPCKernelManagerImpl(KernelManager):
                 # Inject PYTHONPATH for marimo and dependencies from the
                 # current runtime as a last chance effort to expose marimo
                 # to the kernel.
-                kernel_path = get_kernel_pythonpath()
-                existing = env.get("PYTHONPATH", "")
-                if existing:
-                    env["PYTHONPATH"] = f"{kernel_path}{os.pathsep}{existing}"
-                else:
-                    env["PYTHONPATH"] = kernel_path
+                kernel_pythonpath = get_kernel_pythonpath()
         else:
             # Fall back to building ephemeral sandbox venv
             # with IPC dependencies.
             # NB. "Ephemeral" sandboxes (or rather tmp sandboxes built by uv)
             # are always writable, and as such install marimo as a default,
             # making them much easier than a configured venv we cannot manage.
+            is_ephemeral_sandbox = True
             try:
                 self._sandbox_dir, venv_python = build_sandbox_venv(
                     self.app_metadata.filename,
@@ -259,12 +300,18 @@ class IPCKernelManagerImpl(KernelManager):
                 err=True,
             )
 
+        # Store the venv python for package manager targeting
+        self._venv_python = venv_python
+
+        env = construct_kernel_env(
+            base_env=os.environ.copy(),
+            venv_python=venv_python,
+            is_ephemeral_sandbox=is_ephemeral_sandbox,
+            writable=writable,
+            kernel_pythonpath=kernel_pythonpath,
+        )
+
         cmd = [venv_python, "-m", "marimo._ipc.launch_kernel"]
-        if writable:
-            # Setting this attempts to make auto-installations work even if
-            # other normally detected criteria are not true.
-            # IPC by itself does not seem to trigger them.
-            env["MARIMO_MANAGE_SCRIPT_METADATA"] = "true"
 
         LOGGER.debug(f"Launching kernel: {' '.join(cmd)}")
 
@@ -321,6 +368,11 @@ class IPCKernelManagerImpl(KernelManager):
         # Profiling not currently supported with IPC kernel
         return None
 
+    @property
+    def venv_python(self) -> str | None:
+        """Python executable path for the kernel's venv."""
+        return self._venv_python
+
     def is_alive(self) -> bool:
         if self._process is None:
             return False
@@ -345,14 +397,13 @@ class IPCKernelManagerImpl(KernelManager):
                 commands.StopKernelCommand()
             )
             self.queue_manager.close_queues()
-
-            # Terminate process if still alive
-            if self._process.poll() is None:
-                self._process.terminate()
+            if self._process.poll() is None and self.kernel_task is not None:
                 try:
-                    self._process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
+                    try_kill_process_and_group(self.kernel_task)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    LOGGER.warning(e)
 
         # Always attempt cleanup, even if _process is None
         cleanup_sandbox_dir(self._sandbox_dir)
@@ -376,6 +427,11 @@ class _SubprocessWrapper(ProcessLike):
     def pid(self) -> int | None:
         return self._process.pid
 
+    @property
+    def exitcode(self) -> int | None:
+        """Mirror multiprocessing.Process.exitcode for exit diagnostics."""
+        return self._process.poll()
+
     def is_alive(self) -> bool:
         return self._process.poll() is None
 
@@ -385,5 +441,5 @@ class _SubprocessWrapper(ProcessLike):
     def kill(self) -> None:
         self._process.kill()
 
-    def join(self, timeout: Optional[float] = None) -> None:
+    def join(self, timeout: float | None = None) -> None:
         self._process.wait(timeout=timeout)

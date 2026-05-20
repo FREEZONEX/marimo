@@ -10,7 +10,7 @@
 
 import marimo
 
-__generated_with = "0.17.2"
+__generated_with = "0.23.6"
 app = marimo.App()
 
 
@@ -54,7 +54,7 @@ def _(mo):
     cells and edges represent data dependencies. marimo creates this graph by
     analyzing each cell (without running it) to determine its
 
-    - references ("refs*), the global variables it reads but doesn't define;
+    - references ("refs"), the global variables it reads but doesn't define;
     - definitions ("defs"), the global variables it defines.
 
     There is an edge from one cell to another if the latter cell references any
@@ -96,14 +96,12 @@ def _(mo):
 
 @app.cell
 def _(amplitude, mo, period, plot_wave):
-    mo.md(
-        f"""
-        {mo.as_html(plot_wave(amplitude, period))}
+    mo.md(f"""
+    {mo.as_html(plot_wave(amplitude, period))}
 
-        - `refs: {mo.refs()}`
-        - `defs: {mo.defs()}`
-        """
-    )
+    - `refs: {mo.refs()}`
+    - `defs: {mo.defs()}`
+    """)
     return
 
 
@@ -494,6 +492,7 @@ def _(mo):
 def _():
     import matplotlib.pyplot as plt
     import numpy as np
+
     return np, plt
 
 
@@ -602,6 +601,7 @@ def _():
 @app.cell
 def _():
     import marimo as mo
+
     return (mo,)
 
 

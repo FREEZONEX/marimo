@@ -6,6 +6,7 @@ import importlib.util
 import shutil
 import sys
 from dataclasses import dataclass
+from typing import Literal
 
 from marimo._dependencies.errors import ManyModulesNotFoundError
 
@@ -234,24 +235,31 @@ class DependencyManager:
     pylsp = Dependency("pylsp")
     basedpyright = Dependency("basedpyright")
     ty = Dependency("ty")
+    pyrefly = Dependency("pyrefly")
     pytest = Dependency("pytest")
     vegafusion = Dependency("vegafusion")
     vl_convert_python = Dependency("vl_convert")
-    dotenv = Dependency("dotenv")
     docstring_to_markdown = Dependency(
         "docstring_to_markdown", min_version="0.17.0"
     )
     tomlkit = Dependency("tomlkit")
     loro = Dependency("loro")
     boto3 = Dependency("boto3")
-    litellm = Dependency("litellm")
+
     redshift_connector = Dependency("redshift_connector")
+    starrocks = Dependency("starrocks")
     mcp = Dependency("mcp")
     pydantic_ai = Dependency(
         "pydantic_ai", pkg_name_to_install="pydantic-ai-slim"
     )
     pydantic = Dependency("pydantic")
     zmq = Dependency("zmq")  # pyzmq for sandbox IPC kernels
+    torch = Dependency("torch")
+    weave = Dependency("weave")
+    # Storage
+    obstore = Dependency("obstore")
+    fsspec = Dependency("fsspec")
+    cloudpathlib = Dependency("cloudpathlib")
 
     # Version requirements to properly support the new superfences introduced in
     # pymdown#2470
@@ -278,7 +286,11 @@ class DependencyManager:
         return shutil.which(pkg) is not None
 
     @staticmethod
-    def require_many(why: str, *dependencies: Dependency) -> None:
+    def require_many(
+        why: str,
+        *dependencies: Dependency,
+        source: Literal["kernel", "server"],
+    ) -> None:
         missing = [
             dep.pkg_name_to_install
             for dep in dependencies
@@ -288,4 +300,5 @@ class DependencyManager:
             raise ManyModulesNotFoundError(
                 missing,
                 f"The following packages are required {why}: {', '.join(missing)}",
+                source=source,
             )

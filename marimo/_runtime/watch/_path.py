@@ -4,8 +4,9 @@ from __future__ import annotations
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
+from marimo import _loggers
 from marimo._runtime.context import (
     ContextNotInitializedError,
     get_context,
@@ -14,6 +15,12 @@ from marimo._runtime.context import (
 from marimo._runtime.side_effect import SideEffect
 from marimo._runtime.state import State
 from marimo._runtime.threads import Thread
+from marimo._utils.platform import is_pyodide
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+LOGGER = _loggers.marimo_logger()
 
 if sys.version_info >= (3, 11):
     from typing import Self
@@ -37,7 +44,12 @@ def write_side_effect(data: str | bytes) -> None:
 
 
 class PathState(State[Path]):
-    """Base class for path state."""
+    """Base class for reactive path watchers.
+
+    Args:
+        path: The filesystem path to watch for changes.
+        allow_self_loops: Whether to allow self-referential reactivity.
+    """
 
     _forbidden_attributes: set[str]
     _target: Callable[[Path, Self, threading.Event], None]
@@ -71,11 +83,21 @@ class PathState(State[Path]):
         # Only bother with the watcher if the context is installed
         # State is not enabled in script mode
         if runtime_context_installed():
-            Thread(
-                target=self._target,
-                args=(path, self, self._should_exit),
-                daemon=True,
-            ).start()
+            # File watching with threads is not supported in Pyodide/WASM
+            # The file can still be read/written, but won't trigger reactive
+            # updates when changed externally
+            if is_pyodide():
+                LOGGER.warning(
+                    "Reactive file watching is not supported in "
+                    "Pyodide/WebAssembly. The file can still be read/written, "
+                    "but external changes won't trigger reactive updates."
+                )
+            else:
+                Thread(
+                    target=self._target,
+                    args=(path, self, self._should_exit),
+                    daemon=True,
+                ).start()
 
     def __getattr__(self, name: str) -> Any:
         """Get an attribute from the file path."""
@@ -96,6 +118,12 @@ class PathState(State[Path]):
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self._value})"
+
+    def __fspath__(self) -> str:
+        return self._value.__fspath__()
+
+    def __str__(self) -> str:
+        return str(self._value)
 
     def exists(self) -> bool:
         """Check if the path exists."""

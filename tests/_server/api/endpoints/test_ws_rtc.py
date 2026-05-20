@@ -2,83 +2,26 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from marimo._config.manager import UserConfigManager
-from marimo._messaging.msgspec_encoder import asdict
-from marimo._messaging.notification import (
-    KernelCapabilitiesNotification,
-    KernelReadyNotification,
-)
 from marimo._server.api.endpoints.ws_endpoint import DOC_MANAGER
-from marimo._utils.parse_dataclass import parse_raw
-from tests._server.conftest import get_session_manager, get_user_config_manager
-from tests._server.mocks import token_header
+from marimo._server.workspace import serialize_file_key
+from tests._server.api.endpoints.ws_helpers import (
+    assert_kernel_ready_response,
+    assert_parse_ready_response,
+    create_response,
+)
+from tests._server.conftest import get_user_config_manager
+from tests._server.mocks import get_session_manager
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from starlette.testclient import TestClient
-
-
-def create_response(
-    partial_response: dict[str, Any],
-) -> dict[str, Any]:
-    response: dict[str, Any] = {
-        "cell_ids": ["Hbol"],
-        "codes": ["import marimo as mo"],
-        "names": ["__"],
-        "layout": None,
-        "resumed": False,
-        "ui_values": {},
-        "last_executed_code": {},
-        "last_execution_time": {},
-        "kiosk": False,
-        "configs": [{"disabled": False, "hide_code": False}],
-        "app_config": {"width": "full"},
-        "capabilities": asdict(KernelCapabilitiesNotification()),
-    }
-    response.update(partial_response)
-    return response
-
-
-def headers(session_id: str) -> dict[str, str]:
-    return {
-        "Marimo-Session-Id": session_id,
-        **token_header("fake-token"),
-    }
-
-
-HEADERS = {
-    **token_header("fake-token"),
-}
-
-
-def assert_kernel_ready_response(
-    raw_data: dict[str, Any], response: Optional[dict[str, Any]] = None
-) -> None:
-    if response is None:
-        response = create_response({})
-    data = parse_raw(raw_data["data"], KernelReadyNotification)
-    expected = parse_raw(response, KernelReadyNotification)
-    assert data.cell_ids == expected.cell_ids
-    assert data.codes == expected.codes
-    assert data.names == expected.names
-    assert data.layout == expected.layout
-    assert data.resumed == expected.resumed
-    assert data.ui_values == expected.ui_values
-    assert data.configs == expected.configs
-    assert data.app_config == expected.app_config
-    assert data.kiosk == expected.kiosk
-    assert data.capabilities == expected.capabilities
-
-
-def assert_parse_ready_response(raw_data: dict[str, Any]) -> None:
-    data = parse_raw(raw_data["data"], KernelReadyNotification)
-    assert data is not None
 
 
 @pytest.fixture  # type: ignore
@@ -163,7 +106,7 @@ async def test_loro_cleanup_on_session_close(
     doc = LoroDoc()
     initial_code = doc.export(ExportMode.Snapshot())
 
-    file_key = get_session_manager(client).file_router.get_unique_file_key()
+    file_key = get_session_manager(client).workspace.get_unique_file_key()
     assert file_key is not None
 
     with (
@@ -257,7 +200,7 @@ async def test_rtc_degrades_without_loro(client: TestClient) -> None:
     """
     from unittest.mock import patch
 
-    file_key = get_session_manager(client).file_router.get_unique_file_key()
+    file_key = get_session_manager(client).workspace.get_unique_file_key()
     assert file_key is not None
 
     # Clear any existing docs
@@ -295,10 +238,12 @@ async def test_rtc_degrades_without_loro(client: TestClient) -> None:
 )
 async def test_ws_sync_without_existing_session(client: TestClient) -> None:
     """Test that ws_sync endpoint requires an existing session."""
-    file_key = get_session_manager(client).file_router.get_unique_file_key()
+    file_key = get_session_manager(client).workspace.get_unique_file_key()
     assert file_key is not None
 
-    ws_sync_url = f"/ws_sync?file={file_key}&access_token=fake-token"
+    ws_sync_url = (
+        f"/ws_sync?file={serialize_file_key(file_key)}&access_token=fake-token"
+    )
 
     # Try to connect to ws_sync without creating a main session first
     with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -316,14 +261,16 @@ async def test_ws_sync_without_existing_session(client: TestClient) -> None:
 )
 async def test_ws_sync_cleanup_on_main_disconnect(client: TestClient) -> None:
     """Test that ws_sync clients are cleaned up when main session disconnects."""
-    file_key = get_session_manager(client).file_router.get_unique_file_key()
+    file_key = get_session_manager(client).workspace.get_unique_file_key()
     assert file_key is not None
 
     # Clear any existing docs
     DOC_MANAGER.loro_docs_clients.clear()
 
     ws_1 = "/ws?session_id=123&access_token=fake-token"
-    ws_sync_url = f"/ws_sync?file={file_key}&access_token=fake-token"
+    ws_sync_url = (
+        f"/ws_sync?file={serialize_file_key(file_key)}&access_token=fake-token"
+    )
 
     with rtc_enabled(get_user_config_manager(client)):
         with client.websocket_connect(ws_1) as main_websocket:

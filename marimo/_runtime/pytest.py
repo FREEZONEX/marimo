@@ -5,7 +5,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any
 
 from marimo._ast.cell import Cell
 from marimo._ast.pytest import MARIMO_TEST_STUB_NAME
@@ -19,6 +19,7 @@ MARIMO_TEST_BLOCK_REGEX = re.compile(rf"{MARIMO_TEST_STUB_NAME}_\d+[(?::)\.]+")
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     import _pytest.Item  # type: ignore
@@ -30,19 +31,35 @@ class MarimoPytestResult:
     failed: int = 0
     errors: int = 0
     skipped: int = 0
-    output: Optional[str] = None
+    xfailed: int = 0
+    xpassed: int = 0
+    output: str | None = None
 
     @property
     def total(self) -> int:
-        return self.skipped + self.passed + self.failed + self.errors
+        return (
+            self.passed
+            + self.failed
+            + self.errors
+            + self.skipped
+            + self.xfailed
+            + self.xpassed
+        )
 
     @property
     def summary(self) -> str:
-        return (
-            f"Total: {self.total}, Passed: {self.passed}, "
-            f"Failed: {self.failed}, Errors: {self.errors}, "
-            f"Skipped: {self.skipped}"
-        )
+        parts = [
+            f"Total: {self.total}",
+            f"Passed: {self.passed}",
+            f"Failed: {self.failed}",
+            f"Errors: {self.errors}",
+            f"Skipped: {self.skipped}",
+        ]
+        if self.xfailed:
+            parts.append(f"XFailed: {self.xfailed}")
+        if self.xpassed:
+            parts.append(f"XPassed: {self.xpassed}")
+        return ", ".join(parts)
 
 
 def _get_name(default: str = "notebook.py") -> str:
@@ -137,8 +154,8 @@ class ReplaceStubPlugin:
 
     def __init__(
         self,
-        defs: Optional[set[str]] = None,
-        lcls: Optional[dict[str, Any]] = None,
+        defs: set[str] | None = None,
+        lcls: dict[str, Any] | None = None,
     ) -> None:
         if lcls is None:
             lcls = globals()
@@ -258,8 +275,15 @@ class ReplaceStubPlugin:
         failed: int = len(stats.get("failed", []))
         skipped: int = len(stats.get("skipped", []))
         errors: int = len(stats.get("error", []))
+        xfailed: int = len(stats.get("xfailed", []))
+        xpassed: int = len(stats.get("xpassed", []))
         self._result = MarimoPytestResult(
-            passed=passed, failed=failed, errors=errors, skipped=skipped
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            skipped=skipped,
+            xfailed=xfailed,
+            xpassed=xpassed,
         )
 
         tr.write_line(self._result.summary)
@@ -352,6 +376,12 @@ def run_pytest(
                     "--disable-warnings",
                     "--color=yes",
                     "--code-highlight=no",
+                    "-p",
+                    "no:codecov",  # Disable codecov plugin to avoid duplicate reports
+                    "-p",
+                    "no:sugar",  # Disable sugar plugin to avoid duplicate reports
+                    "-p",
+                    "no:cacheprovider",  # Skip .pytest_cache I/O
                     notebook_path,
                 ],
                 plugins=[plugin],

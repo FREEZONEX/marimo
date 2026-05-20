@@ -11,6 +11,7 @@ export interface MissingPackageAlert {
   kind: "missing";
   packages: string[];
   isolated: boolean;
+  source?: "kernel" | "server";
 }
 
 export interface InstallingPackageAlert {
@@ -18,6 +19,7 @@ export interface InstallingPackageAlert {
   packages: PackageInstallationStatus;
   logs?: { [key: string]: string } | null;
   log_status?: "append" | "start" | "done" | null;
+  source?: "kernel" | "server";
 }
 
 export interface StartupLogsAlert {

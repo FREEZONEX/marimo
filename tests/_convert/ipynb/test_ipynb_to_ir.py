@@ -272,6 +272,29 @@ def test_transform_exclamation_mark():
     assert result.needs_subprocess is True
 
 
+def test_complex_exclamation_mark():
+    sources = [
+        """!uv pip install --upgrade \\
+            openpipe-art[backend,langgraph]==0.4.11 langchain-core langgraph langchain_openai tenacity datasets pillow==11.3.0 protobuf==5.29.5 {get_vllm} {get_numpy} --prerelease allow --no-cache-dir"""
+    ]
+    result = transform_exclamation_mark(sources)
+    # Packages are unpinned, normalized per PEP 503, and sorted
+    assert result.pip_packages == [
+        "datasets",
+        "langchain-core",
+        "langchain-openai",  # normalized from langchain_openai
+        "langgraph",
+        "openpipe-art",
+        "pillow",
+        "protobuf",
+        "tenacity",
+    ]
+    assert result.transformed_sources == [
+        "# packages added via marimo's package management: openpipe-art[backend,langgraph]==0.4.11 langchain-core langgraph langchain_openai tenacity datasets pillow==11.3.0 protobuf==5.29.5 !uv pip install --upgrade openpipe-art[backend,langgraph]==0.4.11 langchain-core langgraph langchain_openai tenacity datasets pillow==11.3.0 protobuf==5.29.5 {get_vllm} {get_numpy} --prerelease allow --no-cache-dir",
+    ]
+    assert result.needs_subprocess is False
+
+
 def test_transform_duplicate_definitions():
     sources = [
         "a = 1",
@@ -295,13 +318,13 @@ def test_transform_duplicate_definitions():
 def test_transform_remove_duplicate_imports():
     sources = [
         "import numpy as np\nimport pandas as pd\nimport numpy as np",
-        "from sklearn.model_selection import train_test_split\nfrom sklearn.model_selection import cross_val_score",  # noqa: E501
+        "from sklearn.model_selection import train_test_split\nfrom sklearn.model_selection import cross_val_score",
         "import matplotlib.pyplot as plt\nimport numpy as np",
     ]
     result = transform_remove_duplicate_imports(sources)
     assert result == [
         "import numpy as np\nimport pandas as pd",
-        "from sklearn.model_selection import train_test_split\nfrom sklearn.model_selection import cross_val_score",  # noqa: E501
+        "from sklearn.model_selection import train_test_split\nfrom sklearn.model_selection import cross_val_score",
         "import matplotlib.pyplot as plt",
     ]
 
@@ -369,12 +392,12 @@ def test_transform_magic_commands_complex():
     expected = [
         '_df = mo.sql("""\nSELECT *\nFROM table\nWHERE condition\n""")',
         (
-            "# magic command not supported in marimo; please file an issue to add support\n"  # noqa: E501
+            "# magic command not supported in marimo; please file an issue to add support\n"
             "# %%time\nfor i in range(1000000):\n"
             "    pass"
         ),
         (
-            "# magic command not supported in marimo; please file an issue to add support\n"  # noqa: E501
+            "# magic command not supported in marimo; please file an issue to add support\n"
             "# %load_ext autoreload\n"
             "# '%autoreload 2' command supported automatically in marimo"
         ),
@@ -404,15 +427,35 @@ def test_transform_exclamation_mark_complex():
 
 
 def test_transform_exclamation_mark_with_indentation():
+    # Indented pip installs get pass, non-pip commands use subprocess
     sources = [
         "if True:\n    !pip install numpy",
         "for i in range(10):\n    !echo test",
     ]
     result = transform_exclamation_mark(sources)
+    # Pip gets pass + package management, echo uses subprocess
     assert result.transformed_sources == [
-        "if True:\n    # packages added via marimo's package management: numpy !pip install numpy",
+        "if True:\n    pass  # packages added via marimo's package management: numpy !pip install numpy",
         "for i in range(10):\n    #! echo test\n    subprocess.call(['echo', 'test'])",
     ]
+    # Packages extracted even when indented
+    assert result.pip_packages == ["numpy"]
+    assert result.needs_subprocess is True
+
+
+def test_transform_exclamation_mark_indented_multiline():
+    """Test indented multi-line command with backslash continuation"""
+    sources = ["if something:\n    !echo 12\\\n      34"]
+    result = transform_exclamation_mark(sources)
+    # Should handle backslash continuation and preserve indentation
+    assert "subprocess.call" in result.transformed_sources[0]
+    assert "echo" in result.transformed_sources[0]
+    assert result.needs_subprocess is True
+    # Verify indentation is preserved for the subprocess call
+    assert "    subprocess.call" in result.transformed_sources[0]
+    # The command should have combined "12" and "34" after removing continuation
+    assert "12" in result.transformed_sources[0]
+    assert "34" in result.transformed_sources[0]
 
 
 def test_transform_exclamation_mark_preserves_comments():
@@ -514,6 +557,21 @@ def test_transform_exclamation_in_multiline_string():
     assert result.transformed_sources[0] == sources[0]
 
 
+def test_transform_exclamation_mark_pip_in_string():
+    """Ensure !pip install inside strings is NOT transformed"""
+    sources = [
+        '''"""
+!pip install numpy
+"""'''
+    ]
+    result = transform_exclamation_mark(sources)
+    # Should NOT be transformed - it's inside a string
+    assert result.transformed_sources[0] == sources[0]
+    # Should NOT extract packages from strings
+    assert result.pip_packages == []
+    assert result.needs_subprocess is False
+
+
 def test_transform_duplicate_definitions_complex():
     sources = [
         "x = 1 # comment unaffected",
@@ -534,29 +592,29 @@ def test_transform_duplicate_definitions_complex():
 
 def test_transform_remove_duplicate_imports_complex():
     sources = [
-        "import numpy as np\nfrom pandas import DataFrame\nimport matplotlib.pyplot as plt",  # noqa: E501
-        "from sklearn.model_selection import train_test_split, cross_val_score\nimport numpy as np",  # noqa: E501
-        "from pandas import Series\nfrom matplotlib import pyplot as plt\nimport pandas as pd",  # noqa: E501
+        "import numpy as np\nfrom pandas import DataFrame\nimport matplotlib.pyplot as plt",
+        "from sklearn.model_selection import train_test_split, cross_val_score\nimport numpy as np",
+        "from pandas import Series\nfrom matplotlib import pyplot as plt\nimport pandas as pd",
     ]
     result = transform_remove_duplicate_imports(sources)
     assert result == [
-        "import numpy as np\nfrom pandas import DataFrame\nimport matplotlib.pyplot as plt",  # noqa: E501
-        "from sklearn.model_selection import train_test_split, cross_val_score",  # noqa: E501
-        "from pandas import Series\nimport pandas as pd",  # noqa: E501
+        "import numpy as np\nfrom pandas import DataFrame\nimport matplotlib.pyplot as plt",
+        "from sklearn.model_selection import train_test_split, cross_val_score",
+        "from pandas import Series\nimport pandas as pd",
     ]
 
 
 def test_transform_fixup_multiple_definitions_with_classes():
     sources = [
-        "class MyClass:\n    x = 1\n    def method(self):\n        return self.x",  # noqa: E501
+        "class MyClass:\n    x = 1\n    def method(self):\n        return self.x",
         "x = 2\nprint(x)",
-        "class MyClass:\n    x = 3\n    def method(self):\n        return self.x",  # noqa: E501
+        "class MyClass:\n    x = 3\n    def method(self):\n        return self.x",
     ]
     result = transform_fixup_multiple_definitions(sources)
     assert result == [
-        "class _MyClass:\n    x = 1\n\n    def method(self):\n        return self.x",  # noqa: E501
+        "class _MyClass:\n    x = 1\n\n    def method(self):\n        return self.x",
         "x = 2\nprint(x)",
-        "class _MyClass:\n    x = 3\n\n    def method(self):\n        return self.x",  # noqa: E501
+        "class _MyClass:\n    x = 3\n\n    def method(self):\n        return self.x",
     ]
 
 
@@ -567,8 +625,8 @@ def test_transform_magic_commands_unsupported():
     ]
     result = transform_magic_commands(sources)
     assert result == [
-        "# magic command not supported in marimo; please file an issue to add support\n# %custom_magic arg1 arg2",  # noqa: E501
-        "# magic command not supported in marimo; please file an issue to add support\n# %%custom_cell_magic\n# some\n# content",  # noqa: E501
+        "# magic command not supported in marimo; please file an issue to add support\n# %custom_magic arg1 arg2",
+        "# magic command not supported in marimo; please file an issue to add support\n# %%custom_cell_magic\n# some\n# content",
     ]
 
 
@@ -578,13 +636,82 @@ def test_transform_exclamation_mark_with_variables():
     sources = [
         "package = 'numpy'\n!pip install {package}",
         "command = 'echo \"Hello, World!\"'\n!{command}",
+        "value = 42\n!echo {value}",
     ]
     result = transform_exclamation_mark(sources)
-    # These get transformed (the {var} syntax won't work in subprocess.call anyway)
+    # These get transformed (template variables become str() calls in subprocess)
     assert result.transformed_sources == [
         "package = 'numpy'\n# packages added via marimo's package management: {package} !pip install {package}",
-        "command = 'echo \"Hello, World!\"'\n#! {command}\nsubprocess.call(['{command}'])",
+        "command = 'echo \"Hello, World!\"'\n#! {command}\nsubprocess.call([str(command)])",
+        "value = 42\n#! echo {value}\nsubprocess.call(['echo', str(value)])",
     ]
+
+
+def test_transform_exclamation_mark_with_invalid_expressions():
+    # Test that invalid Python expressions in templates are caught
+    # Most syntax errors fail tokenization and remain unchanged
+    # But some pass tokenization and are caught by compilation check
+    sources = [
+        "!wget {1+*2}",  # Invalid operator sequence - caught by compilation check
+        "!echo {1/0}",  # Valid syntax but would fail at runtime - still converts
+    ]
+    result = transform_exclamation_mark(sources)
+    # First is invalid and gets pass (always for invalid commands)
+    # Second is valid Python syntax (runtime error is OK)
+    assert result.transformed_sources == [
+        "# Note: Command contains invalid template expression\n# !wget {1+*2}",
+        "#! echo {1/0}\nsubprocess.call(['echo', str(1/0)])",
+    ]
+    assert result.pip_packages == []
+    # Second command needs subprocess
+    assert result.needs_subprocess is True
+
+
+def test_transform_exclamation_mark_with_safe_templates():
+    # Test that safe template placeholders are converted to str() calls
+    sources = [
+        "!echo {value}",
+        "!ls {directory}",
+        "!cat {config[file]}",  # Note: shlex removes quotes, so use unquoted
+    ]
+    result = transform_exclamation_mark(sources)
+    # Safe templates are converted to str() calls
+    assert result.transformed_sources == [
+        "#! echo {value}\nsubprocess.call(['echo', str(value)])",
+        "#! ls {directory}\nsubprocess.call(['ls', str(directory)])",
+        "#! cat {config[file]}\nsubprocess.call(['cat', str(config[file])])",
+    ]
+    assert result.needs_subprocess is True
+
+
+def test_transform_exclamation_mark_indented_pip_install():
+    """Test that indented pip installs use package management with pass"""
+    sources = [
+        "if True:\n    !python -m uv pip install --upgrade weave\n\nprint('done')"
+    ]
+    result = transform_exclamation_mark(sources)
+    # Should use marimo's package management with pass
+    assert (
+        "pass  # packages added via marimo's package management"
+        in result.transformed_sources[0]
+    )
+    assert "weave" in result.transformed_sources[0]
+    assert result.pip_packages == ["weave"]  # Packages extracted
+    assert result.needs_subprocess is False
+
+
+def test_transform_exclamation_mark_indented_invalid_command():
+    """Test that indented invalid commands get pass statement"""
+    sources = ["if False:\n    !wget {1+*2}\n\nprint('done')"]
+    result = transform_exclamation_mark(sources)
+    # Invalid expression in indented context gets pass statement
+    assert "pass  # !wget {1+*2}" in result.transformed_sources[0]
+    assert (
+        "Note: Command contains invalid template expression"
+        in result.transformed_sources[0]
+    )
+    assert result.pip_packages == []
+    assert result.needs_subprocess is False
 
 
 def test_transform_duplicate_definitions_with_comprehensions():
@@ -1256,3 +1383,110 @@ def test_integration_mixed_packages_with_git_url():
     assert (
         '"package @ git+https://github.com/user/package.git"' in header_value
     )
+
+
+def test_transform_duplicate_definitions_with_star_import():
+    """Star imports should not crash the transform — cells are kept as-is."""
+    sources = dd(
+        [
+            "from os.path import *",
+            "x = 1",
+            "x = 2",
+        ]
+    )
+    result = transform_duplicate_definitions(sources)
+    # Should not raise — star import cell is preserved unchanged
+    assert result[0] == sources[0]
+    assert len(result) == 3
+
+
+def test_convert_from_ipynb_with_star_import():
+    """End-to-end: a notebook with star imports should convert successfully."""
+    notebook = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["from os.path import *"],
+                "metadata": {},
+            },
+            {
+                "cell_type": "code",
+                "source": ["x = join('a', 'b')"],
+                "metadata": {},
+            },
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 2,
+    }
+
+    result = convert_from_ipynb_to_notebook_ir(json.dumps(notebook))
+    assert len(result.cells) >= 1
+    # The star import cell should be present in the output
+    assert any("from os.path import *" in c.code for c in result.cells)
+
+
+def test_remove_input_tag_marks_hidden_and_does_not_leak_into_source():
+    """The `remove-input` nbconvert tag implies hide_code and is consumed."""
+    notebook = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["print('hidden')"],
+                "metadata": {"tags": ["remove-input"]},
+            },
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 2,
+    }
+
+    result = convert_from_ipynb_to_notebook_ir(json.dumps(notebook))
+    assert len(result.cells) == 1
+    cell = result.cells[0]
+    assert cell.options.get("hide_code") is True
+    # The tag must not be re-emitted as a `# Cell tags:` comment.
+    assert "remove-input" not in cell.code
+    assert "# Cell tags" not in cell.code
+
+
+def test_jupyter_source_hidden_marks_hidden():
+    """`metadata.jupyter.source_hidden` is recognized as a hide_code signal."""
+    notebook = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["print('hidden via jupyter meta')"],
+                "metadata": {"jupyter": {"source_hidden": True}},
+            },
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 2,
+    }
+
+    result = convert_from_ipynb_to_notebook_ir(json.dumps(notebook))
+    assert len(result.cells) == 1
+    assert result.cells[0].options.get("hide_code") is True
+
+
+def test_remove_input_alongside_other_tags_only_consumes_remove_input():
+    """Other tags must still be surfaced as a `# Cell tags:` comment."""
+    notebook = {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": ["print('hi')"],
+                "metadata": {"tags": ["remove-input", "extra-tag"]},
+            },
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 2,
+    }
+
+    result = convert_from_ipynb_to_notebook_ir(json.dumps(notebook))
+    cell = result.cells[0]
+    assert cell.options.get("hide_code") is True
+    assert "# Cell tags: extra-tag" in cell.code
+    assert "remove-input" not in cell.code

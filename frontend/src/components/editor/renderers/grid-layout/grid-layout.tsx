@@ -15,7 +15,6 @@ import type { GridLayout, GridLayoutCellSide } from "./types";
 import "react-grid-layout/css/styles.css";
 import "./styles.css";
 import { BorderAllIcon } from "@radix-ui/react-icons";
-import { startCase } from "lodash-es";
 import {
   AlignEndVerticalIcon,
   AlignHorizontalSpaceAroundIcon,
@@ -43,6 +42,7 @@ import { useIsDragging } from "@/hooks/useIsDragging";
 import { cn } from "@/utils/cn";
 import { Maps } from "@/utils/maps";
 import { Objects } from "@/utils/objects";
+import { Strings } from "@/utils/strings";
 
 type Props = ICellRendererProps<GridLayout>;
 
@@ -158,12 +158,19 @@ export const GridLayoutRenderer: React.FC<Props> = ({
       compactType={null}
       preventCollision={true}
       rowHeight={layout.rowHeight}
-      onLayoutChange={(cellLayouts) =>
+      onLayoutChange={(cellLayouts) => {
+        // Don't update state in read mode — the layout is static and
+        // updating triggers a re-render cycle that causes an infinite loop
+        // (React error https://react.dev/errors/185 Maximum update depth exceeded).
+        // https://github.com/marimo-team/marimo/issues/8644
+        if (isReading) {
+          return;
+        }
         setLayout({
           ...layout,
           cells: cellLayouts,
-        })
-      }
+        });
+      }}
       droppingItem={
         droppingItem
           ? {
@@ -322,7 +329,7 @@ export const GridLayoutRenderer: React.FC<Props> = ({
             <div
               key={cell.id}
               draggable={true}
-              // eslint-disable-next-line react/no-unknown-property
+              // oxlint-disable-next-line react/no-unknown-property
               unselectable="on"
               data-cell-id={cell.id}
               // Firefox requires some kind of initialization which we can do by adding this attribute
@@ -630,7 +637,7 @@ const GridHoverActions: React.FC<GridHoverActionsProps> = ({
           {Objects.entries(SIDE_TO_ICON).map(([option, Icon]) => (
             <DropdownMenuItem key={option} onSelect={() => setSide(option)}>
               <Icon className={"h-4 w-3 mr-2"} />
-              <span className="flex-1">{startCase(option)}</span>
+              <span className="flex-1">{Strings.startCase(option)}</span>
               {option === side && <CheckIcon className="h-4 w-4" />}
             </DropdownMenuItem>
           ))}

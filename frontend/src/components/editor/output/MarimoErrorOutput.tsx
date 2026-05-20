@@ -25,6 +25,7 @@ import { useChromeActions } from "../chrome/state";
 import { AutoFixButton } from "../errors/auto-fix";
 import { CellLinkError } from "../links/cell-link";
 import { processTextForUrls } from "./console/text-rendering";
+import { renderHTML } from "@/plugins/core/RenderHTML";
 
 const Tip = (props: {
   title?: string;
@@ -316,7 +317,7 @@ export const MarimoErrorOutput = ({
               <ul className="list-disc">
                 {error.cells.map((cid, cidIdx) => (
                   <li className={liStyle} key={`cell-${cidIdx}`}>
-                    <CellLinkError cellId={cid as CellId} />
+                    <CellLinkError cellId={cid} />
                   </li>
                 ))}
               </ul>
@@ -477,6 +478,7 @@ export const MarimoErrorOutput = ({
               );
             }
 
+            // All other exceptions
             return (
               <li className="my-2" key={`exception-${idx}`}>
                 {error.raising_cell == null ? (
@@ -484,14 +486,25 @@ export const MarimoErrorOutput = ({
                     <p className="text-muted-foreground">
                       {processTextForUrls(error.msg, `exception-${idx}`)}
                     </p>
-                    <div className="text-muted-foreground mt-2">
-                      See the console area for a traceback.
-                    </div>
+                    {"traceback" in error && error.traceback ? (
+                      <div className="font-code text-sm mt-2 p-3 bg-muted rounded border overflow-auto max-h-[50vh] cursor-text select-text">
+                        {renderHTML({ html: error.traceback })}
+                      </div>
+                    ) : (
+                      <div className="text-muted-foreground mt-2">
+                        See the console area for a traceback.
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div>
                     {processTextForUrls(error.msg, `exception-${idx}`)}
-                    <CellLinkError cellId={error.raising_cell as CellId} />
+                    <CellLinkError cellId={error.raising_cell} />
+                    {"traceback" in error && error.traceback && (
+                      <div className="font-code text-sm mt-2 p-3 bg-muted rounded border overflow-auto max-h-[50vh] cursor-text select-text">
+                        {renderHTML({ html: error.traceback })}
+                      </div>
+                    )}
                   </div>
                 )}
               </li>
@@ -518,7 +531,7 @@ export const MarimoErrorOutput = ({
               ) : (
                 <div>
                   {error.msg}
-                  <CellLinkError cellId={error.blamed_cell as CellId} />
+                  <CellLinkError cellId={error.blamed_cell} />
                 </div>
               )}
             </li>
@@ -554,13 +567,13 @@ export const MarimoErrorOutput = ({
               {error.msg}
               {error.blamed_cell == null ? (
                 <span>
-                  (<CellLinkError cellId={error.raising_cell as CellId} />)
+                  (<CellLinkError cellId={error.raising_cell} />)
                 </span>
               ) : (
                 <span>
-                  (<CellLinkError cellId={error.raising_cell as CellId} />
+                  (<CellLinkError cellId={error.raising_cell} />
                   &nbsp;blames&nbsp;
-                  <CellLinkError cellId={error.blamed_cell as CellId} />)
+                  <CellLinkError cellId={error.blamed_cell} />)
                 </span>
               )}
             </div>
@@ -578,7 +591,7 @@ export const MarimoErrorOutput = ({
           {ancestorStoppedErrors.map((error, idx) => (
             <div key={`ancestor-stopped-${idx}`}>
               {error.msg}
-              <CellLinkError cellId={error.raising_cell as CellId} />
+              <CellLinkError cellId={error.raising_cell} />
             </div>
           ))}
           {cellId && (

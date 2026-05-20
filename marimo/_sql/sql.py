@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Literal, Optional, cast
+from typing import Any, Literal, cast
 
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._output.rich_help import mddoc
@@ -22,7 +22,7 @@ from marimo._types.ids import VariableName
 from marimo._utils.narwhals_utils import can_narwhalify_lazyframe
 
 
-def get_default_result_limit() -> Optional[int]:
+def get_default_result_limit() -> int | None:
     limit = os.environ.get("MARIMO_SQL_DEFAULT_LIMIT")
     return int(limit) if limit is not None else None
 
@@ -32,7 +32,7 @@ def sql(
     query: str,
     *,
     output: bool = True,
-    engine: Optional[DBAPIConnection] = None,
+    engine: DBAPIConnection | None = None,
 ) -> Any:
     """
     Execute a SQL query.
@@ -65,6 +65,7 @@ def sql(
             "to execute sql",
             DependencyManager.duckdb,
             DependencyManager.sqlglot,
+            source="kernel",
         )
         sql_engine = DuckDBEngine(connection=None)
     else:
@@ -76,7 +77,7 @@ def sql(
                 break
         else:
             raise ValueError(
-                "Unsupported engine. Must be a SQLAlchemy, Ibis, Clickhouse, DuckDB, Redshift or DBAPI 2.0 compatible engine."
+                "Unsupported engine. Must be a SQLAlchemy, Ibis, Clickhouse, DuckDB, Redshift, StarRocks or DBAPI 2.0 compatible engine."
             )
 
     try:
@@ -107,7 +108,7 @@ def sql(
 
     enforce_own_limit = not has_limit and default_result_limit is not None
 
-    custom_total_count: Optional[Literal["too_many"]] = None
+    custom_total_count: Literal["too_many"] | None = None
     if enforce_own_limit:
         if DependencyManager.polars.has():
             custom_total_count = (
@@ -127,18 +128,23 @@ def sql(
             raise_df_import_error("polars[pyarrow]")
 
     if output:
+        from marimo._output.formatters.df_formatters import include_opinionated
+        from marimo._output.formatting import plain
         from marimo._plugins.stateless.plain_text import plain_text
         from marimo._plugins.ui._impl import table
 
         if isinstance(sql_engine, DuckDBEngine) and is_explain_query(query):
             # For EXPLAIN queries in DuckDB, display plain output to preserve box drawings
             text_output = extract_explain_content(df)
-            t = plain_text(text_output)
+            replace(plain_text(text_output))
+        elif not include_opinionated():
+            # Respect display.dataframes config - use plain formatting
+            replace(plain(df))
         elif can_narwhalify_lazyframe(df):
             # For pl.LazyFrame and DuckDBRelation, we only show the first few rows
             # to avoid loading all the data into memory.
             # Also preload the first page of data without user confirmation.
-            t = table.table.lazy(df, preload=True)
+            replace(table.table.lazy(df, preload=True))
         else:
             # df may be a cursor result from an SQL Engine
             # In this case, we need to convert it to a DataFrame
@@ -148,13 +154,14 @@ def sql(
             elif DBAPIEngine.is_dbapi_cursor(df):
                 display_df = DBAPIEngine.get_cursor_metadata(df)
 
-            t = table.table(
-                display_df,
-                selection=None,
-                pagination=True,
-                _internal_total_rows=custom_total_count,
+            replace(
+                table.table(
+                    display_df,
+                    selection=None,
+                    pagination=True,
+                    _internal_total_rows=custom_total_count,
+                )
             )
-        replace(t)
     return df
 
 

@@ -8,7 +8,7 @@ import re
 import sys
 import textwrap
 import tokenize
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal
 
 from marimo import _loggers
 from marimo._ast.app_config import _AppConfig
@@ -22,6 +22,7 @@ from marimo._ast.visitor import Name, VariableData
 from marimo._convert.converters import MarimoConvert
 from marimo._schemas.serialization import NotebookSerializationV1
 from marimo._types.ids import CellId_t
+from marimo._utils.marimo_path import MarimoPath
 from marimo._version import __version__
 
 if TYPE_CHECKING:
@@ -48,7 +49,7 @@ def pop_setup_cell(
     code: list[str],
     names: list[str],
     configs: list[CellConfig],
-) -> Optional[CellImpl]:
+) -> CellImpl | None:
     # Find the cell named setup, compile, and remove the index from all lists.
     if SETUP_CELL_NAME not in names:
         return None
@@ -122,8 +123,35 @@ def format_tuple_elements(
     return maybe_indent(code.replace("(...)", multiline_tuple))
 
 
+def _needs_trailing_blank_line(mod: ast.Module, code: str) -> bool:
+    """Check if AST ends with a statement requiring a blank line after.
+
+    Ruff formatter adds a blank line after imports, function defs, and class defs.
+    Only adds blank line if the statement is truly the last content (no trailing
+    comments).
+    """
+    if not mod.body:
+        return False
+    last_stmt = mod.body[-1]
+    if not isinstance(
+        last_stmt,
+        (
+            ast.Import,
+            ast.ImportFrom,
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+        ),
+    ):
+        return False
+    # Check if there's trailing content (like comments) after the last statement
+    # If so, don't add a blank line - the existing formatting should be preserved
+    code_lines = code.rstrip().count("\n") + 1
+    return last_stmt.end_lineno == code_lines
+
+
 def to_decorator(
-    config: Optional[CellConfig],
+    config: CellConfig | None,
     fn: Decorators = "cell",
 ) -> str:
     if config is None or not config.is_different_from_default():
@@ -150,7 +178,7 @@ def format_markdown(cell: CellImpl) -> str:
         "prefix": "",
         "suffix": "",
     }
-    key: Optional[str] = "prefix"
+    key: str | None = "prefix"
     tokenizes_fstring = sys.version_info >= (3, 12)
     start_tokens = (
         (tokenize.STRING, tokenize.FSTRING_START)
@@ -197,7 +225,7 @@ def construct_markdown_call(markdown: str, quote: str, tag: str) -> str:
     )
 
 
-def build_setup_section(setup_cell: Optional[CellImpl]) -> str:
+def build_setup_section(setup_cell: CellImpl | None) -> str:
     if setup_cell is None:
         return ""
     block = setup_cell.code
@@ -238,7 +266,7 @@ def to_annotated_string(
     if not variable_data:
         return response
     for name in names:
-        if name in variable_data and variable_data[name]:
+        if variable_data.get(name):
             variable = variable_data[name]
             annotation = variable.annotation_data
             if annotation:
@@ -254,10 +282,10 @@ def to_annotated_string(
 def to_functiondef(
     cell: CellImpl,
     name: str,
-    allowed_refs: Optional[set[Name]] = None,
-    used_refs: Optional[set[Name]] = None,
+    allowed_refs: set[Name] | None = None,
+    used_refs: set[Name] | None = None,
     fn: Literal["cell"] = "cell",
-    variable_data: Optional[dict[str, VariableData]] = None,
+    variable_data: dict[str, VariableData] | None = None,
 ) -> str:
     # allowed refs are a combination of top level imports and unshadowed
     # builtins.
@@ -268,7 +296,7 @@ def to_functiondef(
     if allowed_refs is None:
         allowed_refs = BUILTINS
 
-    refs: tuple[str, ...] = tuple()
+    refs: tuple[str, ...] = ()
     sorted_refs = sorted(cell.refs)
     for ref in sorted_refs:
         if ref not in allowed_refs:
@@ -295,7 +323,7 @@ def to_functiondef(
     # external call. We collect them such that we can determine if a variable
     # def is actually ever used. This is a nice little trick such that mypy and
     # other static analysis tools can capture unused variables across cells.
-    defs: tuple[str, ...] = tuple()
+    defs: tuple[str, ...] = ()
     if cell.defs:
         # SQL defs should not be included in the return value.
         sql_defs = (
@@ -335,12 +363,16 @@ def to_functiondef(
         # maybe consider "return Edges(...)"
         # Such that the return type can simply be 'Edges'
     )
+    # Add blank line before return for ruff compatibility when last statement
+    # is an import, function def, or class def
+    if _needs_trailing_blank_line(cell.mod, cell.code):
+        definition_body.append("")
     definition_body.append(returns)
     return "\n".join(definition_body)
 
 
 def to_top_functiondef(
-    cell: CellImpl, allowed_refs: Optional[set[str]] = None
+    cell: CellImpl, allowed_refs: set[str] | None = None
 ) -> str:
     # For the top-level function criteria to be satisfied,
     # the cell, it must pass basic checks in the cell impl.
@@ -357,12 +389,12 @@ def to_top_functiondef(
             decorator = to_decorator(cell.config, fn="class_definition")
         else:
             decorator = to_decorator(cell.config, fn="function")
-        return "\n".join([decorator, cell.code.strip()])
+        return f"{decorator}\n{cell.code.strip()}"
     return ""
 
 
 def generate_unparsable_cell(
-    code: str, name: Optional[str], config: CellConfig
+    code: str, name: str | None, config: CellConfig
 ) -> str:
     text = ["app._unparsable_cell("]
     # If code contains triple quotes, we can't use raw strings with delimiters
@@ -441,7 +473,7 @@ def safe_serialize_cell(
     return code
 
 
-def generate_app_constructor(config: Optional[_AppConfig]) -> str:
+def generate_app_constructor(config: _AppConfig | None) -> str:
     updates = {}
     # only include a config setting if it's not a default setting, to
     # avoid unnecessary edits to the app file
@@ -455,27 +487,67 @@ def generate_app_constructor(config: Optional[_AppConfig]) -> str:
 
 
 def generate_filecontents_from_ir(ir: NotebookSerializationV1) -> str:
+    # Markdown frontmatter may contain non-config metadata (e.g., author,
+    # description). Suppress warnings for unrecognized keys from markdown.
+    silent = (
+        MarimoPath(ir.filename).is_markdown()
+        if ir.filename and ir.filename != "<marimo>"
+        else False
+    )
+    header_comments = _extract_header_comments(ir)
     return generate_filecontents(
         codes=[cell.code for cell in ir.cells],
         names=[cell.name for cell in ir.cells],
         cell_configs=[CellConfig.from_dict(cell.options) for cell in ir.cells],
-        config=_AppConfig.from_untrusted_dict(ir.app.options),
-        header_comments=ir.header.value if ir.header else None,
+        config=_AppConfig.from_untrusted_dict(ir.app.options, silent=silent),
+        header_comments=header_comments,
     )
+
+
+def _extract_header_comments(ir: NotebookSerializationV1) -> str | None:
+    """Extract script preamble from header.
+
+    For markdown notebooks, Header.value may contain YAML-encoded frontmatter
+    metadata (with a 'header' key for the script preamble, and/or a
+    'pyproject' key for inline dependencies). For Python notebooks, it's the
+    raw script preamble.
+    """
+    if not ir.header or not ir.header.value:
+        return None
+    from marimo._utils import yaml
+
+    try:
+        parsed = yaml.load(ir.header.value)
+        if isinstance(parsed, dict):
+            # YAML dict means frontmatter metadata; extract script preamble
+            header = parsed.get("header", None)
+            pyproject = parsed.get("pyproject", None)
+            if header:
+                return str(header)
+            if pyproject:
+                from marimo._utils.scripts import wrap_script_metadata
+
+                return wrap_script_metadata(pyproject)
+            return None
+    except (yaml.YAMLError, AssertionError):
+        pass
+    return ir.header.value
 
 
 def generate_filecontents(
     codes: list[str],
     names: list[str],
     cell_configs: list[CellConfig],
-    config: Optional[_AppConfig] = None,
-    header_comments: Optional[str] = None,
+    config: _AppConfig | None = None,
+    header_comments: str | None = None,
 ) -> str:
     """Translates a sequences of codes (cells) to a Python file"""
 
-    # Update old internal cell names to the new ones
+    # Normalize internal cell names. Empty names would emit ``def ():``
+    # (invalid Python) and fall back to the unparsable-cell path;
+    # ``"__"`` is a legacy internal marker.
     for idx, name in enumerate(names):
-        if name == "__":
+        if name == "__" or not name:
             names[idx] = DEFAULT_CELL_NAME
 
     setup_cell = pop_setup_cell(codes, names, cell_configs)
@@ -519,12 +591,10 @@ def recover(filepath: Path) -> str:
 
 def is_multiline_comment(node: ast.stmt) -> bool:
     """Checks if a node is a docstring or a multiline comment."""
-    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
-        return True
-    return False
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
 
 
-def get_header_comments(filename: str | Path) -> Optional[str]:
+def get_header_comments(filename: str | Path) -> str | None:
     """Gets the header comments from a file. Returns
     None if the file does not exist or the header is
     invalid, which is determined by:

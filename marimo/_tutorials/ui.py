@@ -1,8 +1,14 @@
 # Copyright 2026 Marimo. All rights reserved.
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "marimo",
+# ]
+# ///
 
 import marimo
 
-__generated_with = "0.17.4"
+__generated_with = "0.23.6"
 app = marimo.App()
 
 
@@ -43,7 +49,9 @@ def _(mo):
 
 @app.cell
 def _(mo, slider):
-    mo.md(f"and here's its value: **{slider.value}**.")
+    mo.md(f"""
+    and here's its value: **{slider.value}**.
+    """)
     return
 
 
@@ -103,7 +111,7 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    marimo has a [large library of simple UI elements](https://docs.marimo.io/api/inputs/index.html). Here are a just few examples:
+    marimo has a [large library of simple UI elements](https://docs.marimo.io/api/inputs/index.html). Here are just a few examples:
     """)
     return
 
@@ -212,7 +220,9 @@ def _(file_upload):
 
 @app.cell
 def _(basic_ui_elements, mo):
-    mo.md(f"To see more examples, use this dropdown: {basic_ui_elements}")
+    mo.md(f"""
+    To see more examples, use this dropdown: {basic_ui_elements}
+    """)
     return
 
 
@@ -237,10 +247,38 @@ def _(basic_ui_elements, documentation):
 
 @app.cell(hide_code=True)
 def _(mo):
+    mo.md(r"""
+    `mo.ui.matrix` lets you edit 2D numeric data interactively.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    matrix = mo.ui.matrix(
+        [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        min_value=-5,
+        max_value=5,
+        step=0.1,
+        precision=1,
+        label="$I$",
+    )
+    matrix
+    return (matrix,)
+
+
+@app.cell
+def _(matrix):
+    matrix.value
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
     mo.md("""
     ### Composite elements
 
-        Composite elements are advanced elements
+        Composite elements are advanced elements that
         let you build UI elements out of other UI elements.
 
         Use these powerful elements to logically group together related elements,
@@ -304,9 +342,9 @@ def _(dictionary):
 
 @app.cell(hide_code=True)
 def _(composite_elements, mo):
-    mo.md(
-        f"To see additional composite elements, use this dropdown: {composite_elements}"
-    )
+    mo.md(f"""
+    To see additional composite elements, use this dropdown: {composite_elements}
+    """)
     return
 
 
@@ -382,6 +420,7 @@ def _(mo):
                     "date": mo.ui.date,
                     "dropdown": mo.ui.dropdown,
                     "file": mo.ui.file,
+                    "matrix": mo.ui.matrix,
                     "multiselect": mo.ui.multiselect,
                     "number": mo.ui.number,
                     "radio": mo.ui.radio,
@@ -441,6 +480,15 @@ def _(mo):
             return [mo.ui.file(kind="button"), mo.ui.file(kind="area")]
         elif value == mo.ui.form:
             return mo.ui.text_area(placeholder="...").form()
+        elif value == mo.ui.matrix:
+            return mo.ui.matrix(
+                [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                min_value=-5,
+                max_value=5,
+                step=0.1,
+                precision=1,
+                label="$I$",
+            )
         elif value == mo.ui.multiselect:
             return mo.ui.multiselect(["a", "b", "c"])
         elif value == mo.ui.number:
@@ -479,6 +527,7 @@ def _(mo):
         elif value == mo.ui.text_area:
             return mo.ui.text_area()
         return None
+
     return (construct_element,)
 
 
@@ -487,6 +536,7 @@ def _(mo):
     def show_element(element):
         if element is not None:
             return mo.hstack([element], justify="center")
+
     return (show_element,)
 
 
@@ -504,6 +554,7 @@ def _(mo):
                 The element's current value is {mo.as_html(element.value)}
                 """
             )
+
     return (value,)
 
 
@@ -518,12 +569,14 @@ def _(mo):
                     )
                 }
             )
+
     return (documentation,)
 
 
 @app.cell
 def _():
     import marimo as mo
+
     return (mo,)
 
 

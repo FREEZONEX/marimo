@@ -14,7 +14,13 @@ import DataEditor, {
   type Rectangle,
 } from "@glideapps/glide-data-grid";
 import { CopyIcon, TrashIcon } from "lucide-react";
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import useEvent from "react-use-event-hook";
 import type { FieldTypes } from "@/components/data-table/types";
 import {
@@ -40,7 +46,6 @@ import { ErrorBoundary } from "@/components/editor/boundary/ErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
 import type { DataType } from "@/core/kernel/messages";
-import { useOnMount } from "@/hooks/useLifecycle";
 import { useNonce } from "@/hooks/useNonce";
 import { logNever } from "@/utils/assertNever";
 import { Events } from "@/utils/events";
@@ -93,9 +98,47 @@ export const GlideDataEditor = <T,>({
 
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
   const rerender = useNonce();
+  const hasAppliedEdits = useRef(false);
 
-  // Handle initial edits passed in
-  useOnMount(() => {
+  const columns: ModifiedGridColumn[] = useMemo(() => {
+    const columns: ModifiedGridColumn[] = [];
+    for (const [columnName, fieldType] of columnFields) {
+      const editable =
+        editableColumns === "all" || editableColumns.includes(columnName);
+
+      columns.push({
+        id: columnName,
+        title: columnName,
+        width: columnWidths[columnName], // Enables resizing
+        icon: editable
+          ? getColumnHeaderIcon(fieldType)
+          : GridColumnIcon.ProtectedColumnOverlay,
+        style: "normal",
+        kind: getColumnKind(fieldType),
+        dataType: fieldType,
+        hasMenu: true,
+        themeOverride: editable
+          ? undefined
+          : {
+              bgCell: theme === "light" ? "#F9F9FA" : "#1e1e21",
+            },
+      });
+    }
+
+    return columns;
+  }, [columnFields, columnWidths, editableColumns, theme]);
+
+  // Apply initial edits after data has loaded
+  useEffect(() => {
+    // Don't apply if already applied or data hasn't loaded yet
+    if (hasAppliedEdits.current || data.length === 0) {
+      return;
+    }
+
+    // Mark as applied once data loads - prevents re-applying user edits
+    hasAppliedEdits.current = true;
+
+    // No initial edits to apply
     if (edits.length === 0) {
       return;
     }
@@ -175,7 +218,7 @@ export const GlideDataEditor = <T,>({
 
     // Add new rows in order
     const sortedNewRows = [...newRows.entries()]
-      .sort(([a], [b]) => a - b)
+      .toSorted(([a], [b]) => a - b)
       .map(([, row]) => row);
 
     if (sortedNewRows.length > 0) {
@@ -184,35 +227,8 @@ export const GlideDataEditor = <T,>({
 
     // Force re-render to update the total rows
     rerender();
-  });
-
-  const columns: ModifiedGridColumn[] = useMemo(() => {
-    const columns: ModifiedGridColumn[] = [];
-    for (const [columnName, fieldType] of Object.entries(columnFields)) {
-      const editable =
-        editableColumns === "all" || editableColumns.includes(columnName);
-
-      columns.push({
-        id: columnName,
-        title: columnName,
-        width: columnWidths[columnName], // Enables resizing
-        icon: editable
-          ? getColumnHeaderIcon(fieldType)
-          : GridColumnIcon.ProtectedColumnOverlay,
-        style: "normal",
-        kind: getColumnKind(fieldType),
-        dataType: fieldType,
-        hasMenu: true,
-        themeOverride: editable
-          ? undefined
-          : {
-              bgCell: theme === "light" ? "#F9F9FA" : "#1e1e21",
-            },
-      });
-    }
-
-    return columns;
-  }, [columnFields, columnWidths, editableColumns, theme]);
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+  }, [data.length]);
 
   const getCellContent = useCallback(
     (cell: Item): GridCell => {
@@ -295,7 +311,7 @@ export const GlideDataEditor = <T,>({
       const [col, _row] = cell;
       const key = columns[col].title;
 
-      const columnType = columnFields[key];
+      const columnType = columnFields.get(key);
       // Verify the new value is of the correct type
       switch (columnType) {
         case "number":
@@ -429,7 +445,7 @@ export const GlideDataEditor = <T,>({
       const oldColumnName = columns[menu.col].title;
 
       // Validate the new column name
-      if (columnFields[newName]) {
+      if (columnFields.has(newName)) {
         toastColumnExists(newName);
         return;
       }
@@ -482,7 +498,7 @@ export const GlideDataEditor = <T,>({
       const clampedColumnIdx = Math.max(0, Math.min(columnIdx, columns.length));
 
       // Validate the new column name
-      if (columnFields[columnName]) {
+      if (columnFields.has(columnName)) {
         toastColumnExists(columnName);
         return;
       }

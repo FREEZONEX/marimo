@@ -1,5 +1,5 @@
 /* Copyright 2026 Marimo. All rights reserved. */
-/** biome-ignore-all lint/suspicious/noConsole: for debugging */
+/* oxlint-disable no-console -- for debugging */
 
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -10,14 +10,25 @@ async function globalTeardown() {
   console.log("🧹 Cleaning up test environment...");
 
   try {
-    // Kill any remaining marimo processes
-    try {
-      await execAsync("pkill -f 'marimo.*--headless' || true");
-      console.log("✅ Cleaned up marimo processes");
-    } catch {
-      // Ignore errors - processes might not exist
-      console.log("⚠️  No marimo processes to clean up");
+    // Kill marimo processes, kernel workers, and parent uv processes.
+    // uv doesn't forward SIGTERM to children, so Playwright's
+    // webServer termination hangs waiting for the process to exit.
+    // Using SIGKILL (-9) ensures processes die immediately.
+    //
+    // The character-class trick (e.g. [m]arimo) prevents pkill from
+    // matching its own shell wrapper process.
+    //
+    // We kill broadly — any process with "marimo" in its command line —
+    // to catch orphan kernel workers that survive the parent being killed.
+    const killCmds = [
+      "pkill -9 -f '[m]arimo' || true",
+      "pkill -9 -f '[u]v.*run.*[m]arimo' || true",
+    ];
+    for (const cmd of killCmds) {
+      // oxlint-disable-next-line typescript/no-empty-function
+      await execAsync(cmd).catch(() => {});
     }
+    console.log("✅ Cleaned up marimo/uv processes");
 
     // Small delay to ensure cleanup completes
     await new Promise((resolve) => setTimeout(resolve, 1000));

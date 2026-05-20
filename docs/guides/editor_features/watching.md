@@ -214,6 +214,15 @@ detects a change to the notebook file, the application will be refreshed. The
 browser will trigger a page refresh to ensure your notebook starts from a fresh
 state.
 
+For gallery mode (`marimo run <folder> --watch`), marimo also refreshes the
+folder index on each workspace request. This means added and removed notebooks
+appear after refreshing or revisiting the gallery page.
+
+!!! warn "Security note for watched folders"
+    In `marimo run <folder> --watch`, newly created notebooks in that folder
+    can appear in the gallery and execute code when opened. Only watch trusted
+    directories, and use authentication when exposing the server remotely.
+
 ## Watching for changes to other modules
 
 marimo can also watch for changes to Python modules that your notebook imports,
@@ -224,7 +233,7 @@ Guide](module_autoreloading.md)
 ## Watching for data changes
 
 marimo supports watching data files and automatically refreshing cells that
-depend on them using [`mo.watch.file`][marimo.watch.file] and [mo.watch.directory][`marimo.watch.directory`].
+depend on them using [`mo.watch.file`][marimo.watch.file] and [`mo.watch.directory`][marimo.watch.directory].
 
 Learn more in the [watch API documentation](../../api/watch.md).
 

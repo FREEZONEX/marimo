@@ -1,7 +1,7 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-import * as RadioGroupPrimitive from "@radix-ui/react-radio-group";
 import { Circle } from "lucide-react";
+import { RadioGroup as RadioGroupPrimitive } from "radix-ui";
 import * as React from "react";
 
 import { cn } from "@/utils/cn";
@@ -33,9 +33,11 @@ const RadioGroupItem = React.forwardRef<
       )}
       {...props}
     >
-      <RadioGroupPrimitive.Indicator className="flex items-center justify-center">
-        <Circle className="h-[10px] w-[10px] fill-primary text-current" />
-      </RadioGroupPrimitive.Indicator>
+      {children ?? (
+        <RadioGroupPrimitive.Indicator className="flex items-center justify-center">
+          <Circle className="h-[10px] w-[10px] fill-primary text-current" />
+        </RadioGroupPrimitive.Indicator>
+      )}
     </RadioGroupPrimitive.Item>
   );
 });

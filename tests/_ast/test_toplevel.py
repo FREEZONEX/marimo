@@ -14,6 +14,9 @@ from marimo._ast.toplevel import (
     TopLevelType,
 )
 from marimo._ast.variables import BUILTINS
+from marimo._dependencies.dependencies import DependencyManager
+
+HAS_DUCKDB = DependencyManager.duckdb.has()
 
 
 class TestTopLevelStatus:
@@ -24,7 +27,7 @@ class TestTopLevelStatus:
             def add(a: int, b: int) -> int:
                 return a + b
 
-            pass
+            _ = 1  # Needed for tests
 
         status = TopLevelStatus.from_cell(cell._cell, BUILTINS)
         assert status.type == TopLevelType.CELL
@@ -146,7 +149,7 @@ class TestTopLevelExtraction:
     @staticmethod
     def test_decorator_reversed(app) -> None:
         with app.setup:
-            from typing import Callable
+            from collections.abc import Callable  # noqa: TC003
 
         @app.cell
         def second(wrap):
@@ -167,7 +170,7 @@ class TestTopLevelExtraction:
     @staticmethod
     def test_decorator(app) -> None:
         with app.setup:
-            from typing import Callable
+            from collections.abc import Callable  # noqa: TC003
 
         @app.cell
         def first():
@@ -296,7 +299,7 @@ class TestTopLevelExtraction:
             def Y() -> float:
                 return 1.0
 
-            pass  # to make it a cell
+            # to make it a cell
 
         @app.cell
         def _(Y):
@@ -633,3 +636,79 @@ class TestTopLevelHook:
 
         status = TopLevelStatus.from_cell(cell._cell, BUILTINS)
         assert status.type == TopLevelType.TOPLEVEL
+
+
+class TestTopLevelSQL:
+    @staticmethod
+    @pytest.mark.skipif(not HAS_DUCKDB, reason="Requires duckdb")
+    def test_sql_self_contained_two_calls(app) -> None:
+        """Two separate duckdb.sql() calls (create then use) — should be TOPLEVEL."""
+
+        @app.function
+        def create_and_query():
+            import duckdb
+
+            duckdb.sql("CREATE TABLE t AS SELECT 1 AS id")
+            return duckdb.sql("SELECT * FROM t").df()
+
+        extraction = TopLevelExtraction.from_app(InternalApp(app))
+        assert [TopLevelType.TOPLEVEL] == [s.type for s in extraction], [
+            s.hint for s in extraction
+        ]
+
+    @staticmethod
+    @pytest.mark.skipif(not HAS_DUCKDB, reason="Requires duckdb")
+    def test_sql_self_contained_single_call(app) -> None:
+        """Single duckdb.sql() with multiple statements (create then use) — should be TOPLEVEL."""
+
+        @app.function
+        def create_and_query():
+            import duckdb
+
+            return duckdb.sql(
+                "CREATE TABLE t AS SELECT 1 AS id; SELECT * FROM t"
+            ).df()
+
+        extraction = TopLevelExtraction.from_app(InternalApp(app))
+        assert [TopLevelType.TOPLEVEL] == [s.type for s in extraction], [
+            s.hint for s in extraction
+        ]
+
+    @staticmethod
+    @pytest.mark.skipif(not HAS_DUCKDB, reason="Requires duckdb")
+    def test_sql_attach_detach_self_contained(app) -> None:
+        """ATTACH/DETACH pattern — db alias defined in same function — should be TOPLEVEL."""
+
+        @app.function
+        def attach_and_query():
+            import duckdb
+
+            duckdb.sql(
+                "DETACH DATABASE IF EXISTS mydb; ATTACH DATABASE 'mydb.duckdb' AS mydb"
+            )
+            return duckdb.sql("SELECT * FROM mydb.users").df()
+
+        extraction = TopLevelExtraction.from_app(InternalApp(app))
+        assert [TopLevelType.TOPLEVEL] == [s.type for s in extraction], [
+            s.hint for s in extraction
+        ]
+
+    @staticmethod
+    @pytest.mark.skipif(not HAS_DUCKDB, reason="Requires duckdb")
+    def test_sql_external_refs_toplevel(app) -> None:
+        """@app.function referencing external SQL tables — still TOPLEVEL.
+
+        SQL table references are runtime dependencies, not definition-time
+        dependencies, so they don't prevent a function from being top-level.
+        """
+
+        @app.function
+        def query_external():
+            import duckdb
+
+            return duckdb.sql("SELECT * FROM some_external_table").df()
+
+        extraction = TopLevelExtraction.from_app(InternalApp(app))
+        assert [TopLevelType.TOPLEVEL] == [s.type for s in extraction], [
+            s.hint for s in extraction
+        ]

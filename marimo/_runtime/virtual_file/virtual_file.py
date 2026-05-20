@@ -7,7 +7,10 @@ import mimetypes
 import random
 import string
 import threading
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from marimo import _loggers
 from marimo._messaging.mimetypes import KnownMimeType
@@ -31,7 +34,7 @@ _ALPHABET = string.ascii_letters + string.digits
 
 
 def random_filename(ext: str) -> str:
-    # adapted from: https://stackoverflow.com/questions/13484726/safe-enough-8-character-short-unique-random-string  # noqa: E501
+    # adapted from: https://stackoverflow.com/questions/13484726/safe-enough-8-character-short-unique-random-string
     # TODO(akshayka): should callers redraw if they get a collision?
     try:
         tid = str(threading.get_native_id())
@@ -52,7 +55,7 @@ class VirtualFile:
         self,
         filename: str,
         buffer: bytes,
-        url: Optional[str] = None,
+        url: str | None = None,
         as_data_url: bool = False,
     ) -> None:
         self.filename = filename
@@ -79,6 +82,39 @@ class VirtualFile:
             url=url,
         )
 
+    @staticmethod
+    def create_and_register(buffer: bytes, ext: str) -> VirtualFile:
+        """Create a virtual file and register it in the current context.
+
+        Falls back to a data URL if no runtime context is available,
+        virtual files aren't supported, or the buffer is empty.
+        """
+        from marimo._runtime.context import get_context
+
+        vfile_name = random_filename(ext)
+
+        def return_data_url() -> VirtualFile:
+            return VirtualFile(
+                filename=vfile_name, buffer=buffer, as_data_url=True
+            )
+
+        # Empty buffers can't be served via the file registry, so use a
+        # data URL instead to ensure the URL is always resolvable.
+        if len(buffer) == 0:
+            return return_data_url()
+
+        try:
+            ctx = get_context()
+        except ContextNotInitializedError:
+            return return_data_url()
+
+        if not ctx.virtual_files_supported:
+            return return_data_url()
+
+        vfile = VirtualFile(filename=vfile_name, buffer=buffer)
+        ctx.virtual_file_registry.add(vfile, ctx)
+        return vfile
+
 
 EMPTY_VIRTUAL_FILE = VirtualFile(
     filename="empty.txt",
@@ -94,7 +130,7 @@ class VirtualFileLifecycleItem(CellLifecycleItem):
         self.ext = _without_leading_dot(ext)
         self.buffer = buffer
         # Not resolved until added to registry
-        self._virtual_file: Optional[VirtualFile] = None
+        self._virtual_file: VirtualFile | None = None
 
     def add_to_cell_lifecycle_registry(self) -> None:
         from marimo._runtime.context import get_context
@@ -182,7 +218,17 @@ class VirtualFileRegistry:
 
     def __post_init__(self) -> None:
         # Set singleton reference for read_virtual_file()
-        VirtualFileStorageManager().storage = self.storage
+        manager = VirtualFileStorageManager()
+        if manager.storage is None:
+            # Not set yet, _or_ was stale
+            manager.storage = self.storage
+        elif self.storage is not manager.storage:
+            # Long running asgi apps, and embedded cases trigger this.
+            LOGGER.debug(
+                "Expected shared global storage but VirtualFileRegistry was initialized "
+                "with new storage instance. Overriding with global storage.",
+            )
+            self.storage = manager.storage
 
     def __del__(self) -> None:
         self.shutdown()
@@ -243,19 +289,43 @@ class VirtualFileRegistry:
             return
         try:
             self.shutting_down = True
-            self.storage.shutdown()
+            self.storage.shutdown(keys=self.registry.keys())
             self.registry.clear()
         finally:
             self.shutting_down = False
 
 
 def _without_leading_dot(ext: str) -> str:
-    return ext[1:] if ext.startswith(".") else ext
+    return ext.removeprefix(".")
 
 
 def read_virtual_file(filename: str, byte_length: int) -> bytes:
     try:
         return VirtualFileStorageManager().read(filename, byte_length)
+    except KeyError as err:
+        raise HTTPException(
+            HTTPStatus.NOT_FOUND,
+            detail="File not found",
+        ) from err
+
+
+def read_virtual_file_chunked(
+    filename: str, byte_length: int, start: int = 0
+) -> Iterator[bytes]:
+    """Read a virtual file in chunks for streaming responses.
+
+    Yields chunks of bytes, avoiding holding the entire file in memory
+    as a single bytes object.
+
+    Args:
+        filename: virtual file name
+        byte_length: number of bytes to read (after applying ``start``)
+        start: offset in bytes to begin reading from (for HTTP Range requests)
+    """
+    try:
+        yield from VirtualFileStorageManager().read_chunked(
+            filename, byte_length, start=start
+        )
     except KeyError as err:
         raise HTTPException(
             HTTPStatus.NOT_FOUND,

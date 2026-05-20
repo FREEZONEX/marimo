@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from starlette.authentication import requires
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -11,6 +11,7 @@ from marimo import _loggers
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._server.api.deps import AppState
 from marimo._server.router import APIRouter
+from marimo._server.workspace import NEW_FILE_WIRE
 from marimo._utils.health import (
     get_cgroup_cpu_percent,
     get_cgroup_mem_stats,
@@ -74,7 +75,7 @@ async def status(request: Request) -> JSONResponse:
     """
     app_state = AppState(request)
     files = [
-        session.app_file_manager.filename or "__new__"
+        session.app_file_manager.filename or NEW_FILE_WIRE
         for session in app_state.session_manager.sessions.values()
     ]
     return JSONResponse(
@@ -92,7 +93,30 @@ async def status(request: Request) -> JSONResponse:
     )
 
 
+class SessionInfo(TypedDict):
+    filename: str | None
+    path: str | None
+
+
+@router.get("/api/sessions", include_in_schema=False)
+@requires("edit")
+async def list_sessions(request: Request) -> JSONResponse:
+    """List active session IDs and their notebook paths."""
+
+    state = AppState(request)
+
+    sessions = {
+        session_id: SessionInfo(
+            filename=session.app_file_manager.filename,
+            path=session.app_file_manager.path,
+        )
+        for session_id, session in state.session_manager.sessions.items()
+    }
+    return JSONResponse(sessions)
+
+
 @router.get("/api/version")
+@requires("read")
 async def version(request: Request) -> PlainTextResponse:
     """
     responses:
@@ -193,7 +217,7 @@ async def usage(request: Request) -> JSONResponse:
                             - memory
                             - cpu
 
-    """  # noqa: E501
+    """
     import subprocess
 
     import psutil
@@ -221,31 +245,36 @@ async def usage(request: Request) -> JSONResponse:
         # subsequent calls return delta since last call
         cpu = psutil.cpu_percent(interval=None)
 
-    # Server memory (and children)
-    main_process = psutil.Process()
-    server_memory = main_process.memory_info().rss
-    children = main_process.children(recursive=True)
-    for child in children:
-        try:
-            server_memory += child.memory_info().rss
-        except psutil.NoSuchProcess:
-            pass
-
-    # Kernel memory
-    kernel_memory: Optional[int] = None
+    # Collect kernel PIDs first so we can exclude them from server memory
+    kernel_memory: int | None = None
+    kernel_pids: set[int] = set()
     session = AppState(request).get_current_session()
     try:
         if session and (pid := session.kernel_pid()) is not None:
             kernel_process = psutil.Process(pid)
+            kernel_pids.add(kernel_process.pid)
             kernel_memory = kernel_process.memory_info().rss
             kernel_children = kernel_process.children(recursive=True)
             for child in kernel_children:
+                kernel_pids.add(child.pid)
                 try:
                     kernel_memory += child.memory_info().rss
                 except psutil.NoSuchProcess:
                     pass
     except psutil.ZombieProcess:
         LOGGER.warning("Kernel process is a zombie")
+
+    # Server memory (excluding kernel processes to avoid double-counting)
+    main_process = psutil.Process()
+    server_memory = main_process.memory_info().rss
+    children = main_process.children(recursive=True)
+    for child in children:
+        if child.pid in kernel_pids:
+            continue
+        try:
+            server_memory += child.memory_info().rss
+        except psutil.NoSuchProcess:
+            pass
 
     # GPU stats
     gpu_stats: list[dict[str, Any]] = []
@@ -309,6 +338,7 @@ async def usage(request: Request) -> JSONResponse:
 
 
 @router.get("/api/status/connections")
+@requires("read")
 async def connections(request: Request) -> JSONResponse:
     """
     responses:
@@ -341,7 +371,7 @@ def _is_gpu_available() -> bool:
 
     if DependencyManager.which("nvidia-smi"):
         try:
-            _ = subprocess.run(  # noqa: ASYNC221
+            _ = subprocess.run(
                 _GPU_STATS_CMD,
                 capture_output=True,
                 text=True,

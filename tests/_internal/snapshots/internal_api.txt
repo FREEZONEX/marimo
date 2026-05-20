@@ -17,8 +17,10 @@ commands
   InvokeFunctionCommand
   ListDataSourceConnectionCommand
   ListOrValue
+  ListSQLSchemasCommand
   ListSQLTablesCommand
   ListSecretKeysCommand
+  ModelCommand
   ModelMessage
   PreviewDatasetColumnCommand
   PreviewSQLTableCommand
@@ -32,7 +34,6 @@ commands
   UpdateCellConfigCommand
   UpdateUIElementCommand
   UpdateUserConfigCommand
-  UpdateWidgetModelCommand
   ValidateSQLCommand
   kebab_case
 config
@@ -87,13 +88,12 @@ notifications
   ReloadNotification
   RemoveUIElementsNotification
   SQLMetadata
+  SQLSchemaListPreviewNotification
   SQLTableListPreviewNotification
   SQLTablePreviewNotification
   SecretKeysResultNotification
   StartupLogsNotification
   UIElementMessageNotification
-  UpdateCellCodesNotification
-  UpdateCellIdsNotification
   ValidateSQLResultNotification
   VariableDeclarationNotification
   VariableValue
@@ -123,6 +123,8 @@ session
   SessionView
   extensions
     CachingExtension
+    EventAwareExtension
+    ExtensionRegistry
     HeartbeatExtension
     LoggingExtension
     NotificationListenerExtension

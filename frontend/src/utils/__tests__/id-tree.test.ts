@@ -214,16 +214,19 @@ describe("CollapsibleTree", () => {
     `);
   });
 
-  it("fails to expand", () => {
+  it("fails to expand when node not found", () => {
     expect(() => tree.expand("five")).toThrowErrorMatchingInlineSnapshot(
       "[Error: Node five not found in tree. Valid ids: one,two,three,four]",
     );
-    expect(() => {
-      tree.expand("one");
-      tree.expand("one");
-    }).toThrowErrorMatchingInlineSnapshot(
-      "[Error: Node one is already expanded]",
-    );
+  });
+
+  it("expand on already expanded node is a no-op", () => {
+    // Expanding an already expanded node should return the same tree (no-op)
+    const result = tree.expand("one");
+    expect(result).toBe(tree);
+    // Can call multiple times without error
+    const result2 = tree.expand("one");
+    expect(result2).toBe(tree);
   });
 
   it("moves nodes correctly", () => {
@@ -374,6 +377,18 @@ describe("CollapsibleTree", () => {
       "one
       three (collapsed)
         four
+      "
+    `);
+  });
+
+  it("can delete non-collapsed nodes without throwing", () => {
+    // Deleting a non-collapsed node should not throw
+    // (previously this would throw "Node is already expanded" internally)
+    const result = tree.deleteAtIndex(1);
+    expect(result.toString()).toMatchInlineSnapshot(`
+      "one
+      three
+      four
       "
     `);
   });
@@ -940,6 +955,77 @@ describe("MultiColumn", () => {
   it("inserts an id", () => {
     const inserted = multiColumn.insertId("D1", columnIds[1], 1 as CellIndex);
     expect(inserted.topLevelIds[1]).toEqual(["B1", "D1", "B2"]);
+  });
+
+  describe("moveCellsRelativeTo", () => {
+    it("moves a single cell before target in same column", () => {
+      const moved = multiColumn.moveCellsRelativeTo(["A3"], "A1", "before");
+      expect(moved.topLevelIds).toEqual([
+        ["A3", "A1", "A2"],
+        ["B1", "B2"],
+        ["C1", "C2", "C3", "C4"],
+      ]);
+    });
+
+    it("moves a single cell after target in same column", () => {
+      const moved = multiColumn.moveCellsRelativeTo(["A1"], "A3", "after");
+      expect(moved.topLevelIds).toEqual([
+        ["A2", "A3", "A1"],
+        ["B1", "B2"],
+        ["C1", "C2", "C3", "C4"],
+      ]);
+    });
+
+    it("moves multiple cells before target", () => {
+      const moved = multiColumn.moveCellsRelativeTo(
+        ["A1", "A2"],
+        "B2",
+        "before",
+      );
+      expect(moved.topLevelIds).toEqual([
+        ["A3"],
+        ["B1", "A1", "A2", "B2"],
+        ["C1", "C2", "C3", "C4"],
+      ]);
+    });
+
+    it("moves multiple cells after target", () => {
+      const moved = multiColumn.moveCellsRelativeTo(
+        ["A2", "A3"],
+        "B1",
+        "after",
+      );
+      expect(moved.topLevelIds).toEqual([
+        ["A1"],
+        ["B1", "A2", "A3", "B2"],
+        ["C1", "C2", "C3", "C4"],
+      ]);
+    });
+
+    it("returns same MultiColumn when cellIds is empty", () => {
+      const moved = multiColumn.moveCellsRelativeTo([], "A1", "before");
+      expect(moved).toBe(multiColumn);
+    });
+
+    it("inserts at end when target is among moved cells", () => {
+      const moved = multiColumn.moveCellsRelativeTo(
+        ["A1", "A2"],
+        "A2",
+        "after",
+      );
+      // Target A2 was removed; insert at end of column 0
+      expect(moved.topLevelIds).toEqual([
+        ["A3", "A1", "A2"],
+        ["B1", "B2"],
+        ["C1", "C2", "C3", "C4"],
+      ]);
+    });
+
+    it("throws when node not found", () => {
+      expect(() =>
+        multiColumn.moveCellsRelativeTo(["Z1"], "A1", "before"),
+      ).toThrow("Cell Z1 not found in any column");
+    });
   });
 
   it("deletes by id", () => {

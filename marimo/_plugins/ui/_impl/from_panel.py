@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
-    Optional,
     TypeVar,
     cast,
 )
@@ -15,18 +14,15 @@ from typing import (
 from marimo import _loggers
 from marimo._output.rich_help import mddoc
 from marimo._plugins.ui._core.ui_element import InitializationArgs, UIElement
-from marimo._plugins.ui._impl.comm import MarimoComm, MarimoCommManager
 from marimo._runtime.functions import Function
-from marimo._types.ids import WidgetModelId
+from marimo._runtime.virtual_file.virtual_file import VirtualFile
 
 if TYPE_CHECKING:
     from panel.viewable import Viewable
 
 LOGGER = _loggers.marimo_logger()
 
-COMM_MANAGER = MarimoCommManager()
-
-comm_class: Optional[type[Any]] = None
+comm_class: type[Any] | None = None
 loaded_extension: int = 0
 loaded_extensions: list[str] = []
 
@@ -36,7 +32,7 @@ T = TypeVar("T", bound=dict[str, Any])
 @dataclass
 class SendToWidgetArgs:
     message: Any
-    buffers: Optional[list[Any]] = None
+    buffers: list[Any] | None = None
 
 
 # Singleton, we only create one instance of this class
@@ -47,16 +43,25 @@ def _get_comm_class() -> type[Any]:
 
     from pyviz_comms import Comm  # type: ignore
 
+    from marimo._messaging.notification import (
+        UIElementMessageNotification,
+    )
+    from marimo._messaging.notification_utils import (
+        broadcast_notification,
+    )
+    from marimo._plugins.ui._impl.comm import _ensure_bytes
+    from marimo._types.ids import UIElementId
+
     class MarimoPanelComm(Comm):  # type: ignore
         def __init__(self, *args: Any, **kwargs: Any):
             super().__init__(*args, **kwargs)
-            self._comm = MarimoComm(
-                comm_id=WidgetModelId(str(self.id)),
-                target_name="panel.comms",
-                data={},
-                comm_manager=COMM_MANAGER,
-            )
-            self._comm.on_msg(self._handle_msg)
+            self._ui_element_id: str | None = None
+            # Panel's push() checks `comm._comm` before sending
+            # document updates to the frontend. Without a truthy
+            # value, backend changes (e.g. DynamicMap overlays) are
+            # silently dropped. Setting a sentinel makes push() call
+            # send(comm, msg) which routes through our send() override.
+            self._comm = True  # type: ignore[assignment]
             if self._on_open:
                 self._on_open({})
 
@@ -69,11 +74,21 @@ def _get_comm_class() -> type[Any]:
             return dict(msg.message, _buffers=buffers)
 
         def send(
-            self, data: Any = None, metadata: Any = None, buffers: Any = None
+            self,
+            data: Any = None,
+            metadata: Any = None,
+            buffers: Any = None,
         ) -> None:
-            buffers = buffers or []
-            self.comm.send(
-                {"content": data}, metadata=metadata, buffers=buffers
+            del metadata
+            if self._ui_element_id is None:
+                return
+            raw_buffers = buffers or []
+            broadcast_notification(
+                UIElementMessageNotification(
+                    ui_element=UIElementId(self._ui_element_id),
+                    message={"content": data},
+                    buffers=[_ensure_bytes(b) for b in raw_buffers],
+                )
             )
 
     comm_class = MarimoPanelComm
@@ -180,7 +195,7 @@ def _extract_holoviews_settings(obj: Any) -> dict[str, Any]:
     are respected when rendering holoviews objects through Panel.
     """
     try:
-        import holoviews as hv  # type: ignore[import-not-found,import-untyped,unused-ignore] # noqa: E501
+        import holoviews as hv  # type: ignore[import-not-found,import-untyped,unused-ignore]
 
         # Check if the object is a holoviews object
         if not isinstance(
@@ -291,12 +306,25 @@ class panel(UIElement[T, T]):
         if loaded_extension == 0:
             loaded_extension = id(self)
 
+        # Serve the extension script as a virtual file rather than passing
+        # the raw JavaScript through the DOM. The frontend refuses to load
+        # scripts that don't come from `./@file/...`, which prevents a
+        # maliciously crafted <marimo-panel> element (embedded via raw HTML
+        # in a markdown cell) from executing attacker-controlled JavaScript
+        # at same origin before any cell has run.
+        extension_url: str | None = None
+        if extension:
+            extension_vfile = VirtualFile.create_and_register(
+                extension.encode("utf-8"), "js"
+            )
+            extension_url = extension_vfile.url
+
         super().__init__(
             component_name="marimo-panel",
             initial_value=cast(T, {}),
             label="",
             args={
-                "extension": extension,
+                "extension-url": extension_url,
                 "render_json": render_json,
                 "docs_json": docs_json,
             },
@@ -313,8 +341,13 @@ class panel(UIElement[T, T]):
     def _handle_msg(self, msg: SendToWidgetArgs) -> None:
         ref = self._ref
         comm = self.obj._comms[ref][0]  # type: ignore[attr-defined]
-        msg = comm.decode(msg)
-        self.obj._on_msg(ref, self._manager, msg)  # type: ignore[attr-defined]
+        decoded = comm.decode(msg)
+        try:
+            self.obj._on_msg(ref, self._manager, decoded)  # type: ignore[attr-defined]
+        except Exception as e:
+            # Deserialization or buffer errors from echo/stale patches
+            LOGGER.debug("Panel _on_msg error (likely harmless echo): %s", e)
+            return
         comm.send(data={"type": "ACK"})
 
     def _initialize(
@@ -323,8 +356,7 @@ class panel(UIElement[T, T]):
     ) -> None:
         super()._initialize(initialization_args)
         for comm, _ in self.obj._comms.values():  # type: ignore[attr-defined]
-            if isinstance(comm.comm, MarimoComm):
-                comm.comm.ui_element_id = self._id
+            comm._ui_element_id = self._id
 
     def _convert_value(self, value: T) -> T:
         return value

@@ -1,7 +1,7 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING
 
 from marimo._ast import codegen
 from marimo._ast.compiler import extract_markdown
@@ -9,8 +9,12 @@ from marimo._ast.compiler import extract_markdown
 if TYPE_CHECKING:
     from marimo._ast.cell import Cell, CellImpl
 
+DEFAULT_MARKDOWN_PREFIX = "r"
 
-def markdown_to_marimo(source: str) -> str:
+
+def markdown_to_marimo(
+    source: str, prefix: str = DEFAULT_MARKDOWN_PREFIX
+) -> str:
     # NB. This should be kept in sync with the logic in
     # frontend/src/core/codemirror/language/languages/markdown.ts
     # ::transformOut
@@ -19,7 +23,7 @@ def markdown_to_marimo(source: str) -> str:
     # 6 quotes in a row breaks
     if not source:
         source = " "
-    return codegen.construct_markdown_call(source, '"""', "r")
+    return codegen.construct_markdown_call(source, '"""', prefix)
 
 
 def sql_to_marimo(
@@ -46,9 +50,7 @@ def sql_to_marimo(
     )
 
 
-def get_markdown_from_cell(
-    cell: Union[CellImpl, Cell], code: str
-) -> Optional[str]:
+def get_markdown_from_cell(cell: CellImpl | Cell, code: str) -> str | None:
     """Attempt to extract markdown from a cell, or return None"""
 
     if not (cell.refs == {"mo"} and not cell.defs):

@@ -4,11 +4,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
-    Callable,
     Generic,
     Literal,
-    Optional,
     TypeVar,
     cast,
 )
@@ -42,6 +41,9 @@ from marimo._schemas.serialization import (
     NotebookSerializationV1,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 LOGGER = _loggers.marimo_logger()
 
 MARIMO_MD = "marimo-md"
@@ -55,7 +57,7 @@ def backwards_compatible_sanitization(line: str) -> str:
 
 
 def extract_attribs(
-    line: str, fence_start: Optional[re.Match[str]] = None
+    line: str, fence_start: re.Match[str] | None = None
 ) -> dict[str, str]:
     # Extract attributes from the code block.
     # Blocks are expected to be like this:
@@ -92,7 +94,7 @@ def _get_language(text: str) -> str:
 
 def formatted_code_block(
     code: str,
-    attributes: Optional[dict[str, str]] = None,
+    attributes: dict[str, str] | None = None,
     is_qmd: bool = False,
 ) -> str:
     """Wraps code in a fenced code block with marimo attributes."""
@@ -117,7 +119,7 @@ def formatted_code_block(
     # ```{.python.marimo attr=...}
     else:
         head = f"""{guard}{{.{language}.marimo{attribute_str}}}"""
-    return "\n".join([head, code, guard, ""])
+    return f"{head}\n{code}\n{guard}\n"
 
 
 def app_config_from_root(root: Element) -> dict[str, Any]:
@@ -195,7 +197,12 @@ class SafeWrap(Generic[T]):
 
 
 def _tree_to_ir(root: Element) -> SafeWrap[NotebookSerializationV1]:
+    from marimo._ast.app_config import _AppConfig
+    from marimo._utils import yaml
+    from marimo._utils.scripts import wrap_script_metadata
+
     app_config = app_config_from_root(root)
+    config_only = _AppConfig.sanitize(app_config)
 
     sources: list[str] = []
     names: list[str] = []
@@ -208,23 +215,39 @@ def _tree_to_ir(root: Element) -> SafeWrap[NotebookSerializationV1]:
         )
         sources.append(get_source_from_tag(child))
 
-    from marimo._utils.scripts import wrap_script_metadata
-
-    header = root.get("header", None)
+    header_str = root.get("header", None)
     pyproject = root.get("pyproject", None)
-    if pyproject and not header:
-        header = wrap_script_metadata(pyproject)
+
+    # Collect non-config frontmatter metadata
+    frontmatter = {k: v for k, v in app_config.items() if k not in config_only}
+    if pyproject:
+        frontmatter["pyproject"] = pyproject
+    if header_str:
+        frontmatter["header"] = header_str
+
+    # Build header: frontmatter YAML for md, or script preamble
+    if frontmatter:
+        header_value = yaml.dump(frontmatter, sort_keys=False)
+    elif pyproject and not header_str:
+        header_value = wrap_script_metadata(pyproject)
+    elif header_str:
+        header_value = header_str
+    else:
+        header_value = None
+
     notebook = NotebookSerializationV1(
-        app=AppInstantiation(options=app_config),
+        app=AppInstantiation(options=config_only),
         cells=[
             CellDef(
                 name=name,
                 code=source,
                 options=config.asdict(),
             )
-            for name, source, config in zip(names, sources, cell_config)
+            for name, source, config in zip(
+                names, sources, cell_config, strict=False
+            )
         ],
-        header=Header(value=header) if header else None,
+        header=Header(value=header_value) if header_value else None,
     )
     return SafeWrap(notebook)
 
@@ -479,7 +502,7 @@ class ExpandAndClassifyProcessor(BlockProcessor):
 
 
 def convert_from_md_to_marimo_ir(
-    text: str, filepath: Optional[str] = None
+    text: str, filepath: str | None = None
 ) -> NotebookSerializationV1:
     if not text.strip():
         return NotebookSerializationV1(

@@ -1,7 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
 import { useAtom, useAtomValue } from "jotai";
-import { MessageCircleQuestionIcon } from "lucide-react";
 import type React from "react";
 import type { PropsWithChildren } from "react";
 import { useEffect, useMemo } from "react";
@@ -13,7 +12,6 @@ import {
 } from "@/core/cells/cells";
 import { capabilitiesAtom } from "@/core/config/capabilities";
 import { cn } from "@/utils/cn";
-import { FeedbackButton } from "../components/feedback-button";
 import { panelLayoutAtom, useChromeActions, useChromeState } from "../state";
 import {
   isPanelHidden,
@@ -115,7 +113,10 @@ export const Sidebar: React.FC = () => {
   ]);
 
   return (
-    <div className="h-full pt-4 pb-1 px-1 flex flex-col items-start text-muted-foreground text-md select-none no-print text-sm z-50 dark:bg-background print:hidden hide-on-fullscreen">
+    <div
+      data-testid="chrome-sidebar"
+      className="h-full pt-4 pb-1 px-1 flex flex-col items-start text-muted-foreground text-md select-none text-sm z-50 dark:bg-background print:hidden hide-on-fullscreen"
+    >
       <ReorderableList<PanelDescriptor>
         value={sidebarItems}
         setValue={handleSetSidebarItems}

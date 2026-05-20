@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from urllib.request import urlopen
 
 import pytest
@@ -13,10 +13,10 @@ from marimo._output.formatters.altair_formatters import (
     FORMAT_LOCALE_URL,
     TIME_FORMAT_LOCALE_URL,
     AltairFormatter,
+    _maybe_warn_external_resources,
 )
 from marimo._output.formatters.formatters import register_formatters
 from marimo._output.formatting import get_formatter
-from marimo._plugins.ui._impl.altair_chart import maybe_make_full_width
 from tests._data.mocks import create_dataframes
 
 HAS_DEPS = DependencyManager.altair.has() and DependencyManager.polars.has()
@@ -83,11 +83,8 @@ def test_altair_formatter_registration():
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="altair not installed")
-@patch("marimo._output.formatters.altair_formatters.maybe_make_full_width")
-def test_altair_formatter_full_width(mock_make_full_width: MagicMock):
+def test_altair_formatter_respects_default_width():
     AltairFormatter().register()
-
-    mock_make_full_width.side_effect = maybe_make_full_width
 
     import altair as alt
 
@@ -101,8 +98,6 @@ def test_altair_formatter_full_width(mock_make_full_width: MagicMock):
         )
     )
 
-    mock_make_full_width.return_value = chart
-
     formatter = get_formatter(chart)
     assert formatter is not None
     res = formatter(chart)
@@ -110,10 +105,8 @@ def test_altair_formatter_full_width(mock_make_full_width: MagicMock):
     mime, content = res
     assert_vegalite_mimetype(mime)
     assert isinstance(content, str)
-    assert "container" in content
-
-    # Verify maybe_make_full_width was called
-    mock_make_full_width.assert_called_once()
+    json_content = json.loads(content)
+    assert json_content.get("width") != "container"
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="altair not installed")
@@ -165,24 +158,59 @@ def test_altair_formatter_mimebundle():
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="altair not installed")
-def test_altair_formatter_svg():
+@pytest.mark.parametrize(
+    ("raw_svg", "expected"),
+    [
+        (True, "<svg></svg>"),
+        (False, "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="),
+    ],
+)
+def test_altair_formatter_svg(raw_svg: bool, expected: str):
     AltairFormatter().register()
 
     import altair as alt
 
     # Create a mock chart with a _repr_mimebundle_ method that returns SVG
     mock_chart = alt.Chart(get_data()).mark_point()
-    with patch.object(
-        alt.Chart,
-        "_repr_mimebundle_",
-        return_value={"image/svg+xml": "<svg></svg>"},
+    with (
+        patch.dict(alt.renderers.options, {"raw_svg": raw_svg}),
+        patch.object(
+            alt.Chart,
+            "_repr_mimebundle_",
+            return_value={"image/svg+xml": "<svg></svg>"},
+        ),
     ):
         formatter = get_formatter(mock_chart)
         assert formatter is not None
         mime, content = formatter(mock_chart)
 
         assert mime == "image/svg+xml"
-        assert content == "<svg></svg>"
+        assert content == expected
+
+
+@pytest.mark.skipif(not HAS_DEPS, reason="altair not installed")
+def test_altair_formatter_png():
+    AltairFormatter().register()
+
+    import altair as alt
+
+    # Create a mock chart with a _repr_mimebundle_ method that returns PNG
+    mock_chart = alt.Chart(get_data()).mark_point()
+    with patch.object(
+        alt.Chart,
+        "_repr_mimebundle_",
+        return_value=(
+            {"image/png": b"png"},
+            {"image/png": {"width": 10.2, "height": 19.8}},
+        ),
+    ):
+        formatter = get_formatter(mock_chart)
+        assert formatter is not None
+        mime, content = formatter(mock_chart)
+
+        assert mime == "application/vnd.marimo+mimebundle"
+        assert content.startswith('{"image/png": "data:image/png;base64,cG5n"')
+        assert content.endswith('{"image/png": {"width": 10, "height": 20}}}')
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="altair not installed")
@@ -269,3 +297,25 @@ def test_altair_formatter_embed_options():
     alt.renderers.set_embed_options()
     content = get_formatted_content(get_chart())
     assert content["usermeta"]["embedOptions"] == {}
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ('<image xlink:href="https://ffox.png"/>', True),
+        ('<image href="#id"/>', False),
+        ('<image href="data:image/png;base64,xxx"/>', False),
+        ('<image href=" https://ffox.png"/>', True),
+        ('<image href=" #id"/>', False),
+    ],
+)
+def test_maybe_warn_external_resource(content: str, expected: bool) -> None:
+    with patch(
+        "marimo._output.formatters.altair_formatters.LOGGER.warning"
+    ) as mock_warning:
+        _maybe_warn_external_resources(content)
+        if expected:
+            mock_warning.assert_called_once()
+            assert "raw_svg=True" in mock_warning.call_args[0][0]
+        else:
+            mock_warning.assert_not_called()

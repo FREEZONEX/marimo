@@ -1,12 +1,12 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import narwhals.stable.v2 as nw
 
 from marimo import _loggers
-from marimo._data.charts import get_chart_builder
+from marimo._data.charts import ChartBuilder, get_chart_builder
 from marimo._data.models import ColumnStats
 from marimo._data.sql_summaries import (
     get_column_type,
@@ -166,7 +166,7 @@ def get_column_preview_for_duckdb(
     *,
     fully_qualified_table_name: str,
     column_name: str,
-) -> Optional[DataColumnPreviewNotification]:
+) -> DataColumnPreviewNotification | None:
     DependencyManager.duckdb.require(why="previewing DuckDB columns")
 
     column_type = get_column_type(fully_qualified_table_name, column_name)
@@ -179,13 +179,9 @@ def get_column_preview_for_duckdb(
     missing_packages = None
     should_limit_to_10_items = True
 
-    if DependencyManager.altair.has():
+    total_rows = stats.total
+    if total_rows is not None and DependencyManager.altair.has():
         try:
-            total_rows: int = wrapped_sql(
-                f"SELECT COUNT(*) FROM {fully_qualified_table_name}",
-                connection=None,
-            ).fetchone()[0]  # type: ignore[index]
-
             if total_rows <= CHART_MAX_ROWS:
                 relation = wrapped_sql(
                     f"SELECT {column_name} FROM {fully_qualified_table_name}",
@@ -195,7 +191,9 @@ def get_column_preview_for_duckdb(
                     column_data=relation,
                     column_type=column_type,
                     column_name=column_name,
-                    should_limit_to_10_items=should_limit_to_10_items,
+                    chart_builder=get_chart_builder(
+                        column_type, should_limit_to_10_items
+                    ),
                 )
             else:
                 error, missing_packages = (
@@ -203,7 +201,7 @@ def get_column_preview_for_duckdb(
                     VEGAFUSION_MISSING_PACKAGES,
                 )
         except Exception as e:
-            LOGGER.warning(f"Failed to generate Altair chart: {str(e)}")
+            LOGGER.warning(f"Failed to generate Altair chart: {e!s}")
 
     return DataColumnPreviewNotification(
         table_name=fully_qualified_table_name,
@@ -221,8 +219,8 @@ def _get_altair_chart(
     column_name: str,
     table: TableManager[Any],
     stats: ColumnStats,
-    table_rows: Optional[int],
-) -> tuple[Optional[str], Optional[str], Optional[str], Optional[list[str]]]:
+    table_rows: int | None,
+) -> tuple[str | None, str | None, str | None, list[str] | None]:
     """
     Get an Altair chart for a column.
 
@@ -272,8 +270,8 @@ def _get_altair_chart(
     if isinstance(column_data, nw.LazyFrame):
         column_data = column_data.collect()
 
-    error: Optional[str] = None
-    missing_packages: Optional[list[str]] = None
+    error: str | None = None
+    missing_packages: list[str] | None = None
 
     # We may not know number of rows, so we can check for max rows error
     try:
@@ -284,7 +282,7 @@ def _get_altair_chart(
             column_data=downgrade_narwhals_df_to_v1(column_data),
             column_type=column_type,
             column_name=column_name,
-            should_limit_to_10_items=should_limit_to_10_items,
+            chart_builder=chart_builder,
         )
     except MaxRowsError:
         chart_spec = None
@@ -298,11 +296,9 @@ def _get_chart_spec(
     column_data: Any,
     column_type: FieldType,
     column_name: str,
-    should_limit_to_10_items: bool,
+    chart_builder: ChartBuilder,
 ) -> str:
     import altair as alt
-
-    chart_builder = get_chart_builder(column_type, should_limit_to_10_items)
 
     # If we have vegafusion and vl-convert-python, use it
     if (

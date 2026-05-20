@@ -1,44 +1,63 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
+import { completionKeymap as defaultCompletionKeymap } from "@codemirror/autocomplete";
 import { EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
-import { describe, expect, it, vi } from "vitest";
-import { completionKeymap } from "../keymap";
+import { keymap } from "@codemirror/view";
+import { describe, expect, it } from "vitest";
+import { completionKeymap, filterCompletionBindings } from "../keymap";
 
-describe("completionKeymap", () => {
-  it("should propagate Escape key when completion is pending", () => {
-    const state = EditorState.create({
-      extensions: [completionKeymap()],
-    });
-    const view = new EditorView({ state });
-
-    // Mock completionStatus to return "pending"
-    vi.spyOn(view.state, "field").mockReturnValue("pending");
-
-    view.dispatch({ changes: [], effects: [], annotations: [] });
-    const result = false; // Mock the expected result
-
-    // Should return false to propagate the Escape key
-    expect(result).toBe(false);
-
-    view.destroy();
+function hasEnterBinding(acceptOnEnter: boolean): boolean {
+  const state = EditorState.create({
+    extensions: [completionKeymap(acceptOnEnter)],
   });
 
-  it("should not propagate Escape key when completion is active", () => {
-    const state = EditorState.create({
-      extensions: [completionKeymap()],
-    });
-    const view = new EditorView({ state });
+  return state
+    .facet(keymap)
+    .flat()
+    .some((binding) => binding.key === "Enter");
+}
 
-    // Mock completionStatus to return "active"
-    vi.spyOn(view.state, "field").mockReturnValue("active");
+describe("completionKeymap", () => {
+  it("upstream includes the macOS-only completion bindings we care about", () => {
+    expect(
+      defaultCompletionKeymap.some((binding) => binding.mac === "Alt-`"),
+    ).toBe(true);
+    expect(
+      defaultCompletionKeymap.some((binding) => binding.mac === "Alt-i"),
+    ).toBe(true);
+  });
 
-    view.dispatch({ changes: [], effects: [], annotations: [] });
-    const result = true; // Mock the expected result
+  it("removes Alt-backtick and Escape while keeping Alt-i", () => {
+    const filtered = filterCompletionBindings(defaultCompletionKeymap);
 
-    // Should return true to stop propagation
-    expect(result).toBe(true);
+    expect(filtered.some((binding) => binding.mac === "Alt-`")).toBe(false);
+    expect(filtered.some((binding) => binding.key === "Escape")).toBe(false);
+    expect(filtered.some((binding) => binding.mac === "Alt-i")).toBe(true);
+  });
 
-    view.destroy();
+  it("includes Enter by default", () => {
+    const filtered = filterCompletionBindings(defaultCompletionKeymap);
+    expect(filtered.some((binding) => binding.key === "Enter")).toBe(true);
+  });
+
+  it("removes Enter when passed a keysToRemove set containing Enter", () => {
+    const keysToRemove = new Set<string | undefined>([
+      "Escape",
+      "Alt-`",
+      "Enter",
+    ]);
+    const filtered = filterCompletionBindings(
+      defaultCompletionKeymap,
+      keysToRemove,
+    );
+    expect(filtered.some((binding) => binding.key === "Enter")).toBe(false);
+  });
+
+  it("completionKeymap includes Enter when acceptOnEnter is true", () => {
+    expect(hasEnterBinding(true)).toBe(true);
+  });
+
+  it("completionKeymap removes Enter when acceptOnEnter is false", () => {
+    expect(hasEnterBinding(false)).toBe(false);
   });
 });

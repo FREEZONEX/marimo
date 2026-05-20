@@ -5,7 +5,7 @@ import { atomWithStorage } from "jotai/utils";
 import { z } from "zod";
 import { store } from "@/core/state/jotai";
 import { createReducerAndAtoms } from "@/utils/createReducer";
-import { jotaiJsonStorage } from "@/utils/storage/jotai";
+import { adaptForLocalStorage } from "@/utils/storage/jotai";
 import { ZodLocalStorage } from "@/utils/storage/typed";
 import type { PanelSection, PanelType } from "./types";
 import { PANELS } from "./types";
@@ -35,43 +35,36 @@ const DEFAULT_PANEL_LAYOUT: PanelLayout = {
   ).map((p) => p.type),
 };
 
-function reconcilePanelLayout(layout: PanelLayout): PanelLayout {
-  const sidebar = [...layout.sidebar];
-  const developerPanel = [...layout.developerPanel];
-  const existingPanels = new Set<PanelType>([...sidebar, ...developerPanel]);
-
-  for (const panel of DEFAULT_PANEL_LAYOUT.sidebar) {
-    if (!existingPanels.has(panel)) {
-      sidebar.push(panel);
-      existingPanels.add(panel);
-    }
-  }
-
-  for (const panel of DEFAULT_PANEL_LAYOUT.developerPanel) {
-    if (!existingPanels.has(panel)) {
-      developerPanel.push(panel);
-      existingPanels.add(panel);
-    }
-  }
-
-  return { sidebar, developerPanel };
+/**
+ * Merge saved layout with current defaults so new panels added in later
+ * versions are appended to their default section. Panels the user has
+ * moved between sections are left where the user put them.
+ */
+function mergePanelLayout(saved: PanelLayout): PanelLayout {
+  const allSaved = new Set([...saved.sidebar, ...saved.developerPanel]);
+  return {
+    sidebar: [
+      ...saved.sidebar,
+      ...DEFAULT_PANEL_LAYOUT.sidebar.filter((p) => !allSaved.has(p)),
+    ],
+    developerPanel: [
+      ...saved.developerPanel,
+      ...DEFAULT_PANEL_LAYOUT.developerPanel.filter((p) => !allSaved.has(p)),
+    ],
+  };
 }
+
+const panelLayoutStorage = adaptForLocalStorage<PanelLayout, PanelLayout>({
+  toSerializable: (v) => v,
+  fromSerializable: (saved) => mergePanelLayout(saved),
+});
 
 export const panelLayoutAtom = atomWithStorage<PanelLayout>(
   "marimo:panel-layout",
   DEFAULT_PANEL_LAYOUT,
-  jotaiJsonStorage,
+  panelLayoutStorage,
   { getOnInit: true },
 );
-
-const initialPanelLayout = reconcilePanelLayout(store.get(panelLayoutAtom));
-if (
-  initialPanelLayout.sidebar.length !== store.get(panelLayoutAtom).sidebar.length ||
-  initialPanelLayout.developerPanel.length !==
-    store.get(panelLayoutAtom).developerPanel.length
-) {
-  store.set(panelLayoutAtom, initialPanelLayout);
-}
 
 /**
  * Resolve which section a panel belongs to based on current layout.
@@ -212,4 +205,5 @@ export const exportedForTesting = {
   reducer,
   createActions,
   initialState,
+  mergePanelLayout,
 };

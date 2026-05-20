@@ -15,6 +15,7 @@
   border: 1px solid var(--gray-4);
 
   @apply divide-y divide-(--gray-5);
+
   &:hover {
     border-color: var(--gray-6);
   }
@@ -72,6 +73,16 @@
     }
   }
 
+  /* Styling for cells marked for cut */
+  &.pending-cut {
+    .output-area,
+    .cm-gutters,
+    .cm {
+      background-color: var(--gray-2);
+      opacity: 0.55;
+    }
+  }
+
   &:focus-within {
     z-index: 20;
   }
@@ -98,9 +109,35 @@
 
     /* Special case for particular components */
 
-    .output-area:has(> .output > marimo-ui-element > marimo-table) {
+    .output-area:has(
+      > .output:only-child > marimo-ui-element:only-child > marimo-table
+    ) {
+      padding: 0 0 5px;
       max-height: none;
       overflow: hidden;
+
+      /* Flush table: remove border and configure edge padding via CSS variable */
+      --marimo-table-edge-padding: 0.75rem;
+
+      marimo-table::part(table-tabs) {
+        margin-top: 0.25rem;
+        border: none;
+        border-radius: 0;
+        border-top-left-radius: 9px;
+      }
+
+      marimo-table::part(table-wrapper) {
+        border: none;
+        border-radius: 0;
+      }
+
+      marimo-table::part(table-footer) {
+        padding-inline: 0.25rem;
+      }
+
+      marimo-table::part(filter-pills) {
+        padding-bottom: 0;
+      }
     }
 
     & > :first-child {
@@ -314,6 +351,11 @@
 
   &.published {
     border: none;
+
+    &:hover {
+      border: none;
+      box-shadow: none;
+    }
   }
 }
 
@@ -359,6 +401,7 @@
     border-top-left-radius: 9px;
     border-top-right-radius: 9px;
   }
+
   div[data-ai-input-open="true"] .cm-editor {
     border-top-left-radius: 0;
     border-top-right-radius: 0;

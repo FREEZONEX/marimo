@@ -1,6 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+/* oxlint-disable typescript/no-explicit-any */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as apiModule from "../api";
@@ -91,6 +91,44 @@ describe("createNetworkRequests", () => {
       );
 
       process.env.NODE_ENV = originalEnv;
+    });
+
+    it("exportAsPDF should pass preset through to the API", async () => {
+      const requests = createNetworkRequests();
+      await requests.exportAsPDF({
+        webpdf: false,
+        preset: "slides",
+        includeInputs: false,
+      } as any);
+
+      expect(mockClient.POST).toHaveBeenCalledWith(
+        "/api/export/pdf",
+        expect.objectContaining({
+          body: expect.objectContaining({
+            webpdf: false,
+            preset: "slides",
+            includeInputs: false,
+          }),
+          parseAs: "blob",
+        }),
+      );
+    });
+
+    it("exportAsIPYNB should call the new endpoint as text", async () => {
+      const requests = createNetworkRequests();
+      await requests.exportAsIPYNB({
+        download: false,
+      } as any);
+
+      expect(mockClient.POST).toHaveBeenCalledWith(
+        "/api/export/ipynb",
+        expect.objectContaining({
+          body: expect.objectContaining({
+            download: false,
+          }),
+          parseAs: "text",
+        }),
+      );
     });
   });
 });

@@ -7,10 +7,8 @@ import sys
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Final,
     Literal,
-    Optional,
     TypeAlias,
     Union,
     cast,
@@ -22,7 +20,7 @@ from narwhals.typing import IntoDataFrame, IntoLazyFrame
 from marimo import _loggers
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._messaging.mimetypes import KnownMimeType
-from marimo._output.hypertext import is_no_js
+from marimo._output.hypertext import is_non_interactive
 from marimo._output.rich_help import mddoc
 from marimo._plugins.ui._core.ui_element import UIElement
 from marimo._plugins.ui._impl.charts.altair_transformer import (
@@ -41,6 +39,8 @@ from marimo._utils.narwhals_utils import (
 LOGGER = _loggers.marimo_logger()
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import altair
     import altair.vegalite
     from narwhals import Schema
@@ -51,12 +51,13 @@ if TYPE_CHECKING:
 #     "field": ["value1", "value2", ...]
 #   }
 # }
-ChartSelectionField = dict[str, Union[list[int], list[float], list[str]]]
+ChartSelectionField = dict[str, list[int] | list[float] | list[str]]
 ChartSelection = dict[str, ChartSelectionField]
 VegaSpec = dict[str, Any]
 RowOrientedData = list[dict[str, Any]]
 ColumnOrientedData = dict[str, list[Any]]
 
+# Use Union[] instead of X | Y — see altair_transformer.py for rationale.
 ChartDataType = Union[
     IntoDataFrame, IntoLazyFrame, RowOrientedData, ColumnOrientedData
 ]
@@ -70,6 +71,8 @@ def _has_binning(spec: VegaSpec) -> bool:
     if "encoding" not in spec:
         return False
     for encoding in spec["encoding"].values():
+        if isinstance(encoding, list):
+            continue
         if "bin" in encoding:
             return True
     return False
@@ -86,7 +89,9 @@ def _get_binned_fields(spec: VegaSpec) -> dict[str, Any]:
         return binned_fields
 
     for encoding in spec["encoding"].values():
-        if "bin" in encoding and encoding["bin"]:
+        if isinstance(encoding, list):
+            continue
+        if encoding.get("bin"):
             # Get the field name
             field = encoding.get("field")
             if field:
@@ -122,7 +127,7 @@ def _using_vegafusion() -> bool:
 
 def _combine_conditions_with_and(
     conditions: list[nw.Expr],
-) -> Optional[nw.Expr]:
+) -> nw.Expr | None:
     """Combine multiple narwhals expressions with AND logic."""
     if not conditions:
         return None
@@ -137,7 +142,7 @@ def _combine_conditions_with_and(
 
 def _combine_conditions_with_or(
     conditions: list[nw.Expr],
-) -> Optional[nw.Expr]:
+) -> nw.Expr | None:
     """Combine multiple narwhals expressions with OR logic."""
     if not conditions:
         return None
@@ -152,7 +157,7 @@ def _combine_conditions_with_or(
 
 def _build_point_filter(
     point: dict[str, Any], schema: Schema
-) -> Optional[nw.Expr]:
+) -> nw.Expr | None:
     """Build a filter expression for a single point selection."""
     field_conditions: list[nw.Expr] = []
     names = schema.names()
@@ -171,7 +176,7 @@ def _try_apply_multipoint_filter(
     df: nw.LazyFrame[Any],
     fields: ChartSelectionField,
     schema: Schema,
-) -> Optional[nw.LazyFrame[Any]]:
+) -> nw.LazyFrame[Any] | None:
     """Try to apply multi-point selection filter using vlPoint.or structure.
 
     This handles the case where multiple points are selected, avoiding
@@ -217,11 +222,11 @@ def _try_apply_multipoint_filter(
 
 
 def _filter_dataframe(
-    native_df: Union[IntoDataFrame, IntoLazyFrame],
+    native_df: IntoDataFrame | IntoLazyFrame,
     *,
     selection: ChartSelection,
-    binned_fields: Optional[dict[str, Any]] = None,
-) -> Union[IntoDataFrame, IntoLazyFrame]:
+    binned_fields: dict[str, Any] | None = None,
+) -> IntoDataFrame | IntoLazyFrame:
     # Use lazy evaluation for efficient chained filtering
     df, undo_df = make_lazy(native_df)
 
@@ -523,11 +528,11 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
     def __init__(
         self,
         chart: AltairChartType,
-        chart_selection: Literal["point"] | Literal["interval"] | bool = True,
+        chart_selection: Literal["point", "interval"] | bool = True,
         legend_selection: list[str] | bool = True,
         *,
         label: str = "",
-        on_change: Optional[Callable[[ChartDataType], None]] = None,
+        on_change: Callable[[ChartDataType], None] | None = None,
     ) -> None:
         DependencyManager.altair.require(why="to use `mo.ui.altair_chart`")
 
@@ -548,26 +553,13 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
                 f"Invalid type for chart: {type(chart)}; expected altair.Chart"
             )
 
-        # Make full-width if no width is specified
-        chart = maybe_make_full_width(chart)
-
         # Fix vegafusion background to be transparent
         chart = maybe_fix_vegafusion_background(chart)
-
-        # Fix the sizing for vconcat charts
-        if isinstance(chart, alt.VConcatChart) and _has_no_nested_hconcat(
-            chart
-        ):
-            chart = _update_vconcat_width(chart)
-
-            # without autosize, vconcat will overflow
-            if chart.autosize is alt.Undefined:
-                chart.autosize = "fit-x"
 
         try:
             vega_spec = _parse_spec(chart)
         except Exception:
-            # Sometimes the changes to width and autosize (above) can cause `.to_dict()` to throw an error
+            # Parsing the chart spec (via Altair's `.to_dict()`) can fail for some charts,
             # similarly to the issue described in https://github.com/marimo-team/marimo/issues/6244
             # so we fallback to the original chart.
             LOGGER.info("Failed to parse spec, using original chart")
@@ -635,8 +627,8 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
                 "https://github.com/marimo-team/marimo/issues/4601"
             )
 
-        self.dataframe: Optional[ChartDataType] = (
-            self._get_dataframe_from_chart(chart)
+        self.dataframe: ChartDataType | None = self._get_dataframe_from_chart(
+            chart
         )
 
         self._spec = vega_spec
@@ -657,7 +649,7 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
 
     # Override _mime_ to return an Altair spec in non-JS environments
     def _mime_(self) -> tuple[KnownMimeType, str]:
-        if is_no_js():
+        if is_non_interactive():
             return (
                 get_chart_mimetype(spec_format="vega"),
                 chart_to_json(self._chart, validate=False),
@@ -670,8 +662,8 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
 
     @staticmethod
     def _get_dataframe_from_chart(
-        chart: Union[altair.Chart, altair.LayerChart],
-    ) -> Optional[ChartDataType]:
+        chart: AltairChartType,
+    ) -> ChartDataType | None:
         if not isinstance(chart.data, str):
             return cast(ChartDataType, chart.data)
 
@@ -844,31 +836,6 @@ class altair_chart(UIElement[ChartSelection, ChartDataType]):
         raise RuntimeError("Setting the value of a UIElement is not allowed.")
 
 
-def maybe_make_full_width(chart: AltairChartType) -> AltairChartType:
-    import altair as alt
-
-    try:
-        if (
-            isinstance(chart, (alt.Chart, alt.LayerChart))
-            and chart.width is alt.Undefined
-        ):
-            # Don't make full width if chart has column encoding (faceted)
-            if (
-                hasattr(chart, "encoding")
-                and hasattr(chart.encoding, "column")
-                and chart.encoding.column is not alt.Undefined
-            ):
-                return chart
-            return chart.properties(width="container")
-        return chart
-    except Exception:
-        LOGGER.exception(
-            "Failed to set width to full container. "
-            "This is likely due to a missing dependency or an invalid chart."
-        )
-        return chart
-
-
 def maybe_fix_vegafusion_background(chart: AltairChartType) -> AltairChartType:
     """Fix vegafusion background to be transparent.
 
@@ -903,12 +870,17 @@ def _has_selection_param(chart: AltairChartType) -> bool:
     try:
         for param in chart.params:  # type: ignore
             try:
-                if isinstance(
-                    param,
-                    (alt.SelectionParameter, alt.TopLevelSelectionParameter),
+                if (
+                    isinstance(
+                        param,
+                        (
+                            alt.SelectionParameter,
+                            alt.TopLevelSelectionParameter,
+                        ),
+                    )
+                    and param.bind is alt.Undefined
                 ):
-                    if param.bind is alt.Undefined:
-                        return True
+                    return True
             except Exception:
                 pass
     except Exception:
@@ -925,60 +897,22 @@ def _has_legend_param(chart: AltairChartType) -> bool:
     try:
         for param in chart.params:  # type: ignore
             try:
-                if isinstance(
-                    param,
-                    (alt.SelectionParameter, alt.TopLevelSelectionParameter),
+                if (
+                    isinstance(
+                        param,
+                        (
+                            alt.SelectionParameter,
+                            alt.TopLevelSelectionParameter,
+                        ),
+                    )
+                    and param.bind == "legend"
                 ):
-                    if param.bind == "legend":
-                        return True
+                    return True
             except Exception:
                 pass
     except Exception:
         pass
     return False
-
-
-def _update_vconcat_width(chart: AltairChartType) -> AltairChartType:
-    """Mutate the chart to set the width to the container."""
-
-    import altair as alt
-
-    if isinstance(chart, alt.VConcatChart):
-        chart.vconcat = [
-            _update_vconcat_width(subchart) for subchart in chart.vconcat
-        ]
-        return chart  # type: ignore[no-any-return]
-
-    if isinstance(chart, alt.LayerChart):
-        chart.layer = [_update_vconcat_width(layer) for layer in chart.layer]
-        return chart  # type: ignore[no-any-return]
-
-    if isinstance(chart, alt.HConcatChart):
-        chart.hconcat = [
-            _update_vconcat_width(subchart) for subchart in chart.hconcat
-        ]
-        return chart  # type: ignore[no-any-return]
-
-    if isinstance(chart, alt.Chart):
-        return maybe_make_full_width(chart)
-
-    # Not handled
-    return chart
-
-
-def _has_no_nested_hconcat(chart: AltairChartType) -> bool:
-    import altair as alt
-
-    if isinstance(chart, alt.HConcatChart):
-        return False
-    if isinstance(chart, alt.VConcatChart):
-        return all(
-            _has_no_nested_hconcat(subchart) for subchart in chart.vconcat
-        )
-    if isinstance(chart, alt.LayerChart):
-        return all(_has_no_nested_hconcat(layer) for layer in chart.layer)
-
-    return True
 
 
 def chart_to_json(

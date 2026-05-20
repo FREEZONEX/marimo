@@ -6,19 +6,17 @@ import base64
 import dataclasses
 import hashlib
 import inspect
-import struct
 import sys
 import types
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-from marimo._ast.transformers import DeprivateVisitor, strip_function
+from marimo._ast.transformers import DeprivateVisitor, get_hashable_ast
 from marimo._ast.variables import (
     get_cell_from_local,
     if_local_then_mangle,
     unmangle_local,
 )
 from marimo._ast.visitor import ImportData, Name, ScopedVisitor
-from marimo._dependencies.dependencies import DependencyManager
 from marimo._plugins.ui._core.ui_element import UIElement
 from marimo._runtime.context import ContextNotInitializedError, get_context
 from marimo._runtime.dataflow import induced_subgraph
@@ -35,23 +33,26 @@ from marimo._runtime.primitives import (
 from marimo._runtime.side_effect import CellHash, SideEffect
 from marimo._runtime.state import SetFunctor, State
 from marimo._runtime.watch._path import PathState
-from marimo._save.cache import Cache, CacheType
+from marimo._save.cache import Cache, CacheType, HashMemoCleanup
+from marimo._save.encode import (
+    attempt_signed_bytes,
+    common_container_to_bytes,
+    data_to_buffer,
+    deterministic_dumps,
+    primitive_to_bytes,
+    type_sign,
+)
 from marimo._save.stubs import maybe_get_custom_stub
 from marimo._types.ids import CellId_t
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable
     from types import CodeType
 
     from marimo._ast.cell import CellImpl
     from marimo._runtime.context.types import RuntimeContext
     from marimo._runtime.dataflow import DirectedGraph
     from marimo._save.loaders import Loader
-
-    # Union[list, torch.Tensor, jax.numpy.ndarray,
-    #             np.ndarray, scipy.sparse.spmatrix]
-    Tensor = Any
-
 
 # Default hash type is generally inconsequential, there may be implications of
 # malicious hash collision or performance. Malicious hash collision can be
@@ -67,9 +68,7 @@ class SerialRefs(NamedTuple):
     stateful_refs: set[Name]
 
 
-def hash_module(
-    code: Optional[CodeType], hash_type: str = DEFAULT_HASH
-) -> bytes:
+def hash_module(code: CodeType | None, hash_type: str = DEFAULT_HASH) -> bytes:
     hash_alg = hashlib.new(hash_type, usedforsecurity=False)
     if not code:
         # Hash of zeros, in the case of no code object as a recognizable noop.
@@ -141,7 +140,7 @@ def hash_function(
     fn: Callable[..., Any], hash_type: str = DEFAULT_HASH
 ) -> bytes:
     return hash_raw_module(
-        DeprivateVisitor().visit(strip_function(fn)), hash_type
+        DeprivateVisitor().visit(get_hashable_ast(fn)), hash_type
     )
 
 
@@ -169,134 +168,10 @@ def hash_cell_execution(
     return hash_cell_group(ancestors, graph, hash_type)
 
 
-def standardize_tensor(tensor: Tensor) -> Optional[Tensor]:
-    if (
-        hasattr(tensor, "__array__")
-        or hasattr(tensor, "toarray")
-        or hasattr(tensor, "__array_interface__")
-    ):
-        DependencyManager.numpy.require("to access data buffer for hashing.")
-        import numpy
-
-        if not hasattr(tensor, "__array_interface__"):
-            # Capture those sparse cases
-            if hasattr(tensor, "toarray"):
-                tensor = tensor.toarray()
-        # As array should not perform copy
-        return numpy.asarray(tensor)
-    raise ValueError(
-        f"Expected a data primitive object, but got {type(tensor)} instead."
-        "This maybe is an internal marimo issue. Please report to "
-        "https://github.com/marimo-team/marimo/issues."
-    )
-
-
-def type_sign(value: bytes, label: str) -> bytes:
-    # Appending all strings with a key disambiguates it from other types. e.g.
-    # when the string value is the same as a float pack, or is the literal
-    # ":none". If our content strings take the form: integrity + delimiter then
-    # these types of collisions become very hard.
-    #
-    # Note that this does not fully protect against cache poisoning, as an
-    # attacker can override python internals to provide a matched hash. A key
-    # signed cache result is the only way to properly protect against this.
-    #
-    # Additionally, (less meaningful, but still possible)- a byte collision can
-    # be manufactured by choosing data so long that the length of the data acts
-    # as the data injection.
-    #
-    # TODO: Benchmark something like `sha1 (integrity) + delimiter`, this
-    # method is chosen because it was assumed to be fast, but might be slow
-    # with a copy of large data.
-    return b"".join([value, bytes(len(value)), bytes(":" + label, "utf-8")])
-
-
-def iterable_sign(value: Iterable[Any], label: str) -> bytes:
-    values = list(value)
-    return b"".join(
-        [b"".join(values), bytes(len(values)), bytes(":" + label, "utf-8")]
-    )
-
-
-def primitive_to_bytes(value: Any) -> bytes:
-    if value is None:
-        return b":none"
-    if isinstance(value, str):
-        return type_sign(bytes(f"{value}", "utf-8"), "str")
-    if isinstance(value, float):
-        return type_sign(struct.pack("d", value), "float")
-    if isinstance(value, int):
-        return type_sign(struct.pack("q", value), "int")
-    if isinstance(value, tuple):
-        return iterable_sign(map(primitive_to_bytes, value), "tuple")
-    return type_sign(bytes(value), "bytes")
-
-
-def common_container_to_bytes(value: Any) -> bytes:
-    visited: dict[int, int] = {}
-
-    def recurse_container(value: Any) -> bytes:
-        if id(value) in visited:
-            return type_sign(bytes(visited[id(value)]), "id")
-        if isinstance(value, dict):
-            visited[id(value)] = len(visited)
-            return iterable_sign(
-                map(recurse_container, sorted(value.items())), "dict"
-            )
-        if isinstance(value, list):
-            visited[id(value)] = len(visited)
-            return iterable_sign(map(recurse_container, value), "list")
-        if isinstance(value, set):
-            visited[id(value)] = len(visited)
-            return iterable_sign(map(recurse_container, sorted(value)), "set")
-        # Tuple may be only data primitive, not fully primitive.
-        if isinstance(value, tuple):
-            return iterable_sign(map(recurse_container, value), "tuple")
-
-        if is_primitive(value):
-            return primitive_to_bytes(value)
-        return data_to_buffer(value)
-
-    return recurse_container(value)
-
-
-def data_to_buffer(data: Tensor) -> bytes:
-    data = standardize_tensor(data)
-    # From joblib.hashing
-    if data.shape == ():
-        # 0d arrays need to be flattened because viewing them as bytes
-        # raises a ValueError exception.
-        data_c_contiguous = data.flatten()
-    elif data.flags.c_contiguous:
-        data_c_contiguous = data
-    elif data.flags.f_contiguous:
-        data_c_contiguous = data.T
-    else:
-        # Cater for non-single-segment arrays, this creates a copy, and thus
-        # alleviates this issue. Note: There might be a more efficient way of
-        # doing this, check for joblib updates.
-        data_c_contiguous = data.flatten()
-    return type_sign(memoryview(data_c_contiguous.view("uint8")), "data")
-
-
-def attempt_signed_bytes(value: bytes, label: str) -> bytes:
-    # Prevents hash collisions like:
-    # >>> fib(1)
-    # >>> s, _ = state(1)
-    # >>> fib(s)
-    # ^ would be a cache hit as is even though fib(s) would fail by
-    # itself
-    try:
-        return type_sign(common_container_to_bytes(value), label)
-    # Fallback to raw state for eval in content hash.
-    except (TypeError, ValueError):
-        return value
-
-
 def get_and_update_context_from_scope(
     scope: dict[str, Any],
-    scope_refs: Optional[set[Name]] = None,
-) -> Optional[RuntimeContext]:
+    scope_refs: set[Name] | None = None,
+) -> RuntimeContext | None:
     """Get stateful registers"""
 
     # Remove non-global references
@@ -304,8 +179,7 @@ def get_and_update_context_from_scope(
     if scope_refs is None:
         scope_refs = set()
     for ref in scope_refs:
-        if ref in ctx_scope:
-            ctx_scope.remove(ref)
+        ctx_scope.discard(ref)
 
     # This is typically done in post execution hook, but it will not be
     # called in script mode.
@@ -334,11 +208,11 @@ class BlockHasher:
         cell_id: CellId_t,
         scope: dict[str, Any],
         *,
-        context: Optional[ast.Module] = None,
+        context: ast.Module | None = None,
         pin_modules: bool = False,
         hash_type: str = DEFAULT_HASH,
         apply_content_hash: bool = True,
-        scoped_refs: Optional[set[Name]] = None,
+        scoped_refs: set[Name] | None = None,
         external: bool = False,
     ) -> None:
         """Hash the context of the module, and return a cache object.
@@ -400,8 +274,8 @@ class BlockHasher:
                 "scoped_refs should only be used with deferred hashing."
             )
 
-        self._hash: Optional[str] = None
-        self._exe_hash: Optional[str] = None
+        self._hash: str | None = None
+        self._exe_hash: str | None = None
         self.graph = graph
         self.cell_id = cell_id
         self.pin_modules = pin_modules
@@ -438,10 +312,6 @@ class BlockHasher:
 
         # Default type, means that there are no references at all.
         cache_type: CacheType = "Pure"
-
-        # TODO: Consider memoizing the serialized contents and hashed cells,
-        # such that a parent cell's BlockHasher can be used to speed up the
-        # hashing of child.
 
         # Collect references that will be utilized for a content hash.
         content_serialization: dict[Name, bytes] = {}
@@ -566,6 +436,20 @@ class BlockHasher:
             cache_type=self.cache_type,
         )
 
+    def _is_memoizable(
+        self,
+        local_ref: Name,
+        value: Any,
+        ctx: RuntimeContext,
+    ) -> bool:
+        """Check if a variable's content hash can be memoized."""
+        return (
+            ctx.cache.is_memoizable(value)
+            and local_ref not in self.stateful_refs
+            and self.cell_id
+            not in self.graph.definitions.get(local_ref, set())
+        )
+
     def _apply_content_hash(
         self, content_serialization: dict[Name, bytes]
     ) -> None:
@@ -577,13 +461,13 @@ class BlockHasher:
         self,
         refs: set[Name],
         scope: dict[str, Any],
-        ctx: Optional[RuntimeContext],
+        ctx: RuntimeContext | None,
         scoped_refs: set[Name],
         apply_hash: bool = True,
     ) -> SerialRefs:
         self._hash = None
         refs, content_serialization, _ = (
-            self.serialize_and_dequeue_content_refs(refs, scope)
+            self.serialize_and_dequeue_content_refs(refs, scope, ctx)
         )
         # If scoped refs are present, then they are unhashable
         # and we should fallback to normal hash or fail.
@@ -607,7 +491,7 @@ class BlockHasher:
             closure -= set(content_serialization.keys()) | self.execution_refs
             unhashable_closure, relevant_serialization, _ = (
                 self.serialize_and_dequeue_content_refs(
-                    closure - unhashable, scope
+                    closure - unhashable, scope, ctx
                 )
             )
             unhashable |= unhashable_closure
@@ -616,7 +500,9 @@ class BlockHasher:
 
             for ref in unhashable:
                 try:
-                    _hashed = pickle.dumps(scope[ref])
+                    _hashed = deterministic_dumps(
+                        scope[ref], self.hash_alg.name
+                    )
                     content_serialization[ref] = type_sign(_hashed, "pickle")
                     refs.remove(ref)
                 except (pickle.PicklingError, TypeError) as e:
@@ -625,14 +511,12 @@ class BlockHasher:
             if failed:
                 # Ruff didn't like a lambda here
                 def get_type(ref: Name) -> str:
-                    return (
-                        str(type(item)) if (item := scope[ref]) else "missing"
-                    )
+                    return str(type(scope[ref])) if ref in scope else "missing"
 
                 ref_list = ", ".join(
                     [
-                        f"{ref}: {get_type(ref)} ({str(e)})"
-                        for ref, e in zip(failed, exceptions)
+                        f"{ref}: {get_type(ref)} ({e!s})"
+                        for ref, e in zip(failed, exceptions, strict=False)
                     ]
                 )
                 # Note ExceptionGroup nicest here, but only available in 3.11
@@ -682,7 +566,7 @@ class BlockHasher:
         self,
         refs: set[Name],
         scope: dict[str, Any],
-        ctx: Optional[RuntimeContext] = None,
+        ctx: RuntimeContext | None = None,
     ) -> SerialRefs:
         """
         Preprocess the scope and references, and extract state references.
@@ -717,7 +601,7 @@ class BlockHasher:
 
             # State relevant to the context, should be dependent on it's value-
             # not the object.
-            value: Optional[State[Any]] = None
+            value: State[Any] | None = None
             # Prefer actual object over reference.
             # Skip if the reference has already been subbed in, or if it is
             # a shadowed reference.
@@ -742,7 +626,7 @@ class BlockHasher:
                         scope[state_name] = scope[ref]
 
             # Likewise, UI objects should be dependent on their value.
-            ui: Optional[UIElement[Any, Any]] = None
+            ui: UIElement[Any, Any] | None = None
             if ref in scope and isinstance(scope[ref], UIElement):
                 ui = scope[ref]
             elif ctx:
@@ -769,7 +653,10 @@ class BlockHasher:
         return SerialRefs(refs, {}, stateful_refs)
 
     def serialize_and_dequeue_content_refs(
-        self, refs: set[Name], scope: dict[Name, Any]
+        self,
+        refs: set[Name],
+        scope: dict[Name, Any],
+        ctx: RuntimeContext | None = None,
     ) -> SerialRefs:
         """Use hashable references to update the hash object and dequeue them.
 
@@ -788,6 +675,7 @@ class BlockHasher:
         Args:
             refs: A set of reference names unaccounted for.
             scope: A dictionary representing the current scope.
+            ctx: Optional runtime context for memoization.
 
         Returns a filtered list of remaining references that were not utilized
         in updating the hash, and a dictionary of the content serialization.
@@ -796,6 +684,7 @@ class BlockHasher:
 
         content_serialization = {}
         refs = set(refs)
+        defining_cells: set[CellId_t] = set()
         # Content addressed hash is valid if every reference is accounted for
         # and can be shown to be a primitive value.
         imports = get_imports(scope)
@@ -827,6 +716,16 @@ class BlockHasher:
                 continue
             value = scope[local_ref]
 
+            # Check memo before expensive serialization
+            if (
+                ctx is not None
+                and self._is_memoizable(local_ref, value, ctx)
+                and local_ref in ctx.cache.hash_memo
+            ):
+                content_serialization[ref] = ctx.cache.hash_memo[local_ref]
+                refs.remove(local_ref)
+                continue
+
             serial_value = None
             if is_primitive(value):
                 serial_value = primitive_to_bytes(value)
@@ -856,9 +755,31 @@ class BlockHasher:
                 continue
 
             if serial_value is not None:
-                content_serialization[ref] = serial_value
+                _hash = hashlib.new(self.hash_alg.name, usedforsecurity=False)
+                _hash.update(serial_value)
+                hash_digest = _hash.digest()
+                content_serialization[ref] = hash_digest
+                if ctx is not None and self._is_memoizable(
+                    local_ref, value, ctx
+                ):
+                    # Local ref as a key is sufficient, because values defined in
+                    # cell are not memoizable and rebinds will clean up the
+                    # cache via cell life cycle.
+                    ctx.cache.hash_memo[local_ref] = hash_digest
+                    defining_cells |= self.graph.definitions.get(
+                        local_ref, set()
+                    )
             # Fall through means that the references should be dequeued.
             refs.remove(local_ref)
+
+        # Register lifecycle cleanup — deduped, at most one per cell
+        if ctx:
+            for def_cell in defining_cells:
+                ctx.cell_lifecycle_registry.inject(
+                    def_cell,
+                    HashMemoCleanup(),
+                )
+
         return SerialRefs(refs, content_serialization, set())
 
     def serialize_and_dequeue_stateful_content_refs(
@@ -902,6 +823,8 @@ class BlockHasher:
             refs, scope, ctx
         )
         # Attempt content hash again on the extracted stateful refs.
+        # Do not pass ctx — stateful values can change between cells,
+        # so memoization is unsafe here.
         refs, content_serialization, _ = (
             self.serialize_and_dequeue_content_refs(refs, scope)
         )
@@ -933,7 +856,7 @@ class BlockHasher:
         refs: set[Name],
         parents: set[CellId_t],
         scope: dict[str, Any],
-        ctx: Optional[RuntimeContext] = None,
+        ctx: RuntimeContext | None = None,
     ) -> set[Name]:
         """Determines and uses the hash of refs' cells to update the hash.
 
@@ -993,7 +916,7 @@ class BlockHasher:
         return refs
 
     def hash_and_verify_context_refs(
-        self, refs: set[Name], context: Optional[ast.Module]
+        self, refs: set[Name], context: ast.Module | None
     ) -> None:
         """Utilizes the provided context to update the hash with sanity check.
 
@@ -1022,13 +945,11 @@ class BlockHasher:
         ref_cells = set().union(
             *[self.graph.definitions.get(ref, set()) for ref in refs]
         )
-        ref_cells |= set(
-            [
-                cell
-                for ref in refs
-                if (cell := get_cell_from_local(ref, self.cell_id))
-            ]
-        )
+        ref_cells |= {
+            cell
+            for ref in refs
+            if (cell := get_cell_from_local(ref, self.cell_id))
+        }
         assert len(ref_cells) == 1, (
             "Inconsistent references, cannot determine execution path. "
             f"Got {ref_cells} expected set({self.cell_id}). "
@@ -1113,10 +1034,10 @@ def cache_attempt_from_hash(
     cell_id: CellId_t,
     scope: dict[str, Any],
     *,
-    context: Optional[ast.Module] = None,
+    context: ast.Module | None = None,
     pin_modules: bool = False,
     hash_type: str = DEFAULT_HASH,
-    scoped_refs: Optional[set[Name]] = None,
+    scoped_refs: set[Name] | None = None,
     loader: Loader,
     as_fn: bool = False,
 ) -> Cache:
@@ -1156,8 +1077,8 @@ def content_cache_attempt_from_base(
     previous_block: BlockHasher,
     scope: dict[str, Any],
     loader: Loader,
-    scoped_refs: Optional[set[Name]] = None,
-    required_refs: Optional[set[Name]] = None,
+    scoped_refs: set[Name] | None = None,
+    required_refs: set[Name] | None = None,
     *,
     as_fn: bool = False,
     sensitive: bool = False,

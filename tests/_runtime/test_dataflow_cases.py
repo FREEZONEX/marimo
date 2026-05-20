@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -37,16 +37,16 @@ class GraphTestCase:
     code: dict[str, str]
 
     # Expected graph structure
-    expected_parents: Optional[dict[str, Iterable[str]]] = None
-    expected_children: Optional[dict[str, Iterable[str]]] = None
-    expected_stale: Optional[Iterable[str]] = None
+    expected_parents: dict[str, Iterable[str]] | None = None
+    expected_children: dict[str, Iterable[str]] | None = None
+    expected_stale: Iterable[str] | None = None
 
     # Expected refs/defs
-    expected_refs: Optional[dict[str, Iterable[str]]] = None
-    expected_defs: Optional[dict[str, Iterable[str]]] = None
+    expected_refs: dict[str, Iterable[str]] | None = None
+    expected_defs: dict[str, Iterable[str]] | None = None
 
     enabled: bool = True
-    xfail: Union[bool, str] = False
+    xfail: bool | str = False
 
     def __post_init__(self) -> None:
         # Convert all to a []
@@ -154,6 +154,7 @@ PYTHON_CASES = [
 SQL_CASES = [
     GraphTestCase(
         name="python -> sql",
+        enabled=HAS_DUCKDB,
         code={
             "0": "df = pd.read_csv('data.csv')",
             "1": "result = mo.sql(f'FROM df WHERE name = {name}')",
@@ -165,6 +166,7 @@ SQL_CASES = [
     ),
     GraphTestCase(
         name="sql -> python via output",
+        enabled=HAS_DUCKDB,
         code={
             "0": "result = mo.sql(f'FROM my_table WHERE name = {name}')",
             "1": "df = result.head()",
@@ -176,6 +178,7 @@ SQL_CASES = [
     ),
     GraphTestCase(
         name="sql -/> python when creating a table",
+        enabled=HAS_DUCKDB,
         code={
             "0": "_ = mo.sql(f'CREATE TABLE my_table (name STRING)')",
             "1": "my_table = df.head()",
@@ -187,6 +190,7 @@ SQL_CASES = [
     ),
     GraphTestCase(
         name="sql redefinition",
+        enabled=HAS_DUCKDB,
         code={
             "0": "df = pd.read_csv('data.csv')",
             "1": "df = mo.sql(f'FROM df')",

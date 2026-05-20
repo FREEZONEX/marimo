@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from marimo import _loggers
 from marimo._data.models import (
@@ -132,13 +132,13 @@ class AdbcConnectionCatalog:
         *,
         adbc_connection: AdbcDbApiConnection,
         dialect: str,
-        engine_name: Optional[VariableName],
+        engine_name: VariableName | None,
     ) -> None:
         self._adbc_connection = adbc_connection
         self._dialect = dialect
         self._engine_name = engine_name
 
-    def get_default_database(self) -> Optional[str]:
+    def get_default_database(self) -> str | None:
         try:
             return self._adbc_connection.adbc_current_catalog
         except Exception:
@@ -147,7 +147,7 @@ class AdbcConnectionCatalog:
             LOGGER.debug("Failed to read ADBC current catalog", exc_info=True)
             return None
 
-    def get_default_schema(self) -> Optional[str]:
+    def get_default_schema(self) -> str | None:
         try:
             return self._adbc_connection.adbc_current_db_schema
         except Exception:
@@ -155,7 +155,7 @@ class AdbcConnectionCatalog:
             return None
 
     def _resolve_should_auto_discover(
-        self, value: Union[bool, Literal["auto"]]
+        self, value: bool | Literal["auto"]
     ) -> bool:
         if value == "auto":
             return self._dialect.lower() in CHEAP_DISCOVERY_DATABASES
@@ -164,9 +164,9 @@ class AdbcConnectionCatalog:
     def get_databases(
         self,
         *,
-        include_schemas: Union[bool, Literal["auto"]],
-        include_tables: Union[bool, Literal["auto"]],
-        include_table_details: Union[bool, Literal["auto"]],
+        include_schemas: bool | Literal["auto"],
+        include_tables: bool | Literal["auto"],
+        include_table_details: bool | Literal["auto"],
     ) -> list[Database]:
         databases: list[Database] = []
         include_schemas_bool = self._resolve_should_auto_discover(
@@ -321,7 +321,7 @@ class AdbcConnectionCatalog:
 
     def get_table_details(
         self, *, table_name: str, schema_name: str, database_name: str
-    ) -> Optional[DataTable]:
+    ) -> DataTable | None:
         _ = database_name
         try:
             schema = self._adbc_connection.adbc_get_table_schema(
@@ -373,7 +373,7 @@ class AdbcDBAPIEngine(SQLConnection[AdbcDbApiConnection]):
     def __init__(
         self,
         connection: AdbcDbApiConnection,
-        engine_name: Optional[VariableName] = None,
+        engine_name: VariableName | None = None,
     ) -> None:
         super().__init__(connection, engine_name)
         self._catalog = AdbcConnectionCatalog(
@@ -457,18 +457,31 @@ class AdbcDBAPIEngine(SQLConnection[AdbcDbApiConnection]):
             auto_discover_columns=False,
         )
 
-    def get_default_database(self) -> Optional[str]:
+    def get_default_database(self) -> str | None:
         return self._catalog.get_default_database()
 
-    def get_default_schema(self) -> Optional[str]:
+    def get_default_schema(self) -> str | None:
         return self._catalog.get_default_schema()
+
+    # TODO: The following methods are currently not implemented.
+    # We should consider implementing these in the future for better performance when users don't want to fetch everything.
+    def get_schemas(
+        self,
+        *,
+        database: str | None,
+        include_tables: bool,
+        include_table_details: bool,
+    ) -> list[Schema]:
+        """Get all schemas and optionally their tables. Keys are schema names."""
+        _, _, _ = database, include_tables, include_table_details
+        return []
 
     def get_databases(
         self,
         *,
-        include_schemas: Union[bool, Literal["auto"]],
-        include_tables: Union[bool, Literal["auto"]],
-        include_table_details: Union[bool, Literal["auto"]],
+        include_schemas: bool | Literal["auto"],
+        include_tables: bool | Literal["auto"],
+        include_table_details: bool | Literal["auto"],
     ) -> list[Database]:
         return self._catalog.get_databases(
             include_schemas=include_schemas,
@@ -487,7 +500,7 @@ class AdbcDBAPIEngine(SQLConnection[AdbcDbApiConnection]):
 
     def get_table_details(
         self, *, table_name: str, schema_name: str, database_name: str
-    ) -> Optional[DataTable]:
+    ) -> DataTable | None:
         return self._catalog.get_table_details(
             table_name=table_name,
             schema_name=schema_name,
@@ -495,7 +508,7 @@ class AdbcDBAPIEngine(SQLConnection[AdbcDbApiConnection]):
         )
 
     def execute(
-        self, query: str, parameters: Optional[Sequence[Any]] = None
+        self, query: str, parameters: Sequence[Any] | None = None
     ) -> Any:
         sql_output_format = self.sql_output_format()
         cursor = self._connection.cursor()
@@ -521,7 +534,8 @@ class AdbcDBAPIEngine(SQLConnection[AdbcDbApiConnection]):
                 return pl.from_arrow(arrow_table)
 
             def convert_to_pandas() -> pd.DataFrame:
-                return arrow_table.to_pandas()
+                df: pd.DataFrame = arrow_table.to_pandas()
+                return df
 
             result = convert_to_output(
                 sql_output_format=sql_output_format,

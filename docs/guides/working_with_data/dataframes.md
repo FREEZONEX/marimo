@@ -47,10 +47,12 @@ df
 
 ```python
 import polars as pl
+import urllib.request
 
-df = pl.read_json(
-"https://raw.githubusercontent.com/vega/vega-datasets/master/data/cars.json"
-)
+url = "https://raw.githubusercontent.com/vega/vega-datasets/master/data/cars.json"
+
+with urllib.request.urlopen(url) as response:
+    df = pl.read_json(response.read())
 df
 ```
 
@@ -477,7 +479,7 @@ When you run a SQL cell in marimo, you can get the output returned as a datafram
 </figure>
 </div>
 
-Alternatively you can also use the [marimo configuration file](/guides/configuration/#user-configuration) to configure the default SQL output. 
+Alternatively you can also use the [marimo configuration file](../configuration/index.md#user-configuration) to configure the default SQL output. 
 
 ```toml
 [runtime]

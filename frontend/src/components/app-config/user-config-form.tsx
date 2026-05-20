@@ -2,6 +2,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { atom, useAtom, useAtomValue, useSetAtom } from "jotai";
+import { merge } from "lodash-es";
 import {
   AlertTriangleIcon,
   BrainIcon,
@@ -14,11 +15,11 @@ import {
 } from "lucide-react";
 import React, { useId, useRef } from "react";
 import { useLocale } from "react-aria";
-import type { FieldValues } from "react-hook-form";
 import { useForm } from "react-hook-form";
 import type z from "zod";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { acceptCompletionOnEnterAtom } from "@/core/codemirror/completion/accept-on-enter-atom";
 import {
   Form,
   FormControl,
@@ -31,7 +32,6 @@ import {
 import { Kbd } from "@/components/ui/kbd";
 import { NativeSelect } from "@/components/ui/native-select";
 import { NumberField } from "@/components/ui/number-field";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { KEYMAP_PRESETS } from "@/core/codemirror/keymaps/keymaps";
 import { capabilitiesAtom } from "@/core/config/capabilities";
 import { useUserConfig } from "@/core/config/config";
@@ -49,7 +49,6 @@ import { useDebouncedCallback } from "@/hooks/useDebounce";
 import { Banner } from "@/plugins/impl/common/error-banner";
 import { THEMES } from "@/theme/useTheme";
 import { arrayToggle } from "@/utils/arrays";
-import { cn } from "@/utils/cn";
 import { autoPopulateModels } from "../ai/ai-utils";
 import { keyboardShortcutsAtom } from "../editor/controls/keyboard-shortcuts";
 import { Badge } from "../ui/badge";
@@ -58,42 +57,9 @@ import { Tooltip } from "../ui/tooltip";
 import { AiConfig } from "./ai-config";
 import { formItemClasses, SettingGroup } from "./common";
 import { DataForm } from "./data-form";
+import { applyManualInjections, getDirtyValues } from "./get-dirty-values";
 import { IsOverridden } from "./is-overridden";
 import { OptionalFeatures } from "./optional-features";
-
-/**
- * Extract only the values that have been modified (dirty) from form state.
- * This prevents sending unchanged fields that could overwrite backend values.
- */
-export function getDirtyValues<T extends FieldValues>(
-  values: T,
-  dirtyFields: Partial<Record<keyof T, unknown>>,
-): Partial<T> {
-  const result: Partial<T> = {};
-  for (const key of Object.keys(dirtyFields) as (keyof T)[]) {
-    const dirty = dirtyFields[key];
-    const value = values[key];
-
-    // Skip if the value no longer exists (e.g., deleted from a record)
-    if (value === undefined) {
-      continue;
-    }
-
-    if (dirty === true) {
-      result[key] = value;
-    } else if (typeof dirty === "object" && dirty !== null) {
-      // Nested object - recurse
-      const nested = getDirtyValues(
-        value as FieldValues,
-        dirty as Partial<Record<string, unknown>>,
-      );
-      if (Object.keys(nested).length > 0) {
-        result[key] = nested as T[keyof T];
-      }
-    }
-  }
-  return result;
-}
 
 const categories = [
   {
@@ -159,6 +125,9 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
   onSubmitted,
 }) => {
   const [config, setConfig] = useUserConfig();
+  const [acceptOnEnter, setAcceptOnEnter] = useAtom(
+    acceptCompletionOnEnterAtom,
+  );
   const formElement = useRef<HTMLFormElement>(null);
   const setKeyboardShortcutsOpen = useSetAtom(keyboardShortcutsAtom);
   const [activeCategory, setActiveCategory] = useAtom(
@@ -174,6 +143,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
       pylsp: true,
       ty: true,
       basedpyright: true,
+      pyrefly: true,
     };
   }
 
@@ -189,7 +159,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
     defaultValues: config,
   });
 
-  const setAiModels = (values: UserConfig, dirtyAiConfig: UserConfig["ai"]) => {
+  const setAiModels = (
+    values: UserConfig["ai"],
+    dirtyAiConfig: UserConfig["ai"],
+  ) => {
     const { chatModel, editModel } = autoPopulateModels(values);
     if (chatModel || editModel) {
       dirtyAiConfig = {
@@ -215,19 +188,24 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
     // Only send values that were actually changed to avoid
     // overwriting backend values the form doesn't manage
     const dirtyValues = getDirtyValues(values, form.formState.dirtyFields);
+    applyManualInjections({
+      values,
+      dirtyValues,
+      touchedFields: form.formState.touchedFields,
+    });
     if (Object.keys(dirtyValues).length === 0) {
       return; // Nothing changed
     }
 
     // Auto-populate AI models when credentials are set, makes it easier to get started
     if (dirtyValues.ai) {
-      dirtyValues.ai = setAiModels(values, dirtyValues.ai);
+      dirtyValues.ai = setAiModels(values.ai, dirtyValues.ai);
     }
 
-    await saveUserConfig({ config: dirtyValues }).then(() => {
-      // Update local state with form values
-      setConfig((prev) => ({ ...prev, ...values }));
-    });
+    await saveUserConfig({ config: dirtyValues });
+    // Only apply the changed keys; this avoids stale request responses
+    // overwriting newer config changes.
+    setConfig((prev) => merge({}, prev, dirtyValues));
   };
   const onSubmit = useDebouncedCallback(onSubmitNotDebounced, FORM_DEBOUNCE);
   const handleAutoSubmit = submitMode === "auto" ? onSubmit : () => {};
@@ -483,6 +461,27 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
+              <div className="flex flex-col space-y-1">
+                <FormItem className={formItemClasses}>
+                  <FormLabel className="font-normal">
+                    Accept suggestion on Enter
+                  </FormLabel>
+                  <FormControl>
+                    <Checkbox
+                      data-testid="accept-completion-on-enter-checkbox"
+                      checked={acceptOnEnter}
+                      onCheckedChange={(checked) =>
+                        setAcceptOnEnter(Boolean(checked))
+                      }
+                    />
+                  </FormControl>
+                </FormItem>
+                <FormDescription>
+                  When unchecked, pressing Enter inserts a new line instead of
+                  accepting an autocomplete suggestion. Use Tab to accept
+                  suggestions.
+                </FormDescription>
+              </div>
               <FormField
                 control={form.control}
                 name="completion.signature_hint_on_typing"
@@ -610,6 +609,48 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         environment. Please install{" "}
                         <Kbd className="inline">basedpyright</Kbd> in your
                         environment.
+                      </Banner>
+                    )}
+                  </div>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="language_servers.pyrefly.enabled"
+                render={({ field }) => (
+                  <div className="flex flex-col gap-1">
+                    <FormItem className={formItemClasses}>
+                      <FormLabel>
+                        <Badge variant="defaultOutline" className="mr-2">
+                          Beta
+                        </Badge>
+                        Pyrefly (
+                        <ExternalLink href="https://github.com/facebook/pyrefly">
+                          docs
+                        </ExternalLink>
+                        )
+                      </FormLabel>
+                      <FormControl>
+                        <Checkbox
+                          data-testid="pyrefly-checkbox"
+                          checked={field.value}
+                          disabled={field.disabled}
+                          onCheckedChange={(checked) => {
+                            field.onChange(Boolean(checked));
+                          }}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                      <IsOverridden
+                        userConfig={config}
+                        name="language_servers.pyrefly.enabled"
+                      />
+                    </FormItem>
+                    {field.value && !capabilities.pyrefly && (
+                      <Banner kind="danger">
+                        Pyrefly is not available in your current environment.
+                        Please install <Kbd className="inline">pyrefly</Kbd> in
+                        your environment.
                       </Banner>
                     )}
                   </div>
@@ -1241,34 +1282,6 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
             />
             <FormField
               control={form.control}
-              name="experimental.performant_table_charts"
-              render={({ field }) => (
-                <div className="flex flex-col gap-y-1">
-                  <FormItem className={formItemClasses}>
-                    <FormLabel className="font-normal">
-                      Performant Table Charts
-                    </FormLabel>
-                    <FormControl>
-                      <Checkbox
-                        data-testid="performant-table-charts-checkbox"
-                        checked={field.value === true}
-                        onCheckedChange={field.onChange}
-                      />
-                    </FormControl>
-                  </FormItem>
-                  <IsOverridden
-                    userConfig={config}
-                    name="experimental.performant_table_charts"
-                  />
-                  <FormDescription>
-                    Enable experimental table charts which are computed on the
-                    backend.
-                  </FormDescription>
-                </div>
-              )}
-            />
-            <FormField
-              control={form.control}
               name="experimental.external_agents"
               render={({ field }) => (
                 <div className="flex flex-col gap-y-1">
@@ -1299,65 +1312,6 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                 </div>
               )}
             />
-            <FormField
-              control={form.control}
-              name="experimental.chat_modes"
-              render={({ field }) => (
-                <div className="flex flex-col gap-y-1">
-                  <FormItem className={formItemClasses}>
-                    <FormLabel className="font-normal">Chat Mode</FormLabel>
-                    <FormControl>
-                      <Checkbox
-                        data-testid="chat-mode-checkbox"
-                        checked={field.value === true}
-                        onCheckedChange={field.onChange}
-                      />
-                    </FormControl>
-                  </FormItem>
-                  <IsOverridden
-                    userConfig={config}
-                    name="experimental.chat_modes"
-                  />
-                  <FormDescription>
-                    Switch between different modes in the Chat sidebar, to
-                    enable tool use.
-                  </FormDescription>
-                </div>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="experimental.server_side_pdf_export"
-              render={({ field }) => (
-                <div className="flex flex-col gap-y-1">
-                  <FormItem className={formItemClasses}>
-                    <FormLabel className="font-normal">
-                      Better PDF Export
-                    </FormLabel>
-                    <FormControl>
-                      <Checkbox
-                        data-testid="server-side-pdf-export-checkbox"
-                        checked={field.value === true}
-                        onCheckedChange={field.onChange}
-                      />
-                    </FormControl>
-                  </FormItem>
-                  <IsOverridden
-                    userConfig={config}
-                    name="experimental.server_side_pdf_export"
-                  />
-                  <FormDescription>
-                    Enable PDF export using{" "}
-                    <Kbd className="inline">nbconvert</Kbd> and{" "}
-                    <Kbd className="inline">playwright</Kbd>. Refer to{" "}
-                    <ExternalLink href="https://docs.marimo.io/guides/exporting/#exporting-to-pdf-slides-or-rst">
-                      the docs
-                    </ExternalLink>
-                    .
-                  </FormDescription>
-                </div>
-              )}
-            />
           </SettingGroup>
         );
     }
@@ -1371,6 +1325,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
       show your current configuration and file location.
     </p>
   );
+  void marimoVersion;
+  void locale;
+  void renderBody;
+  void configMessage;
 
   return (
     <Form {...form}>

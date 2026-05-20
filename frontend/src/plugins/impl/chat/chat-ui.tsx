@@ -2,7 +2,10 @@
 
 import { type UIMessage, useChat } from "@ai-sdk/react";
 import { ChatBubbleIcon } from "@radix-ui/react-icons";
-import { PopoverAnchor } from "@radix-ui/react-popover";
+import { Popover as PopoverPrimitive } from "radix-ui";
+
+const PopoverAnchor = PopoverPrimitive.Anchor;
+
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import {
   createUIMessageStreamResponse,
@@ -10,18 +13,18 @@ import {
   type TextUIPart,
   type UIMessageChunk,
 } from "ai";
-import { startCase } from "lodash-es";
 import {
   BotMessageSquareIcon,
   HelpCircleIcon,
   PaperclipIcon,
   RotateCwIcon,
-  SendIcon,
+  SendHorizontalIcon,
   SettingsIcon,
   Trash2Icon,
   X,
 } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
+import { z } from "zod";
 import { renderUIMessage } from "@/components/chat/chat-display";
 import { convertToFileUIPart } from "@/components/chat/chat-utils";
 import {
@@ -56,6 +59,7 @@ import {
 import { cn } from "@/utils/cn";
 import { Logger } from "@/utils/Logger";
 import { Objects } from "@/utils/objects";
+import { Strings } from "@/utils/strings";
 import { ErrorBanner } from "../common/error-banner";
 import type { PluginFunctions } from "./ChatPlugin";
 import type { ChatConfig } from "./types";
@@ -66,10 +70,21 @@ interface Props extends PluginFunctions {
   showConfigurationControls: boolean;
   maxHeight: number | undefined;
   allowAttachments: boolean | string[];
+  disabled: boolean;
   value: UIMessage[];
   setValue: (messages: UIMessage[]) => void;
   host: HTMLElement;
 }
+
+const ChatMessageIncomingSchema = z.object({
+  type: z.literal("stream_chunk"),
+  message_id: z.string(),
+  content: z
+    .any()
+    .nullable()
+    .transform((val) => val as UIMessageChunk | null),
+  is_final: z.boolean().optional(),
+});
 
 export const Chatbot: React.FC<Props> = (props) => {
   const [input, setInput] = useState("");
@@ -252,15 +267,13 @@ export const Chatbot: React.FC<Props> = (props) => {
     props.host as HTMLElementNotDerivedFromRef,
     MarimoIncomingMessageEvent.TYPE,
     (e) => {
-      const message = e.detail.message;
-      if (
-        typeof message !== "object" ||
-        message === null ||
-        !("type" in message) ||
-        message.type !== "stream_chunk"
-      ) {
+      const parsedMessage = ChatMessageIncomingSchema.safeParse(
+        e.detail.message,
+      );
+      if (!parsedMessage.success) {
         return;
       }
+      const message = parsedMessage.data;
 
       // Push to the stream for useChat to process
       const controller = frontendStreamControllerRef.current;
@@ -268,17 +281,10 @@ export const Chatbot: React.FC<Props> = (props) => {
         return;
       }
 
-      const frontendMessage = message as {
-        type: string;
-        message_id: string;
-        content?: UIMessageChunk;
-        is_final?: boolean;
-      };
-
-      if (frontendMessage.content) {
-        controller.enqueue(frontendMessage.content);
+      if (message.content) {
+        controller.enqueue(message.content);
       }
-      if (frontendMessage.is_final) {
+      if (message.is_final) {
         controller.close();
         frontendStreamControllerRef.current = null;
       }
@@ -448,6 +454,9 @@ export const Chatbot: React.FC<Props> = (props) => {
       <form
         onSubmit={async (evt) => {
           evt.preventDefault();
+          if (props.disabled) {
+            return;
+          }
 
           const fileParts = files
             ? await convertToFileUIPart(files)
@@ -460,7 +469,12 @@ export const Chatbot: React.FC<Props> = (props) => {
           resetInput();
         }}
         ref={formRef}
-        className="flex w-full border-t border-(--slate-6) px-2 py-1 items-center"
+        // oxlint-ignore-next-line -- inert is used to disable the entire form
+        inert={props.disabled || undefined}
+        className={cn(
+          "flex w-full border-t border-(--slate-6) px-2 py-1 items-center",
+          props.disabled && "opacity-50 cursor-not-allowed",
+        )}
       >
         {props.showConfigurationControls && (
           <ConfigPopup config={config} onChange={setConfig} />
@@ -559,10 +573,10 @@ export const Chatbot: React.FC<Props> = (props) => {
           type="submit"
           disabled={isLoading || !input}
           variant="outline"
-          size="sm"
+          size="xs"
           className="text-(--slate-11)"
         >
-          <SendIcon className="h-5 w-5" />
+          <SendHorizontalIcon className="h-4 w-4" />
         </Button>
       </form>
     </div>
@@ -659,7 +673,7 @@ const ConfigPopup: React.FC<{
                 htmlFor={key}
                 className="flex w-full justify-between col-span-3 align-end"
               >
-                {startCase(key)}
+                {Strings.startCase(key)}
                 <Tooltip
                   delayDuration={200}
                   side="top"

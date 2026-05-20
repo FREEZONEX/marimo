@@ -7,6 +7,8 @@ import swiperCssScrollbar from "swiper/css/scrollbar?inline";
 import swiperCssVirtual from "swiper/css/virtual?inline";
 import swiperCss from "swiper/css?inline";
 import { z } from "zod";
+import slidesCss from "@/components/slides/slides.css?inline";
+import swiperSlidesCss from "@/components/slides/swiper-slides.css?inline";
 import type {
   IStatelessPlugin,
   IStatelessPluginProps,
@@ -32,6 +34,8 @@ export class CarouselPlugin implements IStatelessPlugin<Data> {
     swiperCssNavigation,
     swiperCssPagination,
     swiperCssScrollbar,
+    slidesCss,
+    swiperSlidesCss,
   ];
 
   render(props: IStatelessPluginProps<Data>): JSX.Element {
@@ -44,5 +48,5 @@ export class CarouselPlugin implements IStatelessPlugin<Data> {
 }
 
 const LazySlidesComponent = React.lazy(
-  () => import("../../../components/slides/slides-component"),
+  () => import("../../../components/slides/swiper-component"),
 );

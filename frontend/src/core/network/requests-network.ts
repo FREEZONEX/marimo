@@ -1,10 +1,23 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-import { once } from "lodash-es";
+import { once } from "@/utils/once";
 import { getRuntimeManager } from "../runtime/config";
 import { API, createClientWithRuntimeManager } from "./api";
 import { waitForConnectionOpen } from "./connection";
 import type { EditRequests, RunRequests } from "./types";
+
+/**
+ * Options for POSTing FormData via openapi-fetch. openapi-fetch types
+ * request bodies from the JSON schema, so we bypass the body type and
+ * override the serializer to pass the FormData through unchanged; the
+ * browser then sets the multipart Content-Type with boundary.
+ */
+function multipartInit(formData: FormData) {
+  return {
+    body: formData as never,
+    bodySerializer: (body: unknown) => body as never,
+  };
+}
 
 const { handleResponse, handleResponseReturnNull } = API;
 
@@ -49,10 +62,10 @@ export function createNetworkRequests(): EditRequests & RunRequests {
         })
         .then(handleResponseReturnNull);
     },
-    syncCellIds: async (request) => {
+    sendDocumentTransaction: async (request) => {
       await waitForConnectionOpen();
       return getClient()
-        .POST("/api/kernel/sync/cell_ids", {
+        .POST("/api/document/transaction", {
           body: request,
           params: getParams(),
         })
@@ -235,6 +248,14 @@ export function createNetworkRequests(): EditRequests & RunRequests {
         })
         .then(handleResponseReturnNull);
     },
+    previewSQLSchemaList: (request) => {
+      return getClient()
+        .POST("/api/datasources/preview_sql_schema_list", {
+          body: request,
+          params: getParams(),
+        })
+        .then(handleResponseReturnNull);
+    },
     previewDataSourceConnection: (request) => {
       return getClient()
         .POST("/api/datasources/preview_datasource_connection", {
@@ -290,22 +311,32 @@ export function createNetworkRequests(): EditRequests & RunRequests {
     },
     sendCreateFileOrFolder: async (request) => {
       await waitForConnectionOpen();
+      const formData = new FormData();
+      formData.append("path", request.path);
+      formData.append("type", request.type);
+      formData.append("name", request.name);
+      if (request.file) {
+        formData.append("file", request.file, request.name);
+      }
       return getClient()
-        .POST("/api/files/create", {
-          body: request,
-        })
+        .POST("/api/files/create", multipartInit(formData))
         .then(handleResponse);
     },
     sendDeleteFileOrFolder: async (request) => {
-      await waitForConnectionOpen();
       return getClient()
         .POST("/api/files/delete", {
           body: request,
         })
         .then(handleResponse);
     },
+    sendCopyFileOrFolder: async (request) => {
+      return getClient()
+        .POST("/api/files/copy", {
+          body: request,
+        })
+        .then(handleResponse);
+    },
     sendRenameFileOrFolder: async (request) => {
-      await waitForConnectionOpen();
       return getClient()
         .POST("/api/files/move", {
           body: request,
@@ -375,6 +406,15 @@ export function createNetworkRequests(): EditRequests & RunRequests {
     exportAsMarkdown: async (request) => {
       return getClient()
         .POST("/api/export/markdown", {
+          body: request,
+          parseAs: "text",
+          params: getParams(),
+        })
+        .then(handleResponse);
+    },
+    exportAsIPYNB: async (request) => {
+      return getClient()
+        .POST("/api/export/ipynb", {
           body: request,
           parseAs: "text",
           params: getParams(),
@@ -484,6 +524,22 @@ export function createNetworkRequests(): EditRequests & RunRequests {
       return getClient()
         .POST("/api/cache/info", {
           body: {},
+          params: getParams(),
+        })
+        .then(handleResponseReturnNull);
+    },
+    listStorageEntries: (request) => {
+      return getClient()
+        .POST("/api/storage/list_entries", {
+          body: request,
+          params: getParams(),
+        })
+        .then(handleResponseReturnNull);
+    },
+    downloadStorage: (request) => {
+      return getClient()
+        .POST("/api/storage/download", {
+          body: request,
           params: getParams(),
         })
         .then(handleResponseReturnNull);

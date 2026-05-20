@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from typing import Literal, Optional
+from typing import Literal
 
 import click
 from click import echo
 
 from marimo import _loggers
+from marimo._cli.errors import MarimoCLIRuntimeError
 from marimo._cli.print import green, muted, red
 from marimo._config.settings import GLOBAL_SETTINGS
 from marimo._utils.url import is_url
@@ -17,7 +18,7 @@ LOGGER = _loggers.marimo_logger()
 
 
 def prompt_run_in_docker_container(
-    name: str | None, trusted: Optional[bool] = None
+    name: str | None, trusted: bool | None = None
 ) -> bool:
     if GLOBAL_SETTINGS.IN_SECURE_ENVIRONMENT:
         return False
@@ -76,7 +77,7 @@ def echo_red(text: str) -> None:
 
 # Run a marimo file in a docker container
 # marimo edit https://github.com/some/file.py --docker
-def _check_port_in_use(port: int) -> Optional[str]:
+def _check_port_in_use(port: int) -> str | None:
     try:
         result = subprocess.run(
             ["docker", "ps", "--format", "{{.ID}}\t{{.Ports}}", "--no-trunc"],
@@ -97,7 +98,7 @@ def run_in_docker(
     file_path: str | None,
     mode: Literal["edit", "run"],
     *,
-    port: Optional[int],
+    port: int | None,
     debug: bool = False,
 ) -> None:
     echo(f"Starting {green('containerized')} marimo notebook")
@@ -107,45 +108,44 @@ def run_in_docker(
         port = 8080
 
     if not _check_docker_installed():
-        echo_red(
+        raise MarimoCLIRuntimeError(
             "Docker is not installed. Please install Docker and try again."
         )
-        sys.exit(1)
 
     if not _check_docker_running():
-        echo_red(
+        raise MarimoCLIRuntimeError(
             "Docker daemon is not running. Please start Docker and try again."
         )
-        sys.exit(1)
 
     # Check if the port is already in use
     existing_container = _check_port_in_use(port)
     if existing_container:
-        echo_red(
-            f"Port {port} is already in use by container {existing_container}"
+        stop_command = muted(f"docker stop {existing_container}")
+        raise MarimoCLIRuntimeError(
+            f"Port {port} is already in use by container {existing_container}.\n"
+            "To remove the existing container, run:\n"
+            f"  {stop_command}\n"
+            "Then try running this command again."
         )
-        echo("To remove the existing container, run:")
-        echo(muted(f"  docker stop {existing_container}"))
-        echo("Then try running this command again.")
-        sys.exit(1)
 
     # Define the container image and command
     image = "ghcr.io/astral-sh/uv:0.9.25-python3.14-bookworm"
-    container_command = [
-        "uvx",
-        "marimo",
-        "-d" if debug else "",
-        mode,
-        "--sandbox",
-        "--no-token",
-        "-p",
-        f"{port}",
-        "--host",
-        host,
-        file_path if file_path is not None else "",
-    ]
-    # Remove empty strings from command
-    container_command = [arg for arg in container_command if arg]
+    container_command = ["uvx", "marimo"]
+    if debug:
+        container_command.append("-d")
+    container_command.extend(
+        [
+            mode,
+            "--sandbox",
+            "--no-token",
+            "-p",
+            f"{port}",
+            "--host",
+            host,
+        ]
+    )
+    if file_path is not None:
+        container_command.append(file_path)
 
     # Construct the docker run command
     docker_command = [
@@ -189,8 +189,9 @@ def run_in_docker(
             except KeyboardInterrupt:
                 echo("Received keyboard interrupt.")
     except subprocess.CalledProcessError as e:
-        echo_red(f"Failed to start Docker container: {e}")
-        sys.exit(1)
+        raise MarimoCLIRuntimeError(
+            f"Failed to start Docker container: {e}"
+        ) from e
     finally:
         echo("Stopping and removing container...")
         try:

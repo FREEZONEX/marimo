@@ -1,22 +1,30 @@
 /* Copyright 2026 Marimo. All rights reserved. */
-import DOMPurify, { type Config } from "dompurify";
 import { atom, useAtomValue } from "jotai";
 import { hasRunAnyCellAtom } from "@/components/editor/cell/useRunCells";
 import { autoInstantiateAtom } from "@/core/config/config";
 import { getInitialAppMode } from "@/core/mode";
+import { hasTrustedExportContext } from "@/core/static/export-context";
+
+// Re-export so existing consumers don't break.
+export { sanitizeHtml } from "./sanitize-html";
 
 /**
- * Whether to sanitize the html.
- * When running as an app or with auto_instantiate enabled
- * we ignore sanitization because they should be treated as a website.
+ * Whether to sanitize the html. Trust signals match
+ * `hasTrustedNotebookContext` in `@/core/static/export-context`.
+ * Kept as a jotai atom so consumers re-render when `hasRunAnyCellAtom`
+ * flips after the user runs a cell.
  */
 const sanitizeHtmlAtom = atom<boolean>((get) => {
   const hasRunAnyCell = get(hasRunAnyCellAtom);
   const autoInstantiate = get(autoInstantiateAtom);
 
-  // If a user has specifically run at least one cell or auto_instantiate is enabled, we don't need to sanitize.
-  // HTML needs to be rich to allow for interactive widgets and other dynamic content.
   if (hasRunAnyCell || autoInstantiate) {
+    return false;
+  }
+
+  // Trusted export context is installed once at page load by a first-party
+  // script (frozen + non-configurable), so a direct read is safe and stable.
+  if (hasTrustedExportContext()) {
     return false;
   }
 
@@ -41,48 +49,4 @@ const sanitizeHtmlAtom = atom<boolean>((get) => {
  */
 export function useSanitizeHtml() {
   return useAtomValue(sanitizeHtmlAtom);
-}
-
-// preserve target=_blank https://github.com/cure53/DOMPurify/issues/317#issuecomment-912474068
-const TEMPORARY_ATTRIBUTE = "data-temp-href-target";
-DOMPurify.addHook("beforeSanitizeAttributes", (node) => {
-  if (node.tagName === "A") {
-    if (!node.hasAttribute("target")) {
-      node.setAttribute("target", "_self");
-    }
-
-    if (node.hasAttribute("target")) {
-      node.setAttribute(TEMPORARY_ATTRIBUTE, node.getAttribute("target") || "");
-    }
-  }
-});
-
-DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-  if (node.tagName === "A" && node.hasAttribute(TEMPORARY_ATTRIBUTE)) {
-    node.setAttribute("target", node.getAttribute(TEMPORARY_ATTRIBUTE) || "");
-    node.removeAttribute(TEMPORARY_ATTRIBUTE);
-    if (node.getAttribute("target") === "_blank") {
-      node.setAttribute("rel", "noopener noreferrer");
-    }
-  }
-});
-
-/**
- * This removes script tags, form tags, iframe tags, and other potentially dangerous tags
- */
-export function sanitizeHtml(html: string) {
-  const sanitizationOptions: Config = {
-    // Default to permit HTML, SVG and MathML, this limits to HTML only
-    USE_PROFILES: { html: true, svg: true, mathMl: true },
-    // glue elements like style, script or others to document.body and prevent unintuitive browser behavior in several edge-cases
-    FORCE_BODY: true,
-    CUSTOM_ELEMENT_HANDLING: {
-      tagNameCheck: /^(marimo-[A-Za-z][\w-]*|iconify-icon)$/,
-      attributeNameCheck: /^[A-Za-z][\w-]*$/,
-    },
-    // This flag means we should sanitize such that is it safe for XML,
-    // but this is only used for HTML content.
-    SAFE_FOR_XML: !html.includes("marimo-mermaid"),
-  };
-  return DOMPurify.sanitize(html, sanitizationOptions);
 }

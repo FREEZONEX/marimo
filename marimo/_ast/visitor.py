@@ -7,7 +7,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Union
 from uuid import uuid4
 
 from marimo import _loggers
@@ -24,6 +24,9 @@ from marimo._ast.variables import is_local
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._sql.error_utils import log_sql_error
 from marimo._utils.strings import standardize_annotation_quotes
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 LOGGER = _loggers.marimo_logger()
 
@@ -44,8 +47,8 @@ class ImportData:
     # fully qualified import symbol:
     # import a.b => symbol == None
     # from a.b import c => symbol == a.b.c
-    imported_symbol: Optional[str] = None
-    import_level: Optional[int] = None
+    imported_symbol: str | None = None
+    import_level: int | None = None
 
     def __post_init__(self) -> None:
         self.namespace = self.module.split(".")[0]
@@ -62,18 +65,10 @@ class AnnotationData:
 @dataclass
 class VariableData:
     # "table", "view", "schema", and "catalog" are SQL variables, not Python.
-    kind: Union[
-        Literal[
-            "function",
-            "class",
-            "import",
-            "variable",
-            # NB: only used when there's a need to stub. not generally carried
-            # on cell.
-            "temporary",
-        ],
-        SQLKind,
-    ] = "variable"
+    kind: (
+        Literal["function", "class", "import", "variable", "temporary"]
+        | SQLKind
+    ) = "variable"
 
     # If kind == function or class, it may be dependent on externally defined
     # variables.
@@ -91,13 +86,13 @@ class VariableData:
     unbounded_refs: set[Name] = field(default_factory=set)
 
     # References used for annotation (typing)
-    annotation_data: Optional[AnnotationData] = None
+    annotation_data: AnnotationData | None = None
 
     # For kind == import
-    import_data: Optional[ImportData] = None
+    import_data: ImportData | None = None
 
     # In the sql case, the name may be qualified
-    qualified_name: Optional[str] = None
+    qualified_name: str | None = None
 
     @property
     def language(self) -> Language:
@@ -129,7 +124,7 @@ class Block:
     is_comprehension: bool = False
 
     def is_defined(self, name: str) -> bool:
-        return any(name == defn for defn in self.defs)
+        return name in self.defs
 
 
 @dataclass
@@ -137,7 +132,7 @@ class ObscuredScope:
     """The scope in which a name is hidden."""
 
     # Variable id if this block hides a name
-    obscured: Optional[str] = None
+    obscured: str | None = None
 
 
 @dataclass
@@ -151,7 +146,7 @@ class RefData:
     # Ancestors of the block in which this ref was used
     parent_blocks: list[Block]
     # Only applicable for SQL cells
-    sql_ref: Optional[SQLRef] = None
+    sql_ref: SQLRef | None = None
 
 
 NamedNode = Union[
@@ -180,7 +175,7 @@ def find_sql_refs_cached(sql_statement: str) -> set[SQLRef]:
 class ScopedVisitor(ast.NodeVisitor):
     def __init__(
         self,
-        mangle_prefix: Optional[str] = None,
+        mangle_prefix: str | None = None,
         ignore_local: bool = False,
         on_def: Callable[[NamedNode, str, list[Block]], None] | None = None,
         on_ref: Callable[[NamedNode], None] | None = None,
@@ -253,11 +248,11 @@ class ScopedVisitor(ast.NodeVisitor):
         # so marking it as a deleted ref is in practice a big deal. For 100%
         # correctness we would prune unbound locals from refs, not here but
         # when variables added as defs and refs.
-        return set(
+        return {
             name
             for name in self._refs
             if any(ref.deleted for ref in self._refs[name])
-        )
+        }
 
     def _if_local_then_mangle(
         self, name: str, ignore_scope: bool = False
@@ -318,7 +313,7 @@ class ScopedVisitor(ast.NodeVisitor):
         name: Name,
         *,
         deleted: bool,
-        sql_ref: Optional[SQLRef] = None,
+        sql_ref: SQLRef | None = None,
     ) -> None:
         """Register a referenced name."""
         if name not in self._refs:
@@ -407,7 +402,7 @@ class ScopedVisitor(ast.NodeVisitor):
         """Pop a block from the block stack."""
         self.block_stack.pop()
 
-    def _push_obscured_scope(self, obscured: Optional[str]) -> None:
+    def _push_obscured_scope(self, obscured: str | None) -> None:
         """Push scope onto the stack."""
         self.obscured_scope_stack.append(ObscuredScope(obscured=obscured))
 
@@ -494,7 +489,7 @@ class ScopedVisitor(ast.NodeVisitor):
         return node
 
     def _visit_and_get_refs(
-        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
     ) -> tuple[set[Name], set[Name]]:
         """Create a ref scope for the variable to be declared (e.g. function,
         class), visit the children the node, propagate the refs to the higher
@@ -640,7 +635,7 @@ class ScopedVisitor(ast.NodeVisitor):
         ):
             self.language = "sql"
             first_arg = node.args[0]
-            sql: Optional[str] = None
+            sql: str | None = None
             if isinstance(first_arg, ast.Constant):
                 sql = first_arg.value
             elif isinstance(first_arg, ast.JoinedStr):
@@ -653,18 +648,7 @@ class ScopedVisitor(ast.NodeVisitor):
                 )
                 and sql
             ):
-                import duckdb  # type: ignore[import-not-found,import-untyped,unused-ignore] # noqa: E501
-
-                # Import ParseError outside try block so we can except it
-                # Use a Union approach to handle both cases
-                ParseErrorType: type[Exception]
-                if DependencyManager.sqlglot.has():
-                    from sqlglot.errors import ParseError as SQLGLOTParseError
-
-                    ParseErrorType = SQLGLOTParseError
-                else:
-                    # Fallback when sqlglot is not available
-                    ParseErrorType = Exception
+                import duckdb  # type: ignore[import-not-found,import-untyped,unused-ignore]
 
                 # TODO: Handle other SQL languages
                 # TODO: Get the engine so we can differentiate tables in diff engines
@@ -681,10 +665,13 @@ class ScopedVisitor(ast.NodeVisitor):
                     statements = duckdb.extract_statements(sql)
                 except (duckdb.ProgrammingError, duckdb.IOException):
                     # The user's sql query may have a syntax error,
-                    # or duckdb failed for an unknown reason; don't
-                    # break marimo.
-                    self.generic_visit(node)
-                    return node
+                    # or duckdb failed for an unknown reason.
+                    #
+                    # Don't bail out, and instead fall through to use sqlglot
+                    # for ref extraction on the full SQL string. This handles
+                    # cases where f-string placeholders produce SQL that
+                    # duckdb rejects but sqlglot can still parse.
+                    statements = []
                 except BaseException as e:
                     # We catch base exceptions because we don't want to
                     # fail due to bugs in duckdb -- users code should
@@ -697,8 +684,7 @@ class ScopedVisitor(ast.NodeVisitor):
                         rule_code="MF005",
                         sql_content=sql,
                     )
-                    self.generic_visit(node)
-                    return node
+                    statements = []
 
                 # Try to process each statement individually
                 # For some SQL types (e.g., PIVOT with certain clauses),
@@ -768,25 +754,7 @@ class ScopedVisitor(ast.NodeVisitor):
                         self._define(None, _catalog, VariableData("catalog"))
                         defined_names.add(_catalog)
 
-                    sql_refs: set[SQLRef] = set()
-                    try:
-                        # Take results
-                        sql_refs = find_sql_refs_cached(statement_sql)
-                    except (
-                        duckdb.ProgrammingError,
-                        duckdb.IOException,
-                        ParseErrorType,
-                        BaseException,
-                    ) as e:
-                        # Use first_arg (SQL string node) for accurate positioning
-                        log_sql_error(
-                            LOGGER.error,
-                            message=f"Error parsing SQL statement: {e}",
-                            exception=e,
-                            node=first_arg,
-                            rule_code="MF005",
-                            sql_content=statement_sql,
-                        )
+                    sql_refs = find_sql_refs_cached(statement_sql)
 
                     for ref in sql_refs:
                         name = ref.qualified_name
@@ -942,7 +910,10 @@ class ScopedVisitor(ast.NodeVisitor):
                     )
                     break
         else:
-            self.generic_visit(node)
+            # NB: only visit the target — value was already visited above.
+            # Calling generic_visit here would re-visit value, causing names
+            # inside it to be mangled twice (issue #9274).
+            self.visit(node.target)
         return node
 
     def visit_Name(self, node: ast.Name) -> ast.Name:
@@ -995,10 +966,19 @@ class ScopedVisitor(ast.NodeVisitor):
                 node.id, ignore_scope=True
             )
             for block in reversed(self.block_stack):
-                if block == self.block_stack[0] and block.is_defined(
-                    mangled_name
-                ):
-                    node.id = mangled_name
+                if block == self.block_stack[0]:
+                    # At top-level scope: mangle only if the mangled name is
+                    # already defined. When called from a nested scope
+                    # (len > 1), also mangle even if the top-level block
+                    # doesn't define it yet — this handles recursive calls to
+                    # underscore-prefixed functions, where the function name
+                    # isn't registered in the top-level block until after its
+                    # body is visited.
+                    if (
+                        block.is_defined(mangled_name)
+                        or len(self.block_stack) > 1
+                    ):
+                        node.id = mangled_name
                 elif block.is_defined(node.id):
                     break
         else:

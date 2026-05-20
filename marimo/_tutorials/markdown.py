@@ -11,7 +11,7 @@
 
 import marimo
 
-__generated_with = "0.17.2"
+__generated_with = "0.23.6"
 app = marimo.App()
 
 
@@ -77,18 +77,18 @@ def _(mo):
     ```python3
     mo.md(
         r'''
-        \[
+        $$
         f: \mathbf{R} \to \mathbf{R}
-        \]
+        $$
         '''
     )
     ```
 
     renders the display math
 
-    \[
+    $$
     f: \mathbf{R} \to \mathbf{R}.
-    \]
+    $$
     """)
     return
 
@@ -129,7 +129,7 @@ def _(mo):
     ## Interpolating Python values
 
     You can interpolate Python values into markdown using
-    `f-strings` and marimo's ` as_html` function. This lets you create
+    `f-strings` and marimo's `as_html` function. This lets you create
     markdown whose contents depend on data that changes at runtime.
 
     Here are some examples.
@@ -188,7 +188,9 @@ def _(mo):
 
 @app.cell
 def _(leaves, mo):
-    mo.md(f"""Your leaves: {"🍃" * leaves.value}""")
+    mo.md(f"""
+    Your leaves: {"🍃" * leaves.value}
+    """)
     return
 
 
@@ -284,36 +286,33 @@ def _(mo, np, plt):
         plt.plot(x, amplitude * np.sin(2 * np.pi / period * x))
         plt.ylim(-2.2, 2.2)
         return plt.gca()
+
     return (plotsin,)
 
 
 @app.cell
 def _(amplitude, mo, period):
-    mo.md(
-        f"""
+    mo.md(f"""
     **A sin curve.**
 
     - {amplitude}
     - {period}
-    """
-    )
+    """)
     return
 
 
 @app.cell
 def _(amplitude, mo, period, plotsin):
-    mo.md(
-        rf"""
+    mo.md(rf"""
     You're viewing the graph of
 
-    \[
+    $$
     f(x) = {amplitude.value}\sin((2\pi/{period.value:0.2f})x),
-    \]
+    $$
 
     with $x$ ranging from $0$ to $2\pi$.
     {mo.as_html(plotsin(amplitude.value, period.value))}
-    """
-    )
+    """)
     return
 
 
@@ -321,6 +320,7 @@ def _(amplitude, mo, period, plotsin):
 def _():
     import matplotlib.pyplot as plt
     import numpy as np
+
     return np, plt
 
 
@@ -329,6 +329,7 @@ def _():
     import math
 
     import marimo as mo
+
     return math, mo
 
 

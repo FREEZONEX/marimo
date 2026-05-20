@@ -36,7 +36,7 @@ import { FederatedLanguageServerClient } from "../../lsp/federated-lsp";
 import { NotebookLanguageServerClient } from "../../lsp/notebook-lsp";
 import { createTransport } from "../../lsp/transports";
 import { CellDocumentUri, type ILanguageServerClient } from "../../lsp/types";
-import { getLSPDocumentRootUri } from "../../lsp/utils";
+import { getLspRootUri, getLspWorkspaceFolders } from "../../lsp/utils";
 import {
   clickablePlaceholderExtension,
   smartPlaceholderExtension,
@@ -45,6 +45,7 @@ import type { LanguageAdapter } from "../types";
 
 const pylspClient = once((lspConfig: LSPConfig) => {
   // Create a mutable reference for the resync callback
+  // oxlint-disable-next-line prefer-const -- reassigned after closure capture
   let resyncCallback: (() => Promise<void>) | undefined;
 
   const transport = createTransport("pylsp", async () => {
@@ -53,8 +54,8 @@ const pylspClient = once((lspConfig: LSPConfig) => {
 
   const lspClientOpts = {
     transport,
-    rootUri: getLSPDocumentRootUri(),
-    workspaceFolders: [],
+    rootUri: getLspRootUri(),
+    workspaceFolders: getLspWorkspaceFolders(),
   };
   const config = lspConfig?.pylsp;
 
@@ -69,6 +70,10 @@ const pylspClient = once((lspConfig: LSPConfig) => {
     "W292", // No newline at end of file
     // Modules can be imported in any cell
     "E402", // Module level import not at top of file
+    // Blank line rules are not useful in marimo because cells are joined
+    // without extra blank lines, which can trigger these rules at cell boundaries
+    "E302", // Expected 2 blank lines, found 0
+    "E305", // Expected 2 blank lines after class or function definition, found 0
   ];
   const ignoredRuffRules = [
     // Even ruff documentation of this rule explains it is not useful in notebooks
@@ -147,6 +152,7 @@ const pylspClient = once((lspConfig: LSPConfig) => {
 });
 
 const tyLspClient = once((_: LSPConfig) => {
+  // oxlint-disable-next-line prefer-const -- reassigned after closure capture
   let resyncCallback: (() => Promise<void>) | undefined;
 
   const transport = createTransport("ty", async () => {
@@ -155,8 +161,8 @@ const tyLspClient = once((_: LSPConfig) => {
 
   const lspClientOpts = {
     transport,
-    rootUri: getLSPDocumentRootUri(),
-    workspaceFolders: [],
+    rootUri: getLspRootUri(),
+    workspaceFolders: getLspWorkspaceFolders(),
   };
 
   // We wrap the client in a NotebookLanguageServerClient to add some
@@ -175,7 +181,47 @@ const tyLspClient = once((_: LSPConfig) => {
   return notebookClient;
 });
 
+const pyreflyClient = once(
+  (lspConfig: LSPConfig & { diagnostics: DiagnosticsConfig }) => {
+    // oxlint-disable-next-line prefer-const -- reassigned after closure capture
+    let resyncCallback: (() => Promise<void>) | undefined;
+
+    const transport = createTransport("pyrefly", async () => {
+      await resyncCallback?.();
+    });
+
+    const lspClientOpts = {
+      transport,
+      rootUri: getLspRootUri(),
+      workspaceFolders: getLspWorkspaceFolders(),
+    };
+
+    // We wrap the client in a NotebookLanguageServerClient to add some
+    // additional functionality to handle multiple cells
+    const notebookClient = new NotebookLanguageServerClient(
+      new LanguageServerClient({
+        ...lspClientOpts,
+        initializationOptions: {
+          pyrefly: {
+            displayTypeErrors:
+              (lspConfig.diagnostics?.enabled ?? false)
+                ? "force-on"
+                : "force-off",
+          },
+        },
+      }),
+      {},
+    );
+
+    // Set the resync callback now that the client exists
+    resyncCallback = () => notebookClient.resyncAllDocuments();
+
+    return notebookClient;
+  },
+);
+
 const pyrightClient = once((_: LSPConfig) => {
+  // oxlint-disable-next-line prefer-const -- reassigned after closure capture
   let resyncCallback: (() => Promise<void>) | undefined;
 
   const transport = createTransport("basedpyright", async () => {
@@ -184,8 +230,8 @@ const pyrightClient = once((_: LSPConfig) => {
 
   const lspClientOpts = {
     transport,
-    rootUri: getLSPDocumentRootUri(),
-    workspaceFolders: [],
+    rootUri: getLspRootUri(),
+    workspaceFolders: getLspWorkspaceFolders(),
   };
 
   // We wrap the client in a NotebookLanguageServerClient to add some
@@ -263,6 +309,9 @@ export class PythonLanguageAdapter implements LanguageAdapter<{}> {
       if (lspConfig?.ty?.enabled && hasCapability("ty")) {
         clients.push(tyLspClient(lspConfig));
       }
+      if (lspConfig?.pyrefly?.enabled && hasCapability("pyrefly")) {
+        clients.push(pyreflyClient(lspConfig));
+      }
       if (lspConfig?.basedpyright?.enabled && hasCapability("basedpyright")) {
         clients.push(pyrightClient(lspConfig));
       }
@@ -293,7 +342,7 @@ export class PythonLanguageAdapter implements LanguageAdapter<{}> {
             client: client as unknown as LanguageServerClient,
             languageId: "python",
             allowHTMLContent: true,
-            useSnippetOnCompletion: false,
+            useSnippetOnCompletion: true,
             hoverConfig: hoverOptions,
             completionConfig: autocompleteOptions,
             // Default to false

@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import pathlib
 import sys
 import textwrap
-from typing import TYPE_CHECKING, cast
-from unittest.mock import Mock, patch
+from contextlib import ExitStack
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from marimo._ast.app_config import _AppConfig
 from marimo._config.config import DEFAULT_CONFIG
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._messaging.cell_output import CellChannel
@@ -28,30 +29,31 @@ from marimo._messaging.notification import (
     VariablesNotification,
 )
 from marimo._messaging.serde import deserialize_kernel_message
-from marimo._messaging.types import NoopStream
 from marimo._plugins.ui._core.ids import IDProvider
 from marimo._plugins.ui._core.ui_element import UIElement
 from marimo._runtime.commands import (
-    AppMetadata,
     CreateNotebookCommand,
     DeleteCellCommand,
     ExecuteCellCommand,
     UpdateCellConfigCommand,
     UpdateUIElementCommand,
 )
-from marimo._runtime.context.kernel_context import initialize_kernel_context
-from marimo._runtime.context.types import teardown_context
 from marimo._runtime.dataflow import EdgeWithVar
-from marimo._runtime.patches import create_main_module
-from marimo._runtime.runtime import Kernel, notebook_dir, notebook_location
+from marimo._runtime.runtime import (
+    Kernel,
+    launch_kernel,
+    notebook_dir,
+    notebook_location,
+)
 from marimo._runtime.scratch import SCRATCH_CELL_ID
-from marimo._session.model import SessionMode
 from marimo._utils.parse_dataclass import parse_raw
 from tests._messaging.mocks import MockStderr, MockStream
-from tests.conftest import ExecReqProvider, MockedKernel
+from tests._runtime._helpers.factories import default_app_metadata
+from tests._runtime._helpers.session import mocked_kernel_session
+from tests.conftest import ExecReqProvider, MockedKernel, mock_pyodide
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Coroutine, Sequence
 
 
 def _check_edges(error: Error, expected_edges: Sequence[EdgeWithVar]) -> None:
@@ -148,6 +150,22 @@ class TestExecution:
         assert "y" not in k.globals
         assert "z" not in k.globals
 
+    async def test_delete_cell_restores_doc(self, any_kernel: Kernel) -> None:
+        k = any_kernel
+        # Simulate a notebook with a docstring in its header
+        k.app_metadata.docstring = "Notebook docstring"
+        k.globals["__doc__"] = "Notebook docstring"
+
+        await k.run(
+            [
+                ExecuteCellCommand(cell_id="0", code='__doc__ = "cell doc"'),
+            ]
+        )
+        assert k.globals["__doc__"] == "cell doc"
+
+        await k.delete_cell(DeleteCellCommand(cell_id="0"))
+        assert k.globals["__doc__"] == "Notebook docstring"
+
     async def test_run_referrers_not_stale(self, any_kernel: Kernel) -> None:
         k = any_kernel
         graph = k.graph
@@ -188,9 +206,9 @@ class TestExecution:
 
         element_id = k.globals["s"]._id
         await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(element_id, 5)])
+            UpdateUIElementCommand.from_ids_and_values([(element_id, 5)]),
+            notify_frontend=False,
         )
-        assert k.globals["s"].value == 5
 
         if k.reactive_execution_mode == "lazy":
             assert k.graph.cells["2"].stale
@@ -231,7 +249,8 @@ class TestExecution:
         # Set a child of the array to 5 ...
         child_id = k.globals["array"][0]._id
         await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(child_id, 5)])
+            UpdateUIElementCommand.from_ids_and_values([(child_id, 5)]),
+            notify_frontend=False,
         )
 
         # Make sure the array and its child are updated
@@ -269,7 +288,8 @@ class TestExecution:
 
         array_id = k.globals["array"]._id
         await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(array_id, {"0": 5})])
+            UpdateUIElementCommand.from_ids_and_values([(array_id, {"0": 5})]),
+            notify_frontend=False,
         )
         assert k.globals["array"].value == [5]
         if k.lazy():
@@ -300,7 +320,8 @@ class TestExecution:
         # called
         child_id = k.globals["array"][0]._id
         await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(child_id, 5)])
+            UpdateUIElementCommand.from_ids_and_values([(child_id, 5)]),
+            notify_frontend=False,
         )
         if k.lazy():
             assert k.graph.cells[er.cell_id].stale
@@ -324,7 +345,8 @@ class TestExecution:
         # This shouldn't crash the kernel, and s's value should still be
         # updated
         await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(element_id, 5)])
+            UpdateUIElementCommand.from_ids_and_values([(element_id, 5)]),
+            notify_frontend=False,
         )
         assert k.globals["_cell_1_s"].value == 5
 
@@ -343,6 +365,7 @@ class TestExecution:
                         cell_id="1", code="s = mo.ui.slider(0, 10, value=1)"
                     ),
                 ),
+                cell_ids=("0", "1"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     [(id_provider.take_id(), 2)]
                 ),
@@ -360,6 +383,7 @@ class TestExecution:
                     er1 := ExecuteCellCommand(cell_id="1", code="y=x+1"),
                     er2 := ExecuteCellCommand(cell_id="2", code="z=x+2"),
                 ),
+                cell_ids=("0", "1", "2"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     []
                 ),
@@ -395,6 +419,7 @@ class TestExecution:
                     ExecuteCellCommand(cell_id="1", code="y=x+1"),
                     ExecuteCellCommand(cell_id="2", code="z=x+2"),
                 ),
+                cell_ids=("0", "1", "2"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     []
                 ),
@@ -422,6 +447,7 @@ class TestExecution:
                     er2 := ExecuteCellCommand(cell_id="1", code="y=x+1"),
                     er3 := ExecuteCellCommand(cell_id="2", code="z=x+2"),
                 ),
+                cell_ids=("0", "1", "2"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     []
                 ),
@@ -450,6 +476,7 @@ class TestExecution:
                     ExecuteCellCommand(cell_id="1", code="y=x+1"),
                     ExecuteCellCommand(cell_id="2", code="z=x+2"),
                 ),
+                cell_ids=("0", "1", "2"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     []
                 ),
@@ -492,6 +519,7 @@ class TestExecution:
                     ExecuteCellCommand(cell_id="1", code="y=x+1"),
                     ExecuteCellCommand(cell_id="2", code="z=x+2"),
                 ),
+                cell_ids=("0", "1", "2"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     []
                 ),
@@ -520,6 +548,7 @@ class TestExecution:
                     er1 := ExecuteCellCommand(cell_id="1", code="y=x+1"),
                     er2 := ExecuteCellCommand(cell_id="2", code="z=x+2"),
                 ),
+                cell_ids=("0", "1", "2"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     []
                 ),
@@ -555,6 +584,7 @@ class TestExecution:
                     ExecuteCellCommand(cell_id="2", code="  \n  "),
                     ExecuteCellCommand(cell_id="3", code="y=x+1"),
                 ),
+                cell_ids=("0", "1", "2", "3"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     []
                 ),
@@ -1093,7 +1123,7 @@ except NameError:
         assert "1" in k.graph.cells
         assert "x" not in k.globals
         if k.lazy():
-            assert k.graph.get_stale() == set([er.cell_id])
+            assert k.graph.get_stale() == {er.cell_id}
             await k.run([er])
         assert not k.graph.get_stale()
         assert "y" not in k.globals
@@ -1105,7 +1135,7 @@ except NameError:
         assert "1" in k.graph.cells
         assert not k.errors
         if k.lazy():
-            assert k.graph.get_stale() == set([er.cell_id])
+            assert k.graph.get_stale() == {er.cell_id}
             await k.run([er])
         assert not k.graph.get_stale()
         assert k.globals["y"] == 1
@@ -1130,7 +1160,7 @@ except NameError:
             [ExecuteCellCommand(er_1.cell_id, "x = 0; raise RuntimeError")]
         )
         if k.lazy():
-            assert graph.get_stale() == set([er_2.cell_id])
+            assert graph.get_stale() == {er_2.cell_id}
             # running er_2 will redefine y; this is different from the
             # behavior of a non-lazy kernel, which doesn't run er_2
             # but instead invalidates it on exception raised
@@ -1173,11 +1203,12 @@ except NameError:
         element_id = k.globals["defs"]["slider"]._id
 
         await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(element_id, 5)])
+            UpdateUIElementCommand.from_ids_and_values([(element_id, 5)]),
+            notify_frontend=False,
         )
         assert k.globals["defs"]["slider"].value == 5
         if k.lazy():
-            assert graph.get_stale() == set([er.cell_id])
+            assert graph.get_stale() == {er.cell_id}
             await k.run([er])
         assert not graph.get_stale()
         assert k.globals["slider_value"] == 6
@@ -1194,7 +1225,8 @@ except NameError:
         await k.set_ui_element_value(
             UpdateUIElementCommand.from_ids_and_values(
                 [("does not exist", None)]
-            )
+            ),
+            notify_frontend=False,
         )
 
     async def test_interrupt(
@@ -1304,14 +1336,10 @@ except NameError:
     @pytest.mark.skipif(
         sys.platform == "win32", reason="Windows paths behave differently"
     )
-    @patch.dict(
-        sys.modules,
-        {
-            "pyodide": Mock(),
-            "js": Mock(
-                location="https://marimo-team.github.io/marimo-gh-pages-template/notebooks/assets/worker-BxJ8HeOy.js"
-            ),
-        },
+    @mock_pyodide(
+        js=Mock(
+            location="https://marimo-team.github.io/marimo-gh-pages-template/notebooks/assets/worker-BxJ8HeOy.js"
+        ),
     )
     async def test_notebook_location_for_pyodide(
         self, any_kernel: Kernel, exec_req: ExecReqProvider
@@ -1333,43 +1361,19 @@ except NameError:
     async def test_notebook_dir_for_unnamed_notebook(
         self, tmp_path: pathlib.Path, exec_req: ExecReqProvider
     ) -> None:
+        filename = str(tmp_path / "notebook.py")
         try:
-            filename = str(tmp_path / "notebook.py")
-            k = Kernel(
-                stream=NoopStream(),
-                stdout=None,
-                stderr=None,
-                stdin=None,
-                cell_configs={},
-                user_config=DEFAULT_CONFIG,
-                app_metadata=AppMetadata(
-                    query_params={},
-                    filename=filename,
-                    cli_args={},
-                    argv=None,
-                    app_config=_AppConfig(),
-                ),
-                enqueue_control_request=lambda _: None,
-                module=create_main_module(None, None, None),
-            )
-            initialize_kernel_context(
-                kernel=k,
-                stream=k.stream,
-                stdout=k.stdout,
-                stderr=k.stderr,
-                virtual_files_supported=True,
-                mode=SessionMode.EDIT,
-            )
-
-            await k.run(
-                [
-                    exec_req.get("import marimo as mo"),
-                    exec_req.get("x = mo.notebook_dir() / 'foo.csv'"),
-                ]
-            )
-            assert str(k.globals["x"]).endswith("foo.csv")
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(filename=filename),
+            ) as tk:
+                await tk.kernel.run(
+                    [
+                        exec_req.get("import marimo as mo"),
+                        exec_req.get("x = mo.notebook_dir() / 'foo.csv'"),
+                    ]
+                )
+                assert str(tk.kernel.globals["x"]).endswith("foo.csv")
         finally:
-            teardown_context()
             if str(tmp_path) in sys.path:
                 sys.path.remove(str(tmp_path))
 
@@ -1398,57 +1402,30 @@ except NameError:
         assert k.globals["pickle_output"] is not None
 
     def test_sys_path_updated(self, tmp_path: pathlib.Path) -> None:
+        filename = str(tmp_path / "notebook.py")
         try:
-            filename = str(tmp_path / "notebook.py")
-            Kernel(
-                stream=NoopStream(),
-                stdout=None,
-                stderr=None,
-                stdin=None,
-                cell_configs={},
-                user_config=DEFAULT_CONFIG,
-                app_metadata=AppMetadata(
-                    query_params={},
-                    filename=filename,
-                    cli_args={},
-                    argv=None,
-                    app_config=_AppConfig(),
-                ),
-                enqueue_control_request=lambda _: None,
-                module=create_main_module(None, None, None),
-            )
-            assert str(tmp_path) in sys.path
-            assert str(tmp_path) == sys.path[0]
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(filename=filename),
+            ):
+                assert str(tmp_path) in sys.path
+                assert str(tmp_path) == sys.path[0]
         finally:
             if str(tmp_path) in sys.path:
                 sys.path.remove(str(tmp_path))
 
     def test_sys_argv_updated(self, tmp_path: pathlib.Path) -> None:
         old_argv = sys.argv
+        filename = str(tmp_path / "notebook.py")
         try:
-            filename = str(tmp_path / "notebook.py")
-            Kernel(
-                stream=NoopStream(),
-                stdout=None,
-                stderr=None,
-                stdin=None,
-                cell_configs={},
-                user_config=DEFAULT_CONFIG,
-                app_metadata=AppMetadata(
-                    query_params={},
-                    filename=filename,
-                    cli_args={},
-                    argv=["foo", "bar"],
-                    app_config=_AppConfig(),
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(
+                    filename=filename, argv=["foo", "bar"]
                 ),
-                enqueue_control_request=lambda _: None,
-                module=create_main_module(None, None, None),
-            )
-
-            assert len(sys.argv) == 3
-            assert filename == sys.argv[0]
-            assert sys.argv[1] == "foo"
-            assert sys.argv[2] == "bar"
+            ):
+                assert len(sys.argv) == 3
+                assert filename == sys.argv[0]
+                assert sys.argv[1] == "foo"
+                assert sys.argv[2] == "bar"
         finally:
             sys.argv = old_argv
             if str(tmp_path) in sys.path:
@@ -1458,26 +1435,12 @@ except NameError:
         self, tmp_path: pathlib.Path
     ) -> None:
         argv = sys.argv
+        filename = str(tmp_path / "notebook.py")
         try:
-            filename = str(tmp_path / "notebook.py")
-            Kernel(
-                stream=NoopStream(),
-                stdout=None,
-                stderr=None,
-                stdin=None,
-                cell_configs={},
-                user_config=DEFAULT_CONFIG,
-                app_metadata=AppMetadata(
-                    query_params={},
-                    filename=filename,
-                    cli_args={},
-                    argv=None,
-                    app_config=_AppConfig(),
-                ),
-                enqueue_control_request=lambda _: None,
-                module=create_main_module(None, None, None),
-            )
-            assert argv == sys.argv
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(filename=filename),
+            ):
+                assert argv == sys.argv
         finally:
             # restore argv in case test failed or accidentally mutated it
             sys.argv = argv
@@ -1491,50 +1454,26 @@ except NameError:
         filename = tmp_path / "notebook.py"
 
         try:
-            k = Kernel(
-                stream=NoopStream(),
-                stdout=None,
-                stderr=None,
-                stdin=None,
-                cell_configs={},
-                user_config={
-                    **DEFAULT_CONFIG,
-                    "runtime": {
-                        **DEFAULT_CONFIG["runtime"],
-                        "pythonpath": [str(custom_path)],
-                    },
+            user_config = {
+                **DEFAULT_CONFIG,
+                "runtime": {
+                    **DEFAULT_CONFIG["runtime"],
+                    "pythonpath": [str(custom_path)],
                 },
-                app_metadata=AppMetadata(
-                    query_params={},
-                    filename=str(filename),
-                    cli_args={},
-                    argv=None,
-                    app_config=_AppConfig(),
-                ),
-                enqueue_control_request=lambda _: None,
-                module=create_main_module(None, None, None),
-            )
-            initialize_kernel_context(
-                kernel=k,
-                stream=k.stream,
-                stdout=k.stdout,
-                stderr=k.stderr,
-                virtual_files_supported=True,
-                mode=SessionMode.EDIT,
-            )
-
-            # Verify the path was added using exec_req
-            await k.run(
-                [
-                    exec_req.get("import sys"),
-                    exec_req.get("paths = list(sys.path)"),
-                ]
-            )
-
-            assert str(custom_path) in k.globals["paths"]
-            assert str(filename.parent) in k.globals["paths"]
+            }
+            with mocked_kernel_session(
+                app_metadata=default_app_metadata(filename=str(filename)),
+                user_config=user_config,  # type: ignore[arg-type]
+            ) as tk:
+                await tk.kernel.run(
+                    [
+                        exec_req.get("import sys"),
+                        exec_req.get("paths = list(sys.path)"),
+                    ]
+                )
+                assert str(custom_path) in tk.kernel.globals["paths"]
+                assert str(filename.parent) in tk.kernel.globals["paths"]
         finally:
-            teardown_context()
             if str(tmp_path) in sys.path:
                 sys.path.remove(str(tmp_path))
             if str(custom_path) in sys.path:
@@ -1747,7 +1686,7 @@ except NameError:
         await k.rename_file("foo")
         if k.lazy():
             assert "pytest" in k.globals["x"]
-            assert k.graph.get_stale() == set([er.cell_id])
+            assert k.graph.get_stale() == {er.cell_id}
             await k.run([er])
         assert k.globals["x"] == "foo"
 
@@ -1758,6 +1697,60 @@ except NameError:
         assert k.globals[f"_cell_{er.cell_id}_x"] == 1
         await k.run([ExecuteCellCommand(er.cell_id, "None")])
         assert f"_cell_{er.cell_id}_x" not in k.globals
+
+    async def test_private_recursive_function(
+        self, any_kernel: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        """Regression test for MO-5426: underscore-prefixed recursive function
+        should be able to call itself within the same cell."""
+        k = any_kernel
+        await k.run(
+            [
+                er := exec_req.get(
+                    """
+                    def _recurse(n):
+                        if n > 0:
+                            return 1 + _recurse(n - 1)
+                        else:
+                            return 0
+
+                    result = _recurse(3)
+                    """
+                )
+            ]
+        )
+        cell = k.graph.cells[er.cell_id]
+        assert cell.exception is None
+        assert k.globals["result"] == 3
+
+    async def test_private_recursive_function_local_shadow(
+        self, any_kernel: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        """A local reassignment inside the function body should shadow the
+        outer definition. Result must differ from the real fib to confirm
+        the shadow is actually used."""
+        k = any_kernel
+        await k.run(
+            [
+                er := exec_req.get(
+                    """
+                    def _recurse(n):
+                        _recurse = lambda x: x
+                        if n <= 1:
+                            return n
+                        return _recurse(n - 1) + _recurse(n - 2)
+
+                    result = _recurse(5)
+                    """
+                )
+            ]
+        )
+        cell = k.graph.cells[er.cell_id]
+        assert cell.exception is None
+        # _recurse = lambda x: x (identity) shadows the recursive definition,
+        # so _recurse(n-1) + _recurse(n-2) = (n-1) + (n-2) = 2n-3
+        # _recurse(5) = (5-1) + (5-2) = 4 + 3 = 7, not fib(5)=5
+        assert k.globals["result"] == 7
 
     async def test_has_run_id(
         self, mocked_kernel: MockedKernel, exec_req: ExecReqProvider
@@ -1889,6 +1882,7 @@ except NameError:
                     ExecuteCellCommand(cell_id="1", code="y = 1"),
                     ExecuteCellCommand(cell_id="2", code="z = 2"),
                 ),
+                cell_ids=("0", "1", "2"),
                 set_ui_element_value_request=UpdateUIElementCommand.from_ids_and_values(
                     []
                 ),
@@ -2650,7 +2644,7 @@ class TestDisable:
         )
 
         assert k.globals["ns"].count == 10
-        assert k.graph.get_stale() == set([er_2.cell_id])
+        assert k.graph.get_stale() == {er_2.cell_id}
 
         # re-enable cell 2
         await k.set_cell_config(
@@ -2659,7 +2653,7 @@ class TestDisable:
             )
         )
         if k.lazy():
-            assert k.graph.get_stale() == set([er_2.cell_id])
+            assert k.graph.get_stale() == {er_2.cell_id}
             await k.run([er_2])
         assert not k.graph.get_stale()
         # cell 2 should have re-run
@@ -2697,13 +2691,14 @@ class TestDisable:
         await k.run([ExecuteCellCommand(cell_id=er_1.cell_id, code="x = 2")])
         assert k.globals["x"] == 2
         if k.lazy():
-            assert graph.get_stale() == set(
-                [er_2.cell_id, er_3.cell_id, er_4.cell_id, er_5.cell_id]
-            )
+            assert graph.get_stale() == {
+                er_2.cell_id,
+                er_3.cell_id,
+                er_4.cell_id,
+                er_5.cell_id,
+            }
             await k.run([er_5])
-        assert graph.get_stale() == set(
-            [er_2.cell_id, er_3.cell_id, er_4.cell_id]
-        )
+        assert graph.get_stale() == {er_2.cell_id, er_3.cell_id, er_4.cell_id}
         assert k.globals["zzz"] == 3
 
         # enable cell 2: should run stale cells as a side-effect
@@ -2715,9 +2710,11 @@ class TestDisable:
         assert k.globals["x"] == 2
         assert k.globals["zzz"] == 3
         if k.lazy():
-            assert graph.get_stale() == set(
-                [er_2.cell_id, er_3.cell_id, er_4.cell_id]
-            )
+            assert graph.get_stale() == {
+                er_2.cell_id,
+                er_3.cell_id,
+                er_4.cell_id,
+            }
             # runs er_3 and er_2, which are stale ancestors
             await k.run([er_4])
         # stale cells **should have** updated
@@ -2750,7 +2747,7 @@ class TestDisable:
         )
         # update the code of cell 1 -- both cells stale
         await k.run([er_1 := exec_req.get_with_id(er_1.cell_id, "x = 2")])
-        assert graph.get_stale() == set([er_1.cell_id, er_2.cell_id])
+        assert graph.get_stale() == {er_1.cell_id, er_2.cell_id}
 
         # enable cell 1, but 2 still disabled
         await k.set_cell_config(
@@ -2759,11 +2756,11 @@ class TestDisable:
             )
         )
         if k.lazy():
-            assert graph.get_stale() == set([er_1.cell_id, er_2.cell_id])
+            assert graph.get_stale() == {er_1.cell_id, er_2.cell_id}
             await k.run([er_1])
 
         assert k.globals["x"] == 2
-        assert graph.get_stale() == set([er_2.cell_id])
+        assert graph.get_stale() == {er_2.cell_id}
 
         # enable cell 2
         await k.set_cell_config(
@@ -2772,7 +2769,7 @@ class TestDisable:
             )
         )
         if k.lazy():
-            assert graph.get_stale() == set([er_2.cell_id])
+            assert graph.get_stale() == {er_2.cell_id}
             await k.run([er_2])
 
         assert not graph.get_stale()
@@ -3143,13 +3140,13 @@ class TestSQL:
             [
                 ExecuteCellCommand(
                     cell_id="2",
-                    code="import polars as pl; t1_df = pl.from_dict({'a': [42]})",  # noqa: E501
+                    code="import polars as pl; t1_df = pl.from_dict({'a': [42]})",
                 ),
                 # cell 1 should automatically execute due to the definition of
                 # t1
                 ExecuteCellCommand(
                     cell_id="3",
-                    code="mo.sql('CREATE OR REPLACE TABLE t1 as SELECT * FROM t1_df')",  # noqa: E501
+                    code="mo.sql('CREATE OR REPLACE TABLE t1 as SELECT * FROM t1_df')",
                 ),
             ]
         )
@@ -3180,13 +3177,13 @@ class TestSQL:
             [
                 ExecuteCellCommand(
                     cell_id="2",
-                    code="import polars as pl; t1_df = pl.from_dict({'a': [42]})",  # noqa: E501
+                    code="import polars as pl; t1_df = pl.from_dict({'a': [42]})",
                 ),
                 # cell 1 should automatically execute due to the definition of
                 # t1
                 ExecuteCellCommand(
                     cell_id="3",
-                    code="duckdb.sql('CREATE OR REPLACE TABLE t1 as SELECT * FROM t1_df')",  # noqa: E501
+                    code="duckdb.sql('CREATE OR REPLACE TABLE t1 as SELECT * FROM t1_df')",
                 ),
             ]
         )
@@ -3219,7 +3216,7 @@ class TestSQL:
                 # t1
                 ExecuteCellCommand(
                     cell_id="2",
-                    code="mo.sql('CREATE OR REPLACE VIEW view as SELECT 42')",  # noqa: E501
+                    code="mo.sql('CREATE OR REPLACE VIEW view as SELECT 42')",
                 ),
             ]
         )
@@ -3285,17 +3282,15 @@ class TestStateTransitions:
         stream = MockStream(mocked_kernel.stream)
         cell_notifications = stream.cell_notifications
 
-        n_queued = sum(
-            [1 for op in cell_notifications if op.status == "queued"]
-        )
+        n_queued = sum(1 for op in cell_notifications if op.status == "queued")
         assert n_queued == 1
 
         n_running = sum(
-            [1 for op in cell_notifications if op.status == "running"]
+            1 for op in cell_notifications if op.status == "running"
         )
         assert n_running == 1
 
-        n_idle = sum([1 for op in cell_notifications if op.status == "idle"])
+        n_idle = sum(1 for op in cell_notifications if op.status == "idle")
         assert n_idle == 1
 
     async def test_statuses_not_repeated_on_stop(
@@ -3310,17 +3305,15 @@ class TestStateTransitions:
 
         cell_notifications = mocked_kernel.stream.cell_notifications
 
-        n_queued = sum(
-            [1 for op in cell_notifications if op.status == "queued"]
-        )
+        n_queued = sum(1 for op in cell_notifications if op.status == "queued")
         assert n_queued == 1
 
         n_running = sum(
-            [1 for op in cell_notifications if op.status == "running"]
+            1 for op in cell_notifications if op.status == "running"
         )
         assert n_running == 1
 
-        n_idle = sum([1 for op in cell_notifications if op.status == "idle"])
+        n_idle = sum(1 for op in cell_notifications if op.status == "idle")
         assert n_idle == 1
 
     async def test_statuses_not_repeated_on_interruption(
@@ -3330,7 +3323,7 @@ class TestStateTransitions:
         await k.run(
             [
                 exec_req.get(
-                    "from marimo._runtime.control_flow import MarimoInterrupt; raise MarimoInterrupt()"  # noqa: E501
+                    "from marimo._runtime.control_flow import MarimoInterrupt; raise MarimoInterrupt()"
                 ),
             ]
         )
@@ -3338,17 +3331,15 @@ class TestStateTransitions:
         stream = MockStream(mocked_kernel.stream)
         cell_notifications = stream.cell_notifications
 
-        n_queued = sum(
-            [1 for op in cell_notifications if op.status == "queued"]
-        )
+        n_queued = sum(1 for op in cell_notifications if op.status == "queued")
         assert n_queued == 1
 
         n_running = sum(
-            [1 for op in cell_notifications if op.status == "running"]
+            1 for op in cell_notifications if op.status == "running"
         )
         assert n_running == 1
 
-        n_idle = sum([1 for op in cell_notifications if op.status == "idle"])
+        n_idle = sum(1 for op in cell_notifications if op.status == "idle")
         assert n_idle == 1
 
     async def test_statuses_not_repeated_on_exception(
@@ -3364,17 +3355,15 @@ class TestStateTransitions:
         stream = MockStream(mocked_kernel.stream)
         cell_notifications = stream.cell_notifications
 
-        n_queued = sum(
-            [1 for op in cell_notifications if op.status == "queued"]
-        )
+        n_queued = sum(1 for op in cell_notifications if op.status == "queued")
         assert n_queued == 1
 
         n_running = sum(
-            [1 for op in cell_notifications if op.status == "running"]
+            1 for op in cell_notifications if op.status == "running"
         )
         assert n_running == 1
 
-        n_idle = sum([1 for op in cell_notifications if op.status == "idle"])
+        n_idle = sum(1 for op in cell_notifications if op.status == "idle")
         assert n_idle == 1
 
     async def test_descendant_status_reset_to_idle_on_error(
@@ -3392,19 +3381,17 @@ class TestStateTransitions:
         cell_notifications = stream.cell_notifications
 
         # er_1 and er_2
-        n_queued = sum(
-            [1 for op in cell_notifications if op.status == "queued"]
-        )
+        n_queued = sum(1 for op in cell_notifications if op.status == "queued")
         assert n_queued == 2
 
         # only er_1 runs
         n_running = sum(
-            [1 for op in cell_notifications if op.status == "running"]
+            1 for op in cell_notifications if op.status == "running"
         )
         assert n_running == 1
 
         # er_1 and er_2
-        n_idle = sum([1 for op in cell_notifications if op.status == "idle"])
+        n_idle = sum(1 for op in cell_notifications if op.status == "idle")
         assert n_idle == 2
 
         assert k.graph.cells[er_1.cell_id].runtime_state == "idle"
@@ -3432,19 +3419,17 @@ class TestStateTransitions:
         cell_notifications = stream.cell_notifications
 
         # er_1 and er_2
-        n_queued = sum(
-            [1 for op in cell_notifications if op.status == "queued"]
-        )
+        n_queued = sum(1 for op in cell_notifications if op.status == "queued")
         assert n_queued == 2
 
         # only er_1 runs
         n_running = sum(
-            [1 for op in cell_notifications if op.status == "running"]
+            1 for op in cell_notifications if op.status == "running"
         )
         assert n_running == 1
 
         # er_1 and er_2
-        n_idle = sum([1 for op in cell_notifications if op.status == "idle"])
+        n_idle = sum(1 for op in cell_notifications if op.status == "idle")
         assert n_idle == 2
 
         assert k.graph.cells[er_1.cell_id].runtime_state == "idle"
@@ -3616,6 +3601,40 @@ class TestErrorHandling:
         assert isinstance(errors[0], MarimoInternalError)
         assert errors[0].msg.startswith("An internal error occurred: ")
 
+        # Verify no traceback leaks via console output
+        for op in cell_notifications:
+            if op.console is not None:
+                console_list = (
+                    [op.console]
+                    if not isinstance(op.console, list)
+                    else op.console
+                )
+                for console_output in console_list:
+                    assert "some secret error" not in str(
+                        console_output.data
+                    ), "Traceback leaked to console in run mode"
+
+    async def test_error_handling_in_run_mode_with_show_tracebacks(
+        self, run_mode_kernel: MockedKernel, exec_req: ExecReqProvider
+    ) -> None:
+        """When show_tracebacks is enabled, exceptions should not be
+        sanitized and should include a formatted traceback."""
+        k = run_mode_kernel.k
+        k.user_config = copy.deepcopy(k.user_config)
+        k.user_config["runtime"]["show_tracebacks"] = True
+        await k.run([exec_req.get("raise ValueError('some secret error')")])
+        cell_notifications = run_mode_kernel.stream.cell_notifications
+        error_cell_notification = _filter_to_error_ops(cell_notifications)
+        assert len(error_cell_notification) == 1
+        errors = _parse_error_output(error_cell_notification[0])
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], MarimoExceptionRaisedError)
+        assert errors[0].msg == "some secret error"
+        assert errors[0].exception_type == "ValueError"
+        assert errors[0].traceback is not None
+        assert "ValueError" in errors[0].traceback
+
     async def test_error_handling_in_run_mode_stop(
         self, run_mode_kernel: MockedKernel, exec_req: ExecReqProvider
     ) -> None:
@@ -3693,6 +3712,7 @@ class TestMarkdownHandling:
         # Create a creation request with auto_run=False to trigger the markdown handling
         creation_request = CreateNotebookCommand(
             execution_requests=execution_requests,
+            cell_ids=tuple(cell.cell_id for cell in execution_requests),
             auto_run=False,
             set_ui_element_value_request=UpdateUIElementCommand(
                 object_ids=[],
@@ -3790,6 +3810,7 @@ class TestMarkdownHandling:
 
         creation_request = CreateNotebookCommand(
             execution_requests=execution_requests,
+            cell_ids=tuple(cell.cell_id for cell in execution_requests),
             auto_run=False,
             set_ui_element_value_request=UpdateUIElementCommand(
                 object_ids=[],
@@ -3830,6 +3851,7 @@ class TestMarkdownHandling:
 
         creation_request = CreateNotebookCommand(
             execution_requests=execution_requests,
+            cell_ids=tuple(cell.cell_id for cell in execution_requests),
             auto_run=False,
             set_ui_element_value_request=UpdateUIElementCommand(
                 object_ids=[],
@@ -3861,6 +3883,7 @@ class TestMarkdownHandling:
 
         creation_request = CreateNotebookCommand(
             execution_requests=execution_requests,
+            cell_ids=tuple(cell.cell_id for cell in execution_requests),
             auto_run=False,
             set_ui_element_value_request=UpdateUIElementCommand(
                 object_ids=[],
@@ -3920,6 +3943,7 @@ class TestMarkdownHandling:
 
         creation_request = CreateNotebookCommand(
             execution_requests=execution_requests,
+            cell_ids=tuple(cell.cell_id for cell in execution_requests),
             auto_run=False,
             set_ui_element_value_request=UpdateUIElementCommand(
                 object_ids=[],
@@ -3978,6 +4002,7 @@ class TestMarkdownHandling:
 
         creation_request = CreateNotebookCommand(
             execution_requests=execution_requests,
+            cell_ids=tuple(cell.cell_id for cell in execution_requests),
             auto_run=False,
             set_ui_element_value_request=UpdateUIElementCommand(
                 object_ids=[],
@@ -4042,19 +4067,143 @@ def _filter_to_error_ops(
     ]
 
 
-class TestRequestHandler:
-    async def test_request_handler_only_created_once(
-        self, any_kernel: Kernel
+class TestLaunchKernelEventLoop:
+    """Event-loop policy / factory selection in launch_kernel.
+
+    The kernel subprocess must run on the Windows ProactorEventLoop so
+    user code can use asyncio.create_subprocess_exec() and other APIs
+    the SelectorEventLoop does not implement. The server keeps the
+    SelectorEventLoop because ConnectionDistributor relies on
+    loop.add_reader().
+
+    Each test exercises a single (platform, python-version) branch and
+    skips when the current runner doesn't match it. CI runs across all
+    major operating systems, so every branch is covered somewhere.
+    """
+
+    _HEAVY_DEPENDENCY_TARGETS = [
+        "marimo._runtime.runtime.restore_signals",
+        "marimo._runtime.runtime.ThreadSafeStream",
+        "marimo._runtime.runtime.ThreadSafeStdout",
+        "marimo._runtime.runtime.ThreadSafeStderr",
+        "marimo._runtime.runtime.ThreadSafeStdin",
+        "marimo._runtime.runtime.marimo_pdb.MarimoPdb",
+        "marimo._runtime.runtime.Kernel",
+        "marimo._runtime.kernel_lifecycle.initialize_kernel_context",
+        "marimo._runtime.runtime.patches.patch_main_module",
+        "marimo._output.formatters.formatters.register_formatters",
+    ]
+
+    class _StopAfterAsyncioRun(Exception):
+        """Sentinel raised from the mocked asyncio.run so we skip the
+        post-run teardown path (which touches a runtime context we
+        haven't initialized)."""
+
+    @classmethod
+    def _fake_asyncio_run(
+        cls, coro: Coroutine[Any, Any, Any], **_kwargs: Any
     ) -> None:
-        """Test that request_handler property is only created once."""
-        k = any_kernel
+        # Close the never-awaited coroutine to suppress the
+        # RuntimeWarning, then bail so we don't execute the post-run
+        # teardown.
+        coro.close()
+        raise cls._StopAfterAsyncioRun
 
-        # Access request_handler multiple times
-        handler1 = k.request_handler
-        handler2 = k.request_handler
-        handler3 = k.request_handler
+    @classmethod
+    def _call_launch_kernel(cls, *, is_edit_mode: bool) -> None:
+        with pytest.raises(cls._StopAfterAsyncioRun):
+            launch_kernel(
+                control_queue=MagicMock(),
+                set_ui_element_queue=MagicMock(),
+                completion_queue=MagicMock(),
+                input_queue=MagicMock(),
+                stream_queue=MagicMock(),
+                socket_addr=None,
+                is_edit_mode=is_edit_mode,
+                configs={},
+                app_metadata=default_app_metadata(),
+                user_config=DEFAULT_CONFIG,
+                virtual_file_storage=None,
+                redirect_console_to_browser=False,
+            )
 
-        # They should all be the same instance
-        assert handler1 is handler2
-        assert handler2 is handler3
-        assert handler1 is handler3
+    @pytest.fixture
+    def harness(self):
+        """Neutralize launch_kernel's heavy dependencies so the test
+        only observes the event-loop policy / loop_factory decision."""
+        with ExitStack() as stack:
+            for target in self._HEAVY_DEPENDENCY_TARGETS:
+                stack.enter_context(patch(target))
+            # Swap the whole signal module ref to avoid registering real
+            # SIGINT/SIGTERM/SIGBREAK handlers in the test process.
+            stack.enter_context(
+                patch("marimo._runtime.runtime.signal", new=MagicMock())
+            )
+            run_mock = MagicMock(side_effect=self._fake_asyncio_run)
+            stack.enter_context(patch("asyncio.run", run_mock))
+            yield run_mock
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="exercises the non-Windows branch",
+    )
+    def test_non_windows_does_not_change_event_loop_policy(self, harness):
+        with patch.object(asyncio, "set_event_loop_policy") as set_policy:
+            self._call_launch_kernel(is_edit_mode=True)
+
+        set_policy.assert_not_called()
+        assert harness.call_count == 1
+        assert "loop_factory" not in harness.call_args.kwargs
+
+    @pytest.mark.skipif(
+        sys.platform != "win32" or sys.version_info >= (3, 14),
+        reason="exercises the Windows pre-3.14 branch",
+    )
+    def test_windows_pre_314_installs_proactor_event_loop_policy(
+        self, harness
+    ):
+        with (
+            patch.object(
+                asyncio, "WindowsProactorEventLoopPolicy"
+            ) as policy_cls,
+            patch.object(asyncio, "set_event_loop_policy") as set_policy,
+        ):
+            self._call_launch_kernel(is_edit_mode=True)
+
+        policy_cls.assert_called_once_with()
+        set_policy.assert_called_once_with(policy_cls.return_value)
+        # Pre-3.14 uses the policy API, not loop_factory.
+        assert "loop_factory" not in harness.call_args.kwargs
+
+    @pytest.mark.skipif(
+        sys.platform != "win32" or sys.version_info < (3, 14),
+        reason="exercises the Windows 3.14+ branch",
+    )
+    def test_windows_314_plus_uses_proactor_loop_factory(self, harness):
+        # Event loop policies are deprecated in 3.14; launch_kernel must
+        # pass ProactorEventLoop as the loop_factory to asyncio.run
+        # instead of mutating the global policy.
+        with (
+            patch.object(asyncio, "ProactorEventLoop") as proactor_cls,
+            patch.object(asyncio, "set_event_loop_policy") as set_policy,
+        ):
+            self._call_launch_kernel(is_edit_mode=True)
+
+        set_policy.assert_not_called()
+        assert harness.call_args.kwargs.get("loop_factory") is proactor_cls
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="run-mode guard is only meaningful on Windows",
+    )
+    def test_run_mode_on_windows_does_not_touch_event_loop_policy(
+        self, harness
+    ):
+        # Run mode (not edit, not IPC) runs in-process on the server's
+        # loop and must NOT mutate the event loop policy — the server
+        # uses the Selector loop for ConnectionDistributor.add_reader().
+        with patch.object(asyncio, "set_event_loop_policy") as set_policy:
+            self._call_launch_kernel(is_edit_mode=False)
+
+        set_policy.assert_not_called()
+        assert "loop_factory" not in harness.call_args.kwargs

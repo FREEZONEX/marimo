@@ -5,17 +5,17 @@ import os
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from marimo._messaging.mimetypes import KnownMimeType
 from marimo._output.mime import MIME
 from marimo._output.rich_help import mddoc
 from marimo._output.utils import flatten_string
+from marimo._utils.methods import getcallable
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from marimo._plugins.core.web_component import JSONType
     from marimo._plugins.ui._core.ui_element import UIElement
     from marimo._plugins.ui._impl.batch import batch as batch_plugin
 
@@ -137,18 +137,18 @@ class Html(MIME):
         return self._text
 
     def _mime_(self) -> tuple[KnownMimeType, str]:
-        if not is_no_js():
+        if not is_non_interactive():
             return ("text/html", self.text)
 
         # Try PNG representation first (for objects with _repr_png_)
-        repr_png = getattr(self, "_repr_png_", None)
-        if repr_png is not None and callable(repr_png):
+        repr_png = getcallable(self, "_repr_png_")
+        if repr_png is not None:
             png_bytes = cast(bytes, repr_png())
             return ("image/png", png_bytes.decode())
 
         # Try markdown representation (for objects with _repr_markdown_)
-        repr_markdown = getattr(self, "_repr_markdown_", None)
-        if repr_markdown is not None and callable(repr_markdown):
+        repr_markdown = getcallable(self, "_repr_markdown_")
+        if repr_markdown is not None:
             markdown_text = cast(str, repr_markdown())
             return ("text/markdown", markdown_text)
 
@@ -163,7 +163,7 @@ class Html(MIME):
         )
 
     @mddoc
-    def batch(self, **elements: UIElement[JSONType, object]) -> batch_plugin:
+    def batch(self, **elements: UIElement[Any, Any]) -> batch_plugin:
         """Convert an HTML object with templated text into a UI element.
 
         This method lets you create custom UI elements that are represented
@@ -204,7 +204,7 @@ class Html(MIME):
         """
         from marimo._plugins.stateless import flex
 
-        return flex.hstack([self], justify="center")
+        return flex.vstack([_BlockWrapped(self)], align="center", gap=0)
 
     @mddoc
     def right(self) -> Html:
@@ -220,7 +220,7 @@ class Html(MIME):
         """
         from marimo._plugins.stateless import flex
 
-        return flex.hstack([self], justify="end")
+        return flex.vstack([_BlockWrapped(self)], align="end", gap=0)
 
     @mddoc
     def left(self) -> Html:
@@ -236,7 +236,7 @@ class Html(MIME):
         """
         from marimo._plugins.stateless import flex
 
-        return flex.hstack([self], justify="start")
+        return flex.vstack([_BlockWrapped(self)], align="start", gap=0)
 
     @mddoc
     def callout(
@@ -267,7 +267,7 @@ class Html(MIME):
 
     @mddoc
     def style(
-        self, style: Optional[dict[str, Any]] = None, **kwargs: Any
+        self, style: dict[str, Any] | None = None, **kwargs: Any
     ) -> Html:
         """Wrap an object in a styled container.
 
@@ -287,6 +287,33 @@ class Html(MIME):
 
     def _repr_html_(self) -> str:
         return self.text
+
+
+class _BlockWrapped(Html):
+    """Wraps another Html in a plain block ``<div>``.
+
+    Used by :meth:`Html.center`, :meth:`Html.left`, and :meth:`Html.right`
+    so that the wrapped content renders inside a single block container
+    (preserving normal block flow and margin collapsing between inner
+    elements) rather than becoming multiple flex-column siblings when the
+    inner wrapper uses ``display: contents`` (as ``mo.md`` does).
+
+    The inner Html is re-rendered on every ``text`` access so mutable
+    children (e.g. ``mo.status.spinner``) keep updating live.
+    """
+
+    def __init__(self, inner: Html) -> None:
+        self._inner = inner
+        super().__init__(self._build_text())
+
+    def _build_text(self) -> str:
+        from marimo._output.builder import h
+
+        return h.div(self._inner.text)
+
+    @property
+    def text(self) -> str:
+        return self._build_text()
 
 
 MARIMO_NO_JS_KEY = "MARIMO_NO_JS"
@@ -310,7 +337,7 @@ def patch_html_for_non_interactive_output() -> Iterator[None]:
         os.environ[MARIMO_NO_JS_KEY] = old_no_js
 
 
-def is_no_js() -> bool:
+def is_non_interactive() -> bool:
     """Whether to render HTML objects as best as possible assuming
     that this will be rendered without javascript.
 

@@ -32,9 +32,9 @@ function initialState(): CellSelectionState {
   };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+// oxlint-disable-next-line typescript/no-explicit-any
 type AnyTable = Table<any>;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+// oxlint-disable-next-line typescript/no-explicit-any
 type AnyCell = Cell<any, unknown>;
 
 const {
@@ -167,8 +167,8 @@ const {
       return state;
     }
 
-    const text = getCellValues(table, state.selectedCells);
-    copyToClipboard(text);
+    const { text, html } = getCellValues(table, state.selectedCells);
+    copyToClipboard(text, html);
     onCopyComplete();
 
     return {

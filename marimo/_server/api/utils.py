@@ -5,15 +5,20 @@ import os
 import subprocess
 import sys
 import webbrowser
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
 from typing import (
     TYPE_CHECKING,
-    Optional,
+    Any,
+    Generic,
     Protocol,
     TypeVar,
     runtime_checkable,
 )
+
+import msgspec
 
 from marimo._runtime.commands import CommandMessage
 from marimo._server.models.models import SuccessResponse
@@ -21,7 +26,12 @@ from marimo._types.ids import ConsumerId
 from marimo._utils.parse_dataclass import parse_raw
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from starlette.datastructures import UploadFile
     from starlette.requests import Request
+
+    from marimo._session.session import Session
 
 
 async def parse_request(
@@ -31,6 +41,46 @@ async def parse_request(
     return parse_raw(
         await request.body(), cls=cls, allow_unknown_keys=allow_unknown_keys
     )
+
+
+S = TypeVar("S", bound=msgspec.Struct)
+
+
+@dataclass
+class MultipartRequest(Generic[S]):
+    """Parsed multipart body. `files` holds un-read `UploadFile` handles
+    so callers can stream large parts instead of buffering."""
+
+    body: S
+    files: dict[str, UploadFile]
+
+
+@asynccontextmanager
+async def parse_multipart_request(
+    request: Request, cls: type[S]
+) -> AsyncIterator[MultipartRequest[S]]:
+    """Parse a multipart/form-data body into a msgspec.Struct + uploads.
+
+    Must be used as an async context manager: `UploadFile` parts stay
+    readable for the body of the `async with`, and their spooled temp
+    files are closed on exit.
+
+    Raises msgspec.ValidationError if required string fields are missing
+    or invalid.
+    """
+    # Lazy import so this module stays import-safe under pyodide.
+    from starlette.datastructures import UploadFile
+
+    async with request.form() as form:
+        string_payload: dict[str, Any] = {}
+        files: dict[str, UploadFile] = {}
+        for key, value in form.multi_items():
+            if isinstance(value, UploadFile):
+                files[key] = value
+            elif isinstance(value, str):
+                string_payload[key] = value
+        body = msgspec.convert(string_payload, cls, strict=False)
+        yield MultipartRequest(body=body, files=files)
 
 
 @runtime_checkable
@@ -63,7 +113,7 @@ async def dispatch_control_request(
     return SuccessResponse()
 
 
-def parse_title(filepath: Optional[str]) -> str:
+def parse_title(filepath: str | None) -> str:
     """
     Create a title from a filename.
     """
@@ -104,3 +154,52 @@ def open_url_in_browser(browser: str, url: str) -> None:
 
 
 T = TypeVar("T")
+
+
+async def install_packages_on_server(
+    manager: str,
+    versions: dict[str, str],
+) -> None:
+    """Install packages into the server's own Python environment.
+
+    Used when the server itself needs a package (e.g. nbformat for
+    IPYNB auto-export when running with --sandbox).
+    """
+    import sys
+
+    from marimo._runtime.packages.package_managers import (
+        create_package_manager,
+    )
+
+    pkg_manager = create_package_manager(manager, python_exe=sys.executable)
+    if not pkg_manager.is_manager_installed():
+        pkg_manager.alert_not_installed()
+        return
+    for pkg, version in versions.items():
+        await pkg_manager.install(pkg, version=version or None)
+
+
+def notify_server_missing_packages(
+    session: Session | None,
+    session_id: str | None,
+    packages: list[str],
+) -> None:
+    """Send a missing-package alert for a server-side package.
+
+    Uses isolated=True so the install button always appears regardless of
+    whether the server is in a virtual environment.
+    """
+    if session_id is None or session is None:
+        return
+    from marimo._messaging.notification import MissingPackageAlertNotification
+    from marimo._session.utils import send_message_to_consumer
+
+    send_message_to_consumer(
+        session=session,
+        operation=MissingPackageAlertNotification(
+            packages=packages,
+            isolated=True,
+            source="server",
+        ),
+        consumer_id=ConsumerId(session_id),
+    )

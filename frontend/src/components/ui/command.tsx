@@ -1,12 +1,16 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-import type { DialogProps } from "@radix-ui/react-dialog";
+import type { Dialog as DialogPrimitive } from "radix-ui";
+
+type DialogProps = DialogPrimitive.DialogProps;
+
 import type { VariantProps } from "class-variance-authority";
 import { Command as CommandPrimitive } from "cmdk";
 import { Search } from "lucide-react";
 import * as React from "react";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { cn } from "@/utils/cn";
+import { smartMatchFilter } from "@/utils/smartMatch";
 import { Strings } from "@/utils/strings";
 import {
   MENU_ITEM_DISABLED,
@@ -21,6 +25,7 @@ const Command = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <CommandPrimitive
     ref={ref}
+    filter={smartMatchFilter}
     className={cn(
       "flex h-full w-full flex-col overflow-hidden rounded-md bg-popover text-popover-foreground",
       className,
@@ -56,7 +61,7 @@ const CommandInput = React.forwardRef<
 >(({ className, icon, rootClassName, ...props }, ref) => (
   <div
     className={cn("flex items-center border-b px-3", rootClassName)}
-    // eslint-disable-next-line react/no-unknown-property
+    // oxlint-disable-next-line react/no-unknown-property
     cmdk-input-wrapper=""
   >
     {icon === null ? null : (

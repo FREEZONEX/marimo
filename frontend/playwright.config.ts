@@ -38,6 +38,7 @@ const appToOptions = {
   "bugs.py": { command: "edit" },
   "cells.py": { command: "edit" },
   "disabled_cells.py": { command: "edit" },
+  "disabled_ancestor_error.py": { command: "edit" },
   "kitchen_sink.py": { command: "edit" },
   "layout_grid.py": { command: "edit" },
   "stdin.py": { command: "edit" },
@@ -210,9 +211,11 @@ const config: PlaywrightTestConfig = {
         reuseExistingServer: true,
         timeout: 30 * 1000,
         ignoreHTTPSErrors: true,
-        // Add stdout/stderr for debugging
-        stdout: "pipe" as const,
-        stderr: "pipe" as const,
+        // Use "ignore" to prevent child processes from inheriting pipe FDs.
+        // With "pipe", orphan kernel workers keep the FDs open after the
+        // parent is killed, causing Playwright's webServer teardown to hang.
+        stdout: "ignore" as const,
+        stderr: "ignore" as const,
       };
     }),
     {
@@ -221,9 +224,8 @@ const config: PlaywrightTestConfig = {
       reuseExistingServer: true,
       timeout: 30 * 1000,
       ignoreHTTPSErrors: true,
-      // Add stdout/stderr for debugging
-      stdout: "pipe" as const,
-      stderr: "pipe" as const,
+      stdout: "ignore" as const,
+      stderr: "ignore" as const,
     },
     // WASM_SERVER,
   ],

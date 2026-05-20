@@ -7,6 +7,7 @@ import {
   CodeIcon,
   FolderDownIcon,
   ImageIcon,
+  Loader2Icon,
   MoreHorizontalIcon,
 } from "lucide-react";
 import type React from "react";
@@ -31,7 +32,9 @@ import type { CellData, CellRuntimeState } from "@/core/cells/types";
 import { MarkdownLanguageAdapter } from "@/core/codemirror/language/languages/markdown";
 import { useResolvedMarimoConfig } from "@/core/config/config";
 import { CSSClasses, KnownQueryParams } from "@/core/constants";
-import type { OutputMessage } from "@/core/kernel/messages";
+import type { MarimoError, OutputMessage } from "@/core/kernel/messages";
+import { kernelStateAtom } from "@/core/kernel/state";
+import { useNotebookCodeAvailable } from "@/core/meta/code-visibility";
 import { showCodeInRunModeAtom } from "@/core/meta/state";
 import { isErrorMime } from "@/core/mime";
 import { type AppMode, kioskModeAtom } from "@/core/mode";
@@ -41,7 +44,11 @@ import { downloadAsHTML } from "@/core/static/download-html";
 import { isStaticNotebook } from "@/core/static/static-state";
 import { isWasm } from "@/core/wasm/utils";
 import { cn } from "@/utils/cn";
-import { downloadBlob, downloadHTMLAsImage } from "@/utils/download";
+import {
+  ADD_PRINTING_CLASS,
+  downloadBlob,
+  downloadHTMLAsImage,
+} from "@/utils/download";
 import { Filenames } from "@/utils/filenames";
 import { FloatingOutline } from "../../chrome/panels/outline/floating-outline";
 import { cellDomProps } from "../../common";
@@ -59,6 +66,7 @@ const VerticalLayoutRenderer: React.FC<VerticalLayoutProps> = ({
 }) => {
   const { invisible } = useDelayVisibility(cells.length, mode);
   const kioskMode = useAtomValue(kioskModeAtom);
+  const kernelState = useAtomValue(kernelStateAtom);
   const [userConfig] = useResolvedMarimoConfig();
   const showCodeInRunModePreference = useAtomValue(showCodeInRunModeAtom);
 
@@ -76,23 +84,7 @@ const VerticalLayoutRenderer: React.FC<VerticalLayoutProps> = ({
       : showCodeByQueryParam === "true";
   });
 
-  const evaluateCanShowCode = () => {
-    const cellsHaveCode = cells.some((cell) => Boolean(cell.code));
-
-    if (kioskMode) {
-      return true;
-    }
-
-    // Only show code if in read mode and there is at least one cell with code
-
-    // If it is a static-notebook or wasm-read-only-notebook, code is always included,
-    // but it can be turned it off via a query parameter (include-code=false)
-
-    const includeCode = urlParams.get(KnownQueryParams.includeCode);
-    return mode === "read" && includeCode !== "false" && cellsHaveCode;
-  };
-
-  const canShowCode = evaluateCanShowCode();
+  const canShowCode = useNotebookCodeAvailable(cells);
 
   const renderCell = (cell: CellRuntimeState & CellData) => {
     return (
@@ -114,6 +106,7 @@ const VerticalLayoutRenderer: React.FC<VerticalLayoutProps> = ({
         staleInputs={cell.staleInputs}
         name={cell.name}
         kiosk={kioskMode}
+        showErrorTracebacks={userConfig.runtime.show_tracebacks ?? false}
       />
     );
   };
@@ -136,6 +129,15 @@ const VerticalLayoutRenderer: React.FC<VerticalLayoutProps> = ({
     }
 
     if (cells.length === 0 && !invisible) {
+      // If kernel is not yet instantiated, show loading state
+      if (!kernelState.isInstantiated) {
+        return (
+          <div className="flex-1 flex flex-col items-center justify-center py-8">
+            <Loader2Icon className="w-8 h-8 animate-spin text-muted-foreground" />
+          </div>
+        );
+      }
+      // Kernel is ready but no cells - truly empty notebook
       return (
         <div className="flex-1 flex flex-col items-center justify-center py-8">
           <Alert variant="info">
@@ -156,11 +158,9 @@ const VerticalLayoutRenderer: React.FC<VerticalLayoutProps> = ({
   // spacing is handled elsewhere
   return (
     <VerticalLayoutWrapper invisible={invisible} appConfig={appConfig}>
-      {showCode && canShowCode ? (
-        <div className="flex flex-col gap-5"> {renderCells()}</div>
-      ) : (
-        renderCells()
-      )}
+      <div className={cn("flex flex-col", showCode && canShowCode && "gap-5")}>
+        {renderCells()}
+      </div>
       {mode === "read" && (
         <ActionButtons
           canShowCode={canShowCode}
@@ -185,7 +185,12 @@ const ActionButtons: React.FC<{
     if (!app) {
       return;
     }
-    await downloadHTMLAsImage({ element: app, filename: document.title });
+    await downloadHTMLAsImage({
+      element: app,
+      filename: document.title,
+      // Add body.printing ONLY when converting the whole notebook to a screenshot
+      prepare: ADD_PRINTING_CLASS,
+    });
   };
 
   const handleDownloadAsHTML = async () => {
@@ -271,7 +276,7 @@ const ActionButtons: React.FC<{
     <div
       data-testid="notebook-actions-dropdown"
       className={cn(
-        "right-0 top-0 z-50 m-4 no-print flex gap-2 print:hidden",
+        "right-0 top-0 z-50 m-4 print:hidden flex gap-2",
         // If the notebook is static, we have a banner at the top, so
         // we can't use fixed positioning. Ideally this is sticky, but the
         // current dom structure makes that difficult.
@@ -284,7 +289,7 @@ const ActionButtons: React.FC<{
             <MoreHorizontalIcon className="w-4 h-4" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="no-print w-[220px]">
+        <DropdownMenuContent align="end" className="print:hidden w-[220px]">
           {actions}
         </DropdownMenuContent>
       </DropdownMenu>
@@ -292,18 +297,17 @@ const ActionButtons: React.FC<{
   );
 };
 
-interface VerticalCellProps
-  extends Pick<
-    CellRuntimeState,
-    | "output"
-    | "consoleOutputs"
-    | "status"
-    | "stopped"
-    | "errored"
-    | "interrupted"
-    | "staleInputs"
-    | "runStartTimestamp"
-  > {
+interface VerticalCellProps extends Pick<
+  CellRuntimeState,
+  | "output"
+  | "consoleOutputs"
+  | "status"
+  | "stopped"
+  | "errored"
+  | "interrupted"
+  | "staleInputs"
+  | "runStartTimestamp"
+> {
   cellOutputArea: "above" | "below";
   cellId: CellId;
   config: CellConfig;
@@ -312,6 +316,7 @@ interface VerticalCellProps
   showCode: boolean;
   name: string;
   kiosk: boolean;
+  showErrorTracebacks: boolean;
 }
 
 const VerticalCell = memo(
@@ -332,6 +337,7 @@ const VerticalCell = memo(
     mode,
     name,
     kiosk,
+    showErrorTracebacks,
   }: VerticalCellProps) => {
     const cellRef = useRef<HTMLDivElement>(null);
 
@@ -409,7 +415,18 @@ const VerticalCell = memo(
     }
 
     const outputIsError = isErrorMime(output?.mimetype);
-    const hidden = errored || interrupted || stopped || outputIsError;
+    // When show_tracebacks is enabled, show error outputs inline
+    // instead of hiding them
+    const hasTraceback =
+      showErrorTracebacks &&
+      outputIsError &&
+      Array.isArray(output?.data) &&
+      output.data.some(
+        (e: MarimoError) =>
+          e.type === "exception" && "traceback" in e && e.traceback,
+      );
+    const hidden =
+      (errored || interrupted || stopped || outputIsError) && !hasTraceback;
     if (hidden) {
       return null;
     }
@@ -464,7 +481,7 @@ export function groupCellsByColumn(
   });
 
   // Sort columns by index
-  return [...cellsByColumn.entries()].sort(([a], [b]) => a - b);
+  return [...cellsByColumn.entries()].toSorted(([a], [b]) => a - b);
 }
 
 /**

@@ -49,6 +49,7 @@ const ACTIONS: Record<keyof AllRequests, Action> = {
 
   // Export operations start a connection
   exportAsHTML: "startConnection",
+  exportAsIPYNB: "startConnection",
   exportAsMarkdown: "startConnection",
   exportAsPDF: "startConnection",
   readCode: "startConnection",
@@ -89,6 +90,7 @@ const ACTIONS: Record<keyof AllRequests, Action> = {
   sendSearchFiles: "startConnection",
   sendCreateFileOrFolder: "throwError",
   sendDeleteFileOrFolder: "throwError",
+  sendCopyFileOrFolder: "throwError",
   sendRenameFileOrFolder: "throwError",
   sendUpdateFile: "throwError",
   sendFileDetails: "throwError",
@@ -111,11 +113,14 @@ const ACTIONS: Record<keyof AllRequests, Action> = {
   previewDatasetColumn: "waitForConnectionOpen",
   previewSQLTable: "waitForConnectionOpen",
   previewSQLTableList: "waitForConnectionOpen",
+  previewSQLSchemaList: "waitForConnectionOpen",
   previewDataSourceConnection: "waitForConnectionOpen",
   validateSQL: "waitForConnectionOpen",
+  listStorageEntries: "waitForConnectionOpen",
+  downloadStorage: "waitForConnectionOpen",
 
   // Sync operations that wait for connection
-  syncCellIds: "waitForConnectionOpen",
+  sendDocumentTransaction: "waitForConnectionOpen",
   sendCodeCompletionRequest: "waitForConnectionOpen",
 };
 
@@ -134,7 +139,7 @@ export function createLazyRequests(
     await runtimeManager.init();
   });
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // oxlint-disable-next-line typescript/no-explicit-any
   function wrapRequest<T extends (...args: any[]) => Promise<any>>(
     request: T,
     key: keyof AllRequests,
