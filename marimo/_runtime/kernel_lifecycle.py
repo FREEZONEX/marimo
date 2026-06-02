@@ -142,6 +142,13 @@ def create_kernel(
         virtual_file_storage=args.virtual_file_storage,
         mode=args.mode,
     )
+
+    # Tier0: 启动时立即注入 PG engine 并广播数据源到前端
+    from marimo._runtime.runner.hooks_setup_engines import (
+        inject_and_broadcast_tier0_engines,
+    )
+    inject_and_broadcast_tier0_engines(kernel.globals)
+
     return kernel, ctx
 
 
