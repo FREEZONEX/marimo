@@ -109,10 +109,6 @@ const {
         if (INTERNAL_SQL_ENGINES.has(name)) {
           return true;
         }
-        // Tier0: 'pg' 由 sitecustomize hook 注入，不是 cell 定义的变量，需要保留
-        if (name === "pg") {
-          return true;
-        }
         return names.has(name as unknown as VariableName);
       }),
     );

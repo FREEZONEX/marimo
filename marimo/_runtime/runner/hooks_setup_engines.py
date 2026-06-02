@@ -59,9 +59,12 @@ def inject_and_broadcast_tier0_engines(glbls: dict) -> None:
 
 
 def _broadcast_tier0_datasource(ctx: OnFinishHookContext) -> None:
+    """on_finish hook: 每次 cell 执行完毕后重新广播 PG 数据源。
+
+    必须每次都广播，因为前端在收到 variables 消息时会调用
+    filterDataSourcesFromVariables 清除非 cell 定义的数据源连接（pg 是 hook 注入的）。
+    """
     if "pg" not in ctx.glbls:
-        return
-    if ctx.glbls.get("_tier0_pg_broadcasted"):
         return
 
     try:
@@ -89,6 +92,5 @@ def _broadcast_tier0_datasource(ctx: OnFinishHookContext) -> None:
                 ]
             )
         )
-        ctx.glbls["_tier0_pg_broadcasted"] = True
     except Exception as e:
         LOGGER.warning("[Tier0] Failed to broadcast PG datasource: %s", e)
