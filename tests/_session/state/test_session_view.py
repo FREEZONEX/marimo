@@ -732,6 +732,13 @@ def test_add_data_source_connections(session_view: SessionView) -> None:
                         databases=[],
                     ),
                     DataSourceConnection(
+                        source="sqlalchemy",
+                        dialect="postgresql",
+                        name="pg",
+                        display_name="PostgreSQL (pg)",
+                        databases=[],
+                    ),
+                    DataSourceConnection(
                         source="duckdb",
                         dialect="default",
                         name=INTERNAL_DUCKDB_ENGINE,
@@ -743,10 +750,11 @@ def test_add_data_source_connections(session_view: SessionView) -> None:
         )
     )
 
-    assert len(session_view.data_connectors.connections) == 3
+    assert len(session_view.data_connectors.connections) == 4
     names = [c.name for c in session_view.data_connectors.connections]
     assert "db1" in names
     assert "pg1" in names
+    assert "pg" in names
     assert INTERNAL_DUCKDB_ENGINE in names
 
     # Add new connection and update existing
@@ -773,7 +781,7 @@ def test_add_data_source_connections(session_view: SessionView) -> None:
         )
     )
 
-    assert len(session_view.data_connectors.connections) == 4
+    assert len(session_view.data_connectors.connections) == 5
     conns = {c.name: c for c in session_view.data_connectors.connections}
 
     # Check updated connection
@@ -785,6 +793,7 @@ def test_add_data_source_connections(session_view: SessionView) -> None:
     assert conns["mysql1"].dialect == "mysql"
     # Check existing connection
     assert "pg1" in conns
+    assert "pg" in conns
     assert INTERNAL_DUCKDB_ENGINE in names
 
     # Check connectors in operations
@@ -802,11 +811,12 @@ def test_add_data_source_connections(session_view: SessionView) -> None:
             )
         )
     )
-    assert len(session_view.data_connectors.connections) == 2
+    assert len(session_view.data_connectors.connections) == 3
     session_view_names = [
         c.name for c in session_view.data_connectors.connections
     ]
     assert "mysql1" in session_view_names
+    assert "pg" in session_view_names
     assert INTERNAL_DUCKDB_ENGINE in session_view_names
 
 

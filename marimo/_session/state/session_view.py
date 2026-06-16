@@ -50,6 +50,7 @@ from marimo._types.ids import CellId_t, UIElementId, WidgetModelId
 from marimo._utils.lists import as_list
 
 LOGGER = _loggers.marimo_logger()
+TIER0_INTERNAL_POSTGRES_ENGINE = "pg"
 
 ExportType = Literal["html", "md", "ipynb", "session"]
 MIMEBUNDLE_TYPE: KnownMimeType = "application/vnd.marimo+mimebundle"
@@ -292,7 +293,11 @@ class SessionView:
             for connection in self.data_connectors.connections:
                 if (
                     connection.name in variable_names
-                    or connection.name == INTERNAL_DUCKDB_ENGINE
+                    or connection.name
+                    in (
+                        INTERNAL_DUCKDB_ENGINE,
+                        TIER0_INTERNAL_POSTGRES_ENGINE,
+                    )
                 ):
                     next_connections[connection.name] = connection
             self.data_connectors = DataSourceConnectionsNotification(
