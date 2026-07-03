@@ -1,8 +1,8 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
-import os
 import functools
+import os
 import re
 from contextlib import contextmanager
 from typing import (
@@ -46,17 +46,37 @@ _TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES = {
     "pg_stat_statements",
 }
 
+_TIER0_VISIBLE_POSTGRES_SCHEMAS = {"uns"}
+_TIER0_VISIBLE_POSTGRES_SCHEMA_PREFIXES = ("proj_",)
+
 
 def _get_hidden_public_tables() -> set[str]:
     hidden_tables = os.getenv("TIER0_HIDDEN_PUBLIC_TABLES")
     if hidden_tables is None:
         return _TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES
 
-    return {
-        item.strip()
-        for item in hidden_tables.split(",")
-        if item.strip()
-    }
+    return {item.strip() for item in hidden_tables.split(",") if item.strip()}
+
+
+def _is_tier0_visible_postgres_schema(schema_name: str) -> bool:
+    return (
+        schema_name in _TIER0_VISIBLE_POSTGRES_SCHEMAS
+        or schema_name.startswith(_TIER0_VISIBLE_POSTGRES_SCHEMA_PREFIXES)
+    )
+
+
+def _filter_tier0_postgres_schema_names(
+    schema_names: list[str], dialect: str
+) -> list[str]:
+    if dialect.lower() not in {"postgresql", "postgres"}:
+        return schema_names
+
+    return [
+        schema_name
+        for schema_name in schema_names
+        if _is_tier0_visible_postgres_schema(schema_name)
+    ]
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -490,10 +510,10 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         else:
             schema_names = self._get_schema_names(database)
 
-        # Tier0: Restrict schema discovery to the tenant-authorized schema.
-        visible_schema = os.getenv("TIER0_VISIBLE_SCHEMA")
-        if visible_schema:
-            schema_names = [s for s in schema_names if s == visible_schema]
+        # Tier0: keep the datasource sidebar focused on business schemas.
+        schema_names = _filter_tier0_postgres_schema_names(
+            schema_names, self.dialect
+        )
 
         schemas: list[Schema] = []
 
@@ -550,7 +570,9 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         if schema.lower() == "public":
             hidden_public_tables = _get_hidden_public_tables()
             table_names = [
-                name for name in table_names if name not in hidden_public_tables
+                name
+                for name in table_names
+                if name not in hidden_public_tables
             ]
             view_names = [
                 name for name in view_names if name not in hidden_public_tables

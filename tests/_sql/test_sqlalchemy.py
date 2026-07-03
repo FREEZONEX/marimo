@@ -1018,6 +1018,53 @@ def test_get_schema_names(make_engine):
 
 
 @pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
+def test_get_schemas_filters_tier0_postgres_schemas(make_engine):
+    engine = make_engine(
+        dialect="postgresql",
+        schema_names=[
+            "public",
+            "uns",
+            "proj_1",
+            "proj_alpha",
+            "project",
+            "analytics",
+        ],
+    )
+
+    schemas = engine.get_schemas(
+        database="tier0",
+        include_tables=False,
+        include_table_details=False,
+    )
+
+    assert [schema.name for schema in schemas] == [
+        "uns",
+        "proj_1",
+        "proj_alpha",
+    ]
+
+
+@pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
+def test_get_schemas_does_not_filter_non_postgres_schemas(make_engine):
+    engine = make_engine(
+        dialect="sqlite",
+        schema_names=["main", "public", "analytics"],
+    )
+
+    schemas = engine.get_schemas(
+        database=":memory:",
+        include_tables=False,
+        include_table_details=False,
+    )
+
+    assert [schema.name for schema in schemas] == [
+        "main",
+        "public",
+        "analytics",
+    ]
+
+
+@pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
 def test_get_schema_names_no_inspector(make_engine):
     engine = make_engine(inspector=False)
     assert engine._get_schema_names("MY_DB") == []
