@@ -1018,12 +1018,24 @@ def test_get_schema_names(make_engine):
 
 
 @pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
-def test_get_schemas_hides_only_default_postgres_public_schema(make_engine):
+def test_get_schemas_hides_postgres_internals_and_default_public(make_engine):
     engine = make_engine(
         dialect="postgresql",
         default_database="tier0",
         schema_names=[
             "public",
+            "information_schema",
+            "pg_catalog",
+            "pg_toast",
+            "pg_temp_3",
+            "_timescaledb_cache",
+            "_timescaledb_catalog",
+            "_timescaledb_config",
+            "_timescaledb_debug",
+            "_timescaledb_functions",
+            "_timescaledb_internal",
+            "timescaledb_experimental",
+            "timescaledb_information",
             "uns",
             "proj_1",
             "proj_alpha",
@@ -1048,11 +1060,24 @@ def test_get_schemas_hides_only_default_postgres_public_schema(make_engine):
 
 
 @pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
-def test_get_schemas_keeps_all_non_default_postgres_schemas(make_engine):
+def test_get_schemas_keeps_project_schemas_and_hides_postgres_internals(
+    make_engine,
+):
     engine = make_engine(
         dialect="postgresql",
         default_database="postgres",
-        schema_names=["public", "app", "analytics"],
+        schema_names=[
+            "public",
+            "app",
+            "analytics",
+            "information_schema",
+            "pg_catalog",
+            "pg_toast",
+            "_timescaledb_cache",
+            "_timescaledb_internal",
+            "timescaledb_experimental",
+            "timescaledb_information",
+        ],
     )
 
     schemas = engine.get_schemas(

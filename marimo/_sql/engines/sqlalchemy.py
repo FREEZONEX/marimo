@@ -46,6 +46,14 @@ _TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES = {
     "pg_stat_statements",
 }
 
+_TIER0_HIDDEN_POSTGRES_SCHEMAS = {"information_schema"}
+_TIER0_HIDDEN_POSTGRES_SCHEMA_PREFIXES = (
+    "pg_",
+    "_timescaledb_",
+    "timescaledb_",
+)
+
+
 def _get_hidden_public_tables() -> set[str]:
     hidden_tables = os.getenv("TIER0_HIDDEN_PUBLIC_TABLES")
     if hidden_tables is None:
@@ -63,13 +71,16 @@ def _filter_tier0_postgres_schema_names(
     if dialect.lower() not in {"postgresql", "postgres"}:
         return schema_names
 
-    if database != default_database:
-        return schema_names
-
     return [
         schema_name
         for schema_name in schema_names
-        if schema_name.lower() != "public"
+        if schema_name.lower() not in _TIER0_HIDDEN_POSTGRES_SCHEMAS
+        and not schema_name.lower().startswith(
+            _TIER0_HIDDEN_POSTGRES_SCHEMA_PREFIXES
+        )
+        and not (
+            database == default_database and schema_name.lower() == "public"
+        )
     ]
 
 
@@ -538,8 +549,8 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         else:
             schema_names = self._get_schema_names(database)
 
-        # Tier0: the default database's public schema contains platform
-        # internals; project databases should expose every schema.
+        # Tier0: hide PostgreSQL/TimescaleDB internals everywhere, and hide the
+        # default database's public schema because it contains platform data.
         schema_names = _filter_tier0_postgres_schema_names(
             schema_names,
             self.dialect,
