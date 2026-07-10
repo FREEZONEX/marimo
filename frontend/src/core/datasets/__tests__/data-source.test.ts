@@ -9,7 +9,11 @@ import {
   exportedForTesting,
   type SQLTableContext,
 } from "../data-source-connections";
-import { type ConnectionName, INTERNAL_SQL_ENGINES } from "../engines";
+import {
+  type ConnectionName,
+  INTERNAL_SQL_ENGINES,
+  TIER0_POSTGRES_ENGINE,
+} from "../engines";
 
 const { reducer, initialState } = exportedForTesting;
 
@@ -206,6 +210,24 @@ describe("filtering data sources", () => {
     for (const engine of INTERNAL_SQL_ENGINES) {
       expect(filtered.connectionsMap.has(engine)).toBe(true);
     }
+  });
+
+  it("keeps the Tier0 injected postgres connection without a variable", () => {
+    const tier0Connection = {
+      name: TIER0_POSTGRES_ENGINE,
+      source: "sqlalchemy",
+      display_name: "postgresql (pg)",
+      dialect: "postgresql",
+      databases: [],
+    };
+    baseState = addConnection([tier0Connection], baseState);
+
+    const filtered = filterDataSources([]);
+
+    expect(filtered.connectionsMap.has(TIER0_POSTGRES_ENGINE)).toBe(true);
+    expect(filtered.connectionsMap.get(TIER0_POSTGRES_ENGINE)).toEqual(
+      tier0Connection,
+    );
   });
 });
 

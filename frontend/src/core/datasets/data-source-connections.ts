@@ -15,6 +15,7 @@ import {
   type ConnectionName,
   DUCKDB_ENGINE,
   INTERNAL_SQL_ENGINES,
+  PERSISTENT_SQL_ENGINES,
 } from "./engines";
 import { datasetTablesAtom } from "./state";
 
@@ -97,7 +98,7 @@ const {
     };
   },
 
-  // Keep internal engines and any connections that are used by variables
+  // Keep persistent engines and any connections that are used by variables
   filterDataSourcesFromVariables: (
     state: DataSourceState,
     variableNames: VariableName[],
@@ -106,7 +107,7 @@ const {
     const names = new Set(variableNames);
     const newMap = new Map(
       [...connectionsMap].filter(([name]) => {
-        if (INTERNAL_SQL_ENGINES.has(name)) {
+        if (PERSISTENT_SQL_ENGINES.has(name)) {
           return true;
         }
         return names.has(name as unknown as VariableName);

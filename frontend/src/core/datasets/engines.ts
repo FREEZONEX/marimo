@@ -9,3 +9,11 @@ export type ConnectionName = TypedString<"ConnectionName">;
 export const DUCKDB_ENGINE = "__marimo_duckdb" as ConnectionName;
 export const INTERNAL_SQL_ENGINES = new Set([DUCKDB_ENGINE]);
 export const DEFAULT_DUCKDB_DATABASE = "memory";
+
+// Tier0 injects this PostgreSQL engine into the kernel globals outside the
+// normal variable lifecycle, so frontend variable filtering must preserve it.
+export const TIER0_POSTGRES_ENGINE = "pg" as ConnectionName;
+export const PERSISTENT_SQL_ENGINES = new Set([
+  ...INTERNAL_SQL_ENGINES,
+  TIER0_POSTGRES_ENGINE,
+]);

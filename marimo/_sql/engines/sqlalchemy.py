@@ -46,10 +46,6 @@ _TIER0_DEFAULT_HIDDEN_PUBLIC_TABLES = {
     "pg_stat_statements",
 }
 
-_TIER0_VISIBLE_POSTGRES_SCHEMAS = {"uns"}
-_TIER0_VISIBLE_POSTGRES_SCHEMA_PREFIXES = ("proj_",)
-
-
 def _get_hidden_public_tables() -> set[str]:
     hidden_tables = os.getenv("TIER0_HIDDEN_PUBLIC_TABLES")
     if hidden_tables is None:
@@ -58,23 +54,22 @@ def _get_hidden_public_tables() -> set[str]:
     return {item.strip() for item in hidden_tables.split(",") if item.strip()}
 
 
-def _is_tier0_visible_postgres_schema(schema_name: str) -> bool:
-    return (
-        schema_name in _TIER0_VISIBLE_POSTGRES_SCHEMAS
-        or schema_name.startswith(_TIER0_VISIBLE_POSTGRES_SCHEMA_PREFIXES)
-    )
-
-
 def _filter_tier0_postgres_schema_names(
-    schema_names: list[str], dialect: str
+    schema_names: list[str],
+    dialect: str,
+    database: str,
+    default_database: str | None,
 ) -> list[str]:
     if dialect.lower() not in {"postgresql", "postgres"}:
+        return schema_names
+
+    if database != default_database:
         return schema_names
 
     return [
         schema_name
         for schema_name in schema_names
-        if _is_tier0_visible_postgres_schema(schema_name)
+        if schema_name.lower() != "public"
     ]
 
 
@@ -201,6 +196,23 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         """
 
         from sqlalchemy import inspect, text
+
+        if (
+            self.dialect.lower() in {"postgresql", "postgres"}
+            and database
+            and database != self.default_database
+        ):
+            from sqlalchemy import create_engine
+
+            database_engine = create_engine(
+                self._connection.url.set(database=database),
+                pool_pre_ping=True,
+            )
+            try:
+                yield inspect(database_engine)
+            finally:
+                database_engine.dispose()
+            return
 
         _use_database_dialect_command: dict[str, str] = {
             "snowflake": f"USE DATABASE {self._quote_identifier(database)}",
@@ -408,6 +420,20 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
             result = connection.execute(text("SHOW CATALOGS"))
             return [str(row[0]) for row in result.fetchall()]
 
+    def _get_postgresql_database_names(self) -> list[str]:
+        """Get all connectable, non-template PostgreSQL databases."""
+        from sqlalchemy import text
+
+        with self._connection.connect() as connection:
+            result = connection.execute(
+                text(
+                    "SELECT datname FROM pg_database "
+                    "WHERE datallowconn AND NOT datistemplate "
+                    "ORDER BY datname"
+                )
+            )
+            return [str(row[0]) for row in result.fetchall()]
+
     @safe_execute(
         fallback=[],
         message="Failed to get database names",
@@ -424,6 +450,8 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
             return self._get_snowflake_database_names()
         if dialect == "starrocks":
             return self._get_starrocks_database_names()
+        if dialect in {"postgresql", "postgres"}:
+            return self._get_postgresql_database_names()
 
         return [self.default_database] if self.default_database else []
 
@@ -510,9 +538,13 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         else:
             schema_names = self._get_schema_names(database)
 
-        # Tier0: keep the datasource sidebar focused on business schemas.
+        # Tier0: the default database's public schema contains platform
+        # internals; project databases should expose every schema.
         schema_names = _filter_tier0_postgres_schema_names(
-            schema_names, self.dialect
+            schema_names,
+            self.dialect,
+            database or "",
+            self.default_database,
         )
 
         schemas: list[Schema] = []

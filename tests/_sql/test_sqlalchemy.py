@@ -1018,9 +1018,10 @@ def test_get_schema_names(make_engine):
 
 
 @pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
-def test_get_schemas_filters_tier0_postgres_schemas(make_engine):
+def test_get_schemas_hides_only_default_postgres_public_schema(make_engine):
     engine = make_engine(
         dialect="postgresql",
+        default_database="tier0",
         schema_names=[
             "public",
             "uns",
@@ -1041,6 +1042,29 @@ def test_get_schemas_filters_tier0_postgres_schemas(make_engine):
         "uns",
         "proj_1",
         "proj_alpha",
+        "project",
+        "analytics",
+    ]
+
+
+@pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
+def test_get_schemas_keeps_all_non_default_postgres_schemas(make_engine):
+    engine = make_engine(
+        dialect="postgresql",
+        default_database="postgres",
+        schema_names=["public", "app", "analytics"],
+    )
+
+    schemas = engine.get_schemas(
+        database="project_1",
+        include_tables=False,
+        include_table_details=False,
+    )
+
+    assert [schema.name for schema in schemas] == [
+        "public",
+        "app",
+        "analytics",
     ]
 
 
@@ -1307,3 +1331,24 @@ def test_snowflake_get_database_names_delegates(make_engine):
 
     mocked.assert_called_once()
     assert result == expected
+
+
+@pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
+def test_postgresql_returns_all_connectable_databases(make_engine):
+    engine = make_engine(
+        dialect="postgresql",
+        default_database="postgres",
+        rows=[("platform",), ("postgres",), ("project_1",)],
+    )
+
+    assert engine._get_postgresql_database_names() == [
+        "platform",
+        "postgres",
+        "project_1",
+    ]
+
+    executed_sql = engine._mock_conn.execute.call_args[0][0]
+    assert str(executed_sql) == (
+        "SELECT datname FROM pg_database "
+        "WHERE datallowconn AND NOT datistemplate ORDER BY datname"
+    )

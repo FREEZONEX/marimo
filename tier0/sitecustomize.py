@@ -6,7 +6,6 @@ PostgreSQL 直连方案：通过 DATABASE_URL 环境变量自动创建 SQLAlchem
 
 环境变量:
 - DATABASE_URL: PostgreSQL 连接串（必需，格式 postgresql://user:pass@host:5432/dbname）
-- TIER0_VISIBLE_SCHEMA: 可见 schema 白名单（默认 uns）
 - MARIMO_UV_TARGET: uv --target 安装目录，启动时自动注入 sys.path
 """
 
