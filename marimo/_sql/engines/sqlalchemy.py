@@ -4,7 +4,9 @@ from __future__ import annotations
 import functools
 import os
 import re
+from collections import OrderedDict
 from contextlib import contextmanager
+from threading import Lock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -12,6 +14,7 @@ from typing import (
     ParamSpec,
     TypeVar,
 )
+from weakref import WeakKeyDictionary
 
 from marimo import _loggers
 from marimo._data.models import (
@@ -53,6 +56,12 @@ _TIER0_HIDDEN_POSTGRES_SCHEMA_PREFIXES = (
     "timescaledb_",
 )
 
+_POSTGRES_DATABASE_ENGINE_CACHE_SIZE = 8
+_POSTGRES_DATABASE_ENGINE_CACHE: WeakKeyDictionary[
+    Any, OrderedDict[str, Any]
+] = WeakKeyDictionary()
+_POSTGRES_DATABASE_ENGINE_CACHE_LOCK = Lock()
+
 
 def _get_hidden_public_tables() -> set[str]:
     hidden_tables = os.getenv("TIER0_HIDDEN_PUBLIC_TABLES")
@@ -82,6 +91,62 @@ def _filter_tier0_postgres_schema_names(
             database == default_database and schema_name.lower() == "public"
         )
     ]
+
+
+def _rewrite_postgresql_database_query(
+    query: str,
+) -> tuple[str, str | None]:
+    """Rewrite PostgreSQL database.schema.table references for execution."""
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.errors import SqlglotError
+
+    try:
+        expressions = [
+            expression
+            for expression in sqlglot.parse(query, read="postgres")
+            if expression is not None
+        ]
+    except SqlglotError:
+        return query, None
+
+    if not expressions:
+        return query, None
+
+    tables = [
+        table
+        for expression in expressions
+        for table in expression.find_all(exp.Table)
+    ]
+    databases = {table.catalog for table in tables if table.catalog}
+    if not databases:
+        return query, None
+
+    if len(databases) > 1:
+        from marimo._sql.error_utils import MarimoSQLException
+
+        database_list = ", ".join(sorted(databases))
+        raise MarimoSQLException(
+            "PostgreSQL cannot execute a query across multiple databases: "
+            f"{database_list}. Use one database per SQL cell, or configure "
+            "postgres_fdw/dblink for cross-database queries."
+        )
+
+    for table in tables:
+        if table.catalog:
+            table.set("catalog", None)
+
+    try:
+        rewritten_query = ";\n".join(
+            expression.sql(dialect="postgres") for expression in expressions
+        )
+    except SqlglotError:
+        return query, None
+
+    if query.rstrip().endswith(";"):
+        rewritten_query += ";"
+
+    return rewritten_query, next(iter(databases))
 
 
 if TYPE_CHECKING:
@@ -246,12 +311,49 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
     def dialect(self) -> str:
         return str(self._connection.dialect.name)
 
+    def _get_postgresql_database_engine(self, database: str) -> Engine:
+        if database == self.default_database:
+            return self._connection
+
+        from sqlalchemy import create_engine
+
+        with _POSTGRES_DATABASE_ENGINE_CACHE_LOCK:
+            database_engines = _POSTGRES_DATABASE_ENGINE_CACHE.setdefault(
+                self._connection, OrderedDict()
+            )
+            cached_engine = database_engines.pop(database, None)
+            if cached_engine is not None:
+                database_engines[database] = cached_engine
+                return cached_engine
+
+            database_engine = create_engine(
+                self._connection.url.set(database=database),
+                pool_pre_ping=True,
+                pool_size=1,
+                max_overflow=1,
+            )
+            database_engines[database] = database_engine
+
+            if len(database_engines) > _POSTGRES_DATABASE_ENGINE_CACHE_SIZE:
+                _, evicted_engine = database_engines.popitem(last=False)
+                evicted_engine.dispose()
+
+            return database_engine
+
     def execute(self, query: str) -> Any:
         sql_output_format = self.sql_output_format()
 
         from sqlalchemy import text
 
-        with self._connection.connect() as connection:
+        execution_engine = self._connection
+        if self.dialect.lower() in {"postgresql", "postgres"}:
+            query, database = _rewrite_postgresql_database_query(query)
+            if database is not None:
+                execution_engine = self._get_postgresql_database_engine(
+                    database
+                )
+
+        with execution_engine.connect() as connection:
             result = connection.execute(text(query))
             if sql_output_format == "native":
                 return result

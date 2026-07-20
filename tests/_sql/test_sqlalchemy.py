@@ -10,8 +10,13 @@ import pytest
 
 from marimo._data.models import Database, DataTable, DataTableColumn, Schema
 from marimo._dependencies.dependencies import DependencyManager
-from marimo._sql.engines.sqlalchemy import SQLAlchemyEngine, safe_execute
+from marimo._sql.engines.sqlalchemy import (
+    SQLAlchemyEngine,
+    _rewrite_postgresql_database_query,
+    safe_execute,
+)
 from marimo._sql.engines.types import EngineCatalog, QueryEngine
+from marimo._sql.error_utils import MarimoSQLException
 from marimo._sql.sql import sql
 from marimo._types.ids import VariableName
 
@@ -598,6 +603,72 @@ def test_sqlalchemy_engine_execute(sqlite_engine: sa.Engine) -> None:
     result = engine.execute("SELECT * FROM test ORDER BY id")
     assert isinstance(result, (pd.DataFrame, pl.DataFrame))
     assert len(result) == 4
+
+
+@pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
+def test_postgresql_execute_routes_database_qualified_query() -> None:
+    mock_base_engine = mock.MagicMock()
+    mock_base_engine.dialect.name = "postgresql"
+    mock_base_engine.url.database = "postgres"
+    mock_base_engine.url.set.return_value = "postgresql://project_7"
+
+    mock_database_engine = mock.MagicMock()
+    mock_connection = (
+        mock_database_engine.connect.return_value.__enter__.return_value
+    )
+    mock_result = mock_connection.execute.return_value
+
+    with (
+        mock.patch("sqlalchemy.inspect", return_value=mock.MagicMock()),
+        mock.patch(
+            "sqlalchemy.create_engine", return_value=mock_database_engine
+        ) as create_engine,
+        mock.patch.object(
+            SQLAlchemyEngine, "sql_output_format", return_value="native"
+        ),
+    ):
+        first_engine = SQLAlchemyEngine(mock_base_engine)
+        second_engine = SQLAlchemyEngine(mock_base_engine)
+        result = first_engine.execute(
+            'SELECT * FROM "project_7"."public"."items" LIMIT 100'
+        )
+        second_engine.execute(
+            'SELECT * FROM "project_7"."inventory"."lots"'
+        )
+
+    assert result is mock_result
+    create_engine.assert_called_once_with(
+        "postgresql://project_7",
+        pool_pre_ping=True,
+        pool_size=1,
+        max_overflow=1,
+    )
+    executed_queries = [
+        str(call.args[0]) for call in mock_connection.execute.call_args_list
+    ]
+    assert executed_queries == [
+        'SELECT * FROM "public"."items" LIMIT 100',
+        'SELECT * FROM "inventory"."lots"',
+    ]
+
+
+def test_rewrite_postgresql_database_query_rejects_multiple_databases() -> None:
+    query = (
+        'SELECT * FROM "project_7"."public"."items" '
+        'UNION ALL SELECT * FROM "project_8"."public"."items"'
+    )
+
+    with pytest.raises(
+        MarimoSQLException,
+        match="cannot execute a query across multiple databases: "
+        "project_7, project_8",
+    ):
+        _rewrite_postgresql_database_query(query)
+
+
+def test_rewrite_postgresql_database_query_ignores_string_literals() -> None:
+    query = "SELECT 'project_7.public.items' AS table_name"
+    assert _rewrite_postgresql_database_query(query) == (query, None)
 
 
 @pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not installed")
