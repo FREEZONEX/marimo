@@ -642,6 +642,7 @@ def test_postgresql_execute_routes_database_qualified_query() -> None:
         pool_pre_ping=True,
         pool_size=1,
         max_overflow=1,
+        json_deserializer=str,
     )
     executed_queries = [
         str(call.args[0]) for call in mock_connection.execute.call_args_list

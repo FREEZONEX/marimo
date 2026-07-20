@@ -331,6 +331,8 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
                 pool_pre_ping=True,
                 pool_size=1,
                 max_overflow=1,
+                # Avoid Polars inferring incompatible nested numeric types.
+                json_deserializer=str,
             )
             database_engines[database] = database_engine
 
