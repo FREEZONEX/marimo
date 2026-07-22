@@ -5,10 +5,12 @@ import {
   type ChatAddToolOutputFunction,
   type FileUIPart,
   isToolUIPart,
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+  lastAssistantMessageIsCompleteWithToolCalls,
   type ToolUIPart,
   type UIMessage,
 } from "ai";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import useEvent from "react-use-event-hook";
 import type { ProviderId } from "@/core/ai/ids/ids";
 import type { ToolNotebookContext } from "@/core/ai/tools/base";
@@ -17,9 +19,9 @@ import type {
   InvokeAiToolRequest,
   InvokeAiToolResponse,
 } from "@/core/network/types";
-import { logNever } from "@/utils/assertNever";
 import { blobToString } from "@/utils/fileToBase64";
 import { Logger } from "@/utils/Logger";
+import { generateUUID } from "@/utils/uuid";
 import { getAICompletionBodyWithAttachments } from "../editor/ai/completion-utils";
 import { toast } from "../ui/use-toast";
 
@@ -169,69 +171,59 @@ export async function handleToolCall({
 }
 
 /**
- * Returns true if a tool call is "ready to be sent back to the server" — i.e.
- * either it has reached a terminal output state, or the user has just supplied
- * an approval response that the server hasn't seen yet.
+ * Auto-send the next turn when the last assistant message ends with a
+ * tool call ready to round-trip. Any non-tool trailing part (text, file,
+ * source-*, reasoning, data-*, new step-start) means the assistant has
+ * already answered, so we leave the next turn to the user. State checks
+ * are delegated to the SDK to stay in sync with upstream.
  */
-function isToolCallReadyToSend(state: ToolUIPart["state"]): boolean {
-  switch (state) {
-    case "output-available":
-    case "output-error":
-    case "output-denied":
-    case "approval-responded":
-      return true;
-    case "input-streaming":
-    case "input-available":
-    case "approval-requested":
-      return false;
-    default:
-      logNever(state);
-      return false;
+export function hasPendingToolCalls(messages: UIMessage[]): boolean {
+  const lastMessage = messages.at(-1);
+  if (!lastMessage || lastMessage.role !== "assistant") {
+    return false;
   }
+  const lastPart = lastMessage.parts.at(-1);
+  if (!lastPart || !isToolUIPart(lastPart)) {
+    return false;
+  }
+  return (
+    lastAssistantMessageIsCompleteWithToolCalls({ messages }) ||
+    lastAssistantMessageIsCompleteWithApprovalResponses({ messages }) ||
+    (lastPart.state === "output-denied" && !lastPart.providerExecuted)
+  );
 }
 
 /**
- * Checks if we should send a message automatically based on the messages.
- * We auto-send when every tool call on the last assistant message has either
- * finished (output-available/error/denied) or has just received a user
- * approval response, and the assistant hasn't replied yet.
+ * True when the assistant is still waiting on tool execution or user approval.
+ * Unlike `hasPendingToolCalls` (ready to auto-resume), these states must block
+ * releasing queued user messages.
  */
-export function hasPendingToolCalls(messages: UIMessage[]): boolean {
-  if (messages.length === 0) {
+export function hasUnresolvedToolCalls(messages: UIMessage[]): boolean {
+  const lastMessage = messages.at(-1);
+  if (!lastMessage || lastMessage.role !== "assistant") {
     return false;
   }
-
-  const lastMessage = messages[messages.length - 1];
-  const parts = lastMessage.parts;
-
-  if (parts.length === 0) {
-    return false;
-  }
-
-  // Only auto-send if the last message is an assistant message
-  // Because assistant messages are the ones that can have tool calls
-  if (lastMessage.role !== "assistant") {
-    return false;
-  }
-
-  const toolParts = parts.filter(isToolUIPart);
-
-  if (toolParts.length === 0) {
-    return false;
-  }
-
-  const allToolCallsReady = toolParts.every((part) =>
-    isToolCallReadyToSend(part.state),
+  return lastMessage.parts.some(
+    (part) => isToolUIPart(part) && isUnresolvedToolState(part.state),
   );
+}
 
-  // Check if the last part has any text content
-  const lastPart = parts[parts.length - 1];
-  const hasTextContent =
-    lastPart.type === "text" && lastPart.text?.trim().length > 0;
-
-  Logger.debug("All tool calls ready to send: %s", allToolCallsReady);
-
-  return allToolCallsReady && !hasTextContent;
+function isUnresolvedToolState(state: ToolUIPart["state"]): boolean {
+  switch (state) {
+    case "approval-requested":
+    case "input-streaming":
+    case "input-available":
+      return true;
+    case "approval-responded":
+    case "output-available":
+    case "output-error":
+    case "output-denied":
+      return false;
+    default: {
+      const _exhaustive: never = state;
+      return _exhaustive;
+    }
+  }
 }
 
 export function useFileState() {
@@ -260,4 +252,77 @@ export function useFileState() {
     setFiles((prev) => prev.filter((f) => f !== fileToRemove));
 
   return { files, addFiles, clearFiles, removeFile };
+}
+
+export type ChatMessagePart = UIMessage["parts"][number];
+
+export interface QueuedUserMessage {
+  id: string;
+  parts: ChatMessagePart[];
+}
+
+/**
+ * Decide whether the message queue should release its next message after a
+ * chat request settles. `onFinish` fires on every completion — including
+ * aborts, errors, and each intermediate tool-call round — so the queue must
+ * only advance once the assistant has genuinely finished its turn.
+ */
+export function shouldFlushQueue(opts: {
+  isError: boolean;
+  isAbort: boolean;
+  hasPendingToolCalls: boolean;
+  hasUnresolvedToolCalls: boolean;
+}): boolean {
+  if (opts.isError) {
+    return false;
+  }
+  // User stopped the stream; release queued input even if a tool part is still
+  // mid-flight (e.g. `input-streaming`).
+  if (opts.isAbort) {
+    return true;
+  }
+  return !opts.hasPendingToolCalls && !opts.hasUnresolvedToolCalls;
+}
+
+/**
+ * Queue of user messages typed while the assistant is still responding.
+ * Messages are enqueued in order and released one at a time.
+ */
+export function useMessageQueue() {
+  const [messages, setMessages] = useState<QueuedUserMessage[]>([]);
+  // Mirror the queue in a ref so `flushNext` reads the latest value even when
+  // invoked from a callback (e.g. `onFinish`) captured on an earlier render.
+  const messagesRef = useRef<QueuedUserMessage[]>([]);
+  const hasQueuedRef = useRef(false);
+  messagesRef.current = messages;
+  hasQueuedRef.current = messages.length > 0;
+
+  const enqueue = useEvent((parts: ChatMessagePart[]) => {
+    setMessages((prev) => {
+      const next = [...prev, { id: generateUUID(), parts }];
+      messagesRef.current = next;
+      hasQueuedRef.current = true;
+      return next;
+    });
+  });
+
+  const flushNext = useEvent((send: (parts: ChatMessagePart[]) => void) => {
+    const queue = messagesRef.current;
+    if (queue.length === 0) {
+      return;
+    }
+    const [next, ...rest] = queue;
+    messagesRef.current = rest;
+    hasQueuedRef.current = rest.length > 0;
+    setMessages(rest);
+    send(next.parts);
+  });
+
+  const clear = useEvent(() => {
+    messagesRef.current = [];
+    hasQueuedRef.current = false;
+    setMessages([]);
+  });
+
+  return { messages, enqueue, flushNext, clear, hasQueuedRef };
 }

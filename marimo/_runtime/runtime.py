@@ -65,7 +65,6 @@ from marimo._messaging.notification_utils import (
     CellNotificationUtils,
     broadcast_notification,
 )
-from marimo._messaging.print_override import print_override
 from marimo._messaging.streams import (
     QueuePipe,
     ThreadSafeStderr,
@@ -87,6 +86,7 @@ from marimo._output.rich_help import mddoc
 from marimo._plugins.core.web_component import JSONType
 from marimo._plugins.ui._core.ui_element import MarimoConvertValueException
 from marimo._runtime import dataflow, handlers, marimo_pdb, patches
+from marimo._runtime.agent import Agent
 from marimo._runtime.app_meta import AppMeta
 from marimo._runtime.callbacks import (
     CacheCallbacks,
@@ -96,6 +96,8 @@ from marimo._runtime.callbacks import (
     PackagesCallbacks,
     SecretsCallbacks,
     SqlCallbacks,
+    SupportsTeardown,
+    cache_cells_enabled,
 )
 from marimo._runtime.commands import (
     AppMetadata,
@@ -107,6 +109,8 @@ from marimo._runtime.commands import (
     ExecuteCellCommand,
     ExecuteStaleCellsCommand,
     InvokeFunctionCommand,
+    OutOfBandCommand,
+    SetBreakpointsCommand,
     UpdateCellConfigCommand,
     UpdateUIElementCommand,
     UpdateUserConfigCommand,
@@ -129,8 +133,7 @@ from marimo._runtime.parent_poller import (
     start_parent_poller,
 )
 from marimo._runtime.redirect_streams import redirect_streams
-from marimo._runtime.reload.autoreload import ModuleReloader
-from marimo._runtime.reload.module_watcher import ModuleWatcher
+from marimo._runtime.reload.manager import AutoreloadManager
 from marimo._runtime.request_router import RequestRouter
 from marimo._runtime.runner import cell_runner, hook_context
 from marimo._runtime.runner.hooks import (
@@ -153,7 +156,7 @@ from marimo._sql.engines.types import (
 from marimo._sql.get_engines import (
     get_engines_from_variables,
 )
-from marimo._tracer import kernel_tracer
+from marimo._tracer import attach_trace_context, kernel_tracer
 from marimo._types.ids import CellId_t, UIElementId, VariableName
 from marimo._types.lifespan import Lifespan
 from marimo._utils.lifespans import Lifespans
@@ -189,12 +192,13 @@ def defs() -> tuple[str, ...]:
         return ()
 
     if ctx.execution_context is not None:
-        return tuple(
-            sorted(
-                defn
-                for defn in ctx.graph.cells[ctx.execution_context.cell_id].defs
-            )
-        )
+        cell_id = ctx.execution_context.cell_id
+        # The scratchpad cell lives in a Runner-local graph, not in
+        # ctx.graph (which always returns the kernel's main graph). It
+        # also has no meaningful defs in any case.
+        if cell_id not in ctx.graph.cells:
+            return ()
+        return tuple(sorted(defn for defn in ctx.graph.cells[cell_id].defs))
     return ()
 
 
@@ -216,10 +220,15 @@ def refs() -> tuple[str, ...]:
     )
 
     if ctx.execution_context is not None:
+        cell_id = ctx.execution_context.cell_id
+        # Scratchpad cell isn't registered in the main graph; same as
+        # defs() above.
+        if cell_id not in ctx.graph.cells:
+            return ()
         return tuple(
             sorted(
                 defn
-                for defn in ctx.graph.cells[ctx.execution_context.cell_id].refs
+                for defn in ctx.graph.cells[cell_id].refs
                 # exclude builtins that have not been shadowed
                 if defn not in unshadowed_builtins
             )
@@ -479,13 +488,15 @@ class Kernel:
         # timestamp, to save the user from having to spam the interrupt button
         self.last_interrupt_timestamp: float | None = None
 
-        # Named attributes exist because internal kernel paths (run hooks,
-        # script metadata) and tests reach into specific callbacks directly.
         self.secrets_callbacks = SecretsCallbacks(self)
         self.datasets_callbacks = DatasetCallbacks(self)
         self.packages_callbacks = PackagesCallbacks(self)
         self.sql_callbacks = SqlCallbacks(self)
-        self.cache_callbacks = CacheCallbacks(self)
+        self.cache_callbacks = CacheCallbacks(
+            self,
+            caching_enabled=lambda: cache_cells_enabled(self.user_config),
+            notebook_filename=app_metadata.filename,
+        )
         self.external_storage_callbacks = ExternalStorageCallbacks(self)
         self._callbacks: list[KernelCallback] = [
             self.secrets_callbacks,
@@ -512,7 +523,7 @@ class Kernel:
 
         self._globals_lock = threading.RLock()
         self._state_lock = threading.RLock()
-        self._completion_worker_started = False
+        self._out_of_band_worker_started = False
 
         self.debugger = debugger_override
         if self.debugger is not None:
@@ -543,6 +554,7 @@ class Kernel:
             sys.path.insert(0, "")
 
         self.graph = dataflow.DirectedGraph()
+        self.agent = Agent()
         # When autorun on startup is disabled, this holds cells that have
         # not yet been run; these cells are removed when they or their
         # descendants are run
@@ -556,8 +568,7 @@ class Kernel:
         self.module_registry = ModuleRegistry(
             self.graph, excluded_modules=set()
         )
-        self.module_reloader: ModuleReloader | None = None
-        self.module_watcher: ModuleWatcher | None = None
+        self.autoreload_manager = AutoreloadManager(self)
 
         # Load runtime settings from user config
         self.user_config = user_config
@@ -624,6 +635,15 @@ class Kernel:
     def stdin(self) -> Stdin | None:
         return self._streams.stdin
 
+    def teardown_callbacks(self) -> None:
+        """Run callback teardown while the runtime context is still alive."""
+        for cb in self._callbacks:
+            if isinstance(cb, SupportsTeardown):
+                try:
+                    cb.teardown()
+                except Exception:
+                    LOGGER.warning("Callback teardown failed", exc_info=True)
+
     def teardown(self) -> None:
         """Teardown resources owned by the kernel."""
         if self.stdout is not None:
@@ -634,8 +654,7 @@ class Kernel:
             self.stdin._stop()
         self.stream.stop()
 
-        if self.module_watcher is not None:
-            self.module_watcher.stop()
+        self.autoreload_manager.teardown()
 
         # TODO(akshayka): There's a memory leak in run mode, with memory
         # usage increasing with each session creation. Somehow the kernel
@@ -660,35 +679,7 @@ class Kernel:
         self.user_config = config
 
         self.packages_callbacks.update_package_manager(package_manager)
-
-        if (
-            (autoreload_mode == "lazy" or autoreload_mode == "autorun")
-            # Pyodide doesn't support hot module reloading
-            and not is_pyodide()
-        ):
-            if self.module_reloader is None:
-                self.module_reloader = ModuleReloader()
-
-            if (
-                self.module_watcher is not None
-                and self.module_watcher.mode != autoreload_mode
-            ):
-                self.module_watcher.stop()
-                self.module_watcher = None
-
-            if self.module_watcher is None:
-                self.module_watcher = ModuleWatcher(
-                    self.graph,
-                    reloader=self.module_reloader,
-                    enqueue_run_stale_cells=self._execute_stale_cells_callback,
-                    mode=autoreload_mode,
-                    stream=self.stream,
-                )
-        else:
-            self.module_reloader = None
-            if self.module_watcher is not None:
-                self.module_watcher.stop()
-                self.module_watcher = None
+        self.autoreload_manager.update_from_config(autoreload_mode)
 
     def _broadcast_tier0_engines(self) -> None:
         """Tier0: broadcast injected PG engine when the notebook opens."""
@@ -726,33 +717,77 @@ class Kernel:
 
     @contextlib.contextmanager
     def lock_globals(self) -> Iterator[None]:
-        # The only other thread accessing globals is the completion worker. If
-        # we haven't started a completion worker, there's no need to lock
-        # globals.
-        if self._completion_worker_started:
+        # The only other thread accessing globals is the out-of-band worker.
+        # If we haven't started one, there's no need to lock globals.
+        if self._out_of_band_worker_started:
             with self._globals_lock:
                 yield
         else:
             yield
 
-    def start_completion_worker(
-        self, completion_queue: QueueType[CodeCompletionCommand]
+    def start_out_of_band_worker(
+        self, out_of_band_queue: QueueType[OutOfBandCommand]
     ) -> None:
-        """Must be called after context is initialized"""
-        from marimo._runtime.complete import completion_worker
+        """Start the background worker for out-of-band commands.
 
-        threading.Thread(
-            target=completion_worker,
-            args=(
-                completion_queue,
-                self.graph,
-                self.globals,
-                self._globals_lock,
-                get_context().stream,
-            ),
-            daemon=True,
-        ).start()
-        self._completion_worker_started = True
+        Drains the queue on its own thread so these commands apply even while
+        a cell is executing (the control queue is blocked behind the running
+        cell). Must be called after the context is initialized.
+        """
+        from marimo._runtime.kernel_lifecycle import collapse_out_of_band
+
+        def _worker() -> None:
+            while True:
+                # Block for the next command, then drain and dispatch whatever
+                # else is queued in one pass (latest of each type wins).
+                commands = collapse_out_of_band(
+                    out_of_band_queue, first=out_of_band_queue.get()
+                )
+                # Breakpoint updates are latency-sensitive; apply them before
+                # the (potentially slow, docstring-resolving) completion
+                # command queued in the same drain pass.
+                commands.sort(
+                    key=lambda c: (
+                        0 if isinstance(c, SetBreakpointsCommand) else 1
+                    )
+                )
+                for command in commands:
+                    self.dispatch_out_of_band(command, docstrings_limit=80)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self._out_of_band_worker_started = True
+
+    def dispatch_out_of_band(
+        self, command: OutOfBandCommand, *, docstrings_limit: int
+    ) -> None:
+        """Apply a single out-of-band command.
+
+        The one place that maps an `OutOfBandCommand` to its handler; extend
+        with a new branch when adding a member to the union.
+        """
+        from marimo._utils.assert_never import assert_never
+
+        if isinstance(command, SetBreakpointsCommand):
+            self.set_breakpoints(command)
+        elif isinstance(command, CodeCompletionCommand):
+            self.code_completion(command, docstrings_limit=docstrings_limit)
+        else:
+            # Exhaustiveness guard: a new OutOfBandCommand member without a
+            # branch here would otherwise be silently dropped by the worker.
+            assert_never(command)
+
+    def set_breakpoints(self, request: SetBreakpointsCommand) -> None:
+        """Update the live debugger's breakpoints (session-scoped).
+
+        Replaces the full set; read by the frame watcher (`DebuggerLifecycle`).
+        """
+        if self.debugger is None:
+            return
+        self.debugger.breakpoints = {
+            cell_id: set(lines)
+            for cell_id, lines in request.breakpoints.items()
+            if lines
+        }
 
     @kernel_tracer.start_as_current_span("code_completion")
     def code_completion(
@@ -765,7 +800,7 @@ class Kernel:
             self.graph,
             self.globals,
             self._globals_lock,
-            get_context().stream,
+            self.stream,
             docstrings_limit,
         )
 
@@ -796,25 +831,12 @@ class Kernel:
                 stderr=self.stderr,
                 stdin=self.stdin,
             ),
+            self.autoreload_manager.cell_scope(),
         ):
-            modules = None
             try:
-                if self.module_reloader is not None:
-                    # Reload modules if they have changed
-                    modules = set(sys.modules)
-                    self.module_reloader.check(
-                        modules=sys.modules, reload=True
-                    )
                 yield exec_ctx
             finally:
                 ctx.execution_context = None
-                if self.module_reloader is not None and modules is not None:
-                    # Note timestamps for newly loaded modules
-                    new_modules = set(sys.modules) - modules
-                    self.module_reloader.check(
-                        modules={m: sys.modules[m] for m in new_modules},
-                        reload=False,
-                    )
 
     def _register_cell(
         self,
@@ -836,12 +858,7 @@ class Kernel:
             self.graph.cells[cell_id].set_stale(stale=True, broadcast=False)
         # leaky abstraction: the graph doesn't know about stale modules, so
         # we have to check for them here.
-        module_reloader = self.module_reloader
-        if (
-            module_reloader is not None
-            and module_reloader.cell_uses_stale_modules(cell)
-        ):
-            self.graph.set_stale({cell.cell_id}, prune_imports=True)
+        self.autoreload_manager.flag_if_imports_stale(cell)
         LOGGER.debug("registered cell %s", cell_id)
         LOGGER.debug("parents: %s", self.graph.parents[cell_id])
         LOGGER.debug("children: %s", self.graph.children[cell_id])
@@ -1845,9 +1862,6 @@ class Kernel:
             )
         )
 
-        if self.module_watcher is not None:
-            self.module_watcher.run_is_processed.set()
-
     @kernel_tracer.start_as_current_span("set_cell_config")
     async def set_cell_config(self, request: UpdateCellConfigCommand) -> None:
         """Update cell configs.
@@ -1891,15 +1905,15 @@ class Kernel:
         Args:
             request: The UI element update command.
             notify_frontend: Whether to broadcast the new value back to
-                the frontend via a ``marimo-ui-value-update`` message.
-                Set ``False`` for user-initiated updates from the frontend
+                the frontend via a `marimo-ui-value-update` message.
+                Set `False` for user-initiated updates from the frontend
                 (the frontend already has the value locally;
                 re-broadcasting causes redundant traffic and, on transports
                 with non-negligible round-trip latency (LSP, remote
                 kernels), can visibly snap the rendered widget backward to
-                a stale value). Set ``True`` for genuinely
+                a stale value). Set `True` for genuinely
                 kernel-initiated changes (e.g. code_mode's
-                ``set_ui_value``) where the frontend has no other way to
+                `set_ui_value`) where the frontend has no other way to
                 learn about the update.
 
         Returns True if any ui elements were set, False otherwise
@@ -2142,6 +2156,26 @@ class Kernel:
             error_title = "Function not found"
             error_message = f"Could not find function given request: {request}"
             debug(error_title, error_message)
+            # Logged at warning level so the field trigger is visible in
+            # production. The requested namespace missing from the registry is
+            # the signature of a frontend/kernel object-id desync; the set of
+            # registered namespaces lets us compare object-id (cell) prefixes
+            # to tell an unknown cell apart from a stale one. Object-ids and
+            # filenames only, never argument values.
+            LOGGER.warning(
+                "Function call not found "
+                "(pid=%s, notebook=%s, namespace=%s, function=%s, "
+                "namespace_registered=%s, registered_namespace_count=%d, "
+                "registered_namespaces=%s, child_contexts_searched=%d)",
+                os.getpid(),
+                self.app_metadata.filename,
+                request.namespace,
+                request.function_name,
+                request.namespace in ctx.function_registry.namespaces,
+                len(ctx.function_registry.namespaces),
+                sorted(ctx.function_registry.namespaces),
+                sum(1 for child in ctx.children if child.app is not None),
+            )
         elif function.cell_id is None:
             found = True
             error_title = "Function not associated with cell"
@@ -2342,7 +2376,12 @@ class Kernel:
         acquiring an RLock costs ~100ns so the overhead is negligible.
         """
         LOGGER.debug("Acquiring globals lock to handle request %s", request)
-        with self.lock_globals():
+        # Link kernel spans to the trace of the originating HTTP request (if
+        # the request carried W3C trace headers), so distributed traces span
+        # the server and the kernel.
+        http_request = getattr(request, "request", None)
+        headers = getattr(http_request, "headers", None)
+        with self.lock_globals(), attach_trace_context(headers):
             LOGGER.debug("Handling control request: %s", request)
             await self.router.dispatch(request)
             LOGGER.debug("Handled control request: %s", request)
@@ -2543,7 +2582,6 @@ def _create_streams(
 
 def _install_subprocess_handlers(
     kernel: Kernel,
-    ctx: KernelRuntimeContext,
     user_config: MarimoConfig,
     interrupt_queue: QueueType[bool] | None,
 ) -> None:
@@ -2553,7 +2591,7 @@ def _install_subprocess_handlers(
 
     register_formatters(theme=user_config["display"]["theme"])
 
-    signal.signal(signal.SIGINT, handlers.construct_interrupt_handler(ctx))
+    signal.signal(signal.SIGINT, handlers.construct_interrupt_handler())
 
     if sys.platform == "win32":
         if interrupt_queue is not None:
@@ -2571,7 +2609,7 @@ def _install_subprocess_handlers(
 def launch_kernel(
     control_queue: QueueType[CommandMessage],
     set_ui_element_queue: QueueType[BatchableCommand],
-    completion_queue: QueueType[CodeCompletionCommand],
+    completion_queue: QueueType[OutOfBandCommand],
     input_queue: QueueType[str],
     stream_queue: QueueType[KernelMessage] | None,
     socket_addr: tuple[str, int] | None,
@@ -2626,18 +2664,17 @@ def launch_kernel(
                 control_queue=control_queue,
                 set_ui_element_queue=set_ui_element_queue,
                 virtual_file_storage=virtual_file_storage,
-                print_override_fn=print_override,
             )
         ) as (kernel, ctx):
             if is_edit_mode:
-                # completions only provided in edit mode
-                kernel.start_completion_worker(completion_queue)
+                # out-of-band commands are only processed in edit mode
+                kernel.start_out_of_band_worker(completion_queue)
 
             if is_subprocess:
                 # Read theme from kernel.user_config — create_kernel may have
                 # mutated it for run mode (autorun + auto_reload off).
                 _install_subprocess_handlers(
-                    kernel, ctx, kernel.user_config, interrupt_queue
+                    kernel, kernel.user_config, interrupt_queue
                 )
 
             # The control loop is asynchronous so that (a) user code can use

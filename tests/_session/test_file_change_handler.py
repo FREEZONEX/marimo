@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from marimo import __version__, _loggers
 from marimo._ast.cell import CellConfig
 from marimo._ast.cell_manager import CellManager
 from marimo._config.manager import get_default_config_manager
@@ -34,7 +35,6 @@ from marimo._session.file_change_handler import (
     RunModeReloadStrategy,
 )
 from marimo._session.notebook import AppFileManager
-from marimo._session.notebook.file_manager import _build_transaction
 from marimo._types.ids import CellId_t
 
 if TYPE_CHECKING:
@@ -42,10 +42,10 @@ if TYPE_CHECKING:
 
 
 def _cm_from_doc(doc: NotebookDocument) -> CellManager:
-    """Build a ``CellManager`` mirroring ``doc``'s cells.
+    """Build a `CellManager` mirroring `doc`'s cells.
 
-    Used to drive ``_build_transaction`` from tests that already
-    express the prior state as a synthetic ``NotebookDocument``.
+    Used to drive `_build_transaction` from tests that already
+    express the prior state as a synthetic `NotebookDocument`.
     """
     cm = CellManager()
     for cell in doc.cells:
@@ -130,8 +130,9 @@ def _run_reload(
     mock_session.document = prev_document
     strategy = EditModeReloadStrategy(config_manager)
     cell_ids = list(afm.app.cell_manager.cell_ids())
-    transaction, _ = _build_transaction(
-        prev=_cm_from_doc(prev_document), new=afm.app.cell_manager
+    transaction, _ = _cm_from_doc(prev_document)._build_transaction(
+        new=afm.app.cell_manager,
+        source="file-watch",
     )
     strategy.handle_reload(
         mock_session,
@@ -258,8 +259,9 @@ def test_edit_mode_reload_with_deleted_cells(
     mock_session.document = prev_document
 
     strategy = EditModeReloadStrategy(config)
-    transaction, _ = _build_transaction(
-        prev=_cm_from_doc(prev_document), new=afm.app.cell_manager
+    transaction, _ = _cm_from_doc(prev_document)._build_transaction(
+        new=afm.app.cell_manager,
+        source="file-watch",
     )
     strategy.handle_reload(
         mock_session,
@@ -697,6 +699,60 @@ async def test_file_change_coordinator_skips_own_writes(
     strategy.handle_reload.assert_called_once()
 
 
+async def test_file_change_coordinator_keeps_reloaded_generated_with(
+    tmp_path: Path, mock_session: MagicMock
+) -> None:
+    temp_file = tmp_path / "test_reloaded_generated_with.py"
+    temp_file.write_text("import marimo\napp = marimo.App()\n")
+
+    afm = AppFileManager(filename=str(temp_file))
+    mock_session.app_file_manager = afm
+    request = SaveNotebookRequest(
+        cell_ids=[CellId_t("1")],
+        filename=str(temp_file),
+        codes=["x = 1"],
+        names=["cell1"],
+        configs=[CellConfig()],
+        persist=True,
+    )
+    afm.save(request)
+    old_content = temp_file.read_text().replace(
+        f'__generated_with = "{__version__}"',
+        '__generated_with = "0.0.0"',
+    )
+
+    afm.save(
+        SaveNotebookRequest(
+            cell_ids=[CellId_t("1")],
+            filename=str(temp_file),
+            codes=["x = 2"],
+            names=["cell1"],
+            configs=[CellConfig()],
+            persist=True,
+        )
+    )
+
+    temp_file.write_text(old_content)
+    result = await FileChangeCoordinator(MagicMock()).handle_change(
+        temp_file, mock_session
+    )
+    assert result.handled
+
+    afm.save(
+        SaveNotebookRequest(
+            cell_ids=list(afm.app.cell_manager.cell_ids()),
+            filename=str(temp_file),
+            codes=list(afm.app.cell_manager.codes()),
+            names=["cell1"],
+            configs=[CellConfig()],
+            persist=True,
+        )
+    )
+
+    assert '__generated_with = "0.0.0"' in temp_file.read_text()
+    assert f'__generated_with = "{__version__}"' not in temp_file.read_text()
+
+
 async def test_file_change_coordinator_handles_syntax_errors(
     tmp_path: Path, mock_session: MagicMock
 ) -> None:
@@ -742,6 +798,56 @@ async def test_file_change_coordinator_handles_syntax_errors(
     # Should handle using best-effort scanner fallback (never re-raises syntax errors)
     assert result.handled
     assert result.error is None
+
+
+async def test_file_change_coordinator_skips_conflict_markers(
+    tmp_path: Path,
+    mock_session: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When git writes conflict markers into the notebook, the watcher
+    must not reload — otherwise cells become unparsable and conflict
+    resolution tools like git-mediate break. See issue #9613."""
+    test_file = tmp_path / "test.py"
+    test_file.write_text(SINGLE_CELL_NOTEBOOK)
+    mock_session.app_file_manager = AppFileManager(filename=str(test_file))
+
+    strategy = MagicMock()
+    coordinator = FileChangeCoordinator(strategy)
+
+    test_file.write_text(
+        dedent(
+            """\
+            import marimo
+            app = marimo.App()
+
+            @app.cell
+            def cell1():
+            <<<<<<< HEAD
+                x = 1
+            =======
+                x = 2
+            >>>>>>> other-branch
+                return x
+            """
+        )
+    )
+
+    logger = _loggers.marimo_logger()
+    previous_propagate = logger.propagate
+    try:
+        logger.propagate = True
+        with caplog.at_level("WARNING"):
+            result = await coordinator.handle_change(test_file, mock_session)
+    finally:
+        logger.propagate = previous_propagate
+
+    assert not result.handled
+    assert result.error is None
+    strategy.handle_reload.assert_not_called()
+    assert any(
+        "conflict markers" in record.message for record in caplog.records
+    )
 
 
 async def test_file_change_coordinator_path_mismatch(

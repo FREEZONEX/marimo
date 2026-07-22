@@ -4,9 +4,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock, patch
+
+import pytest
 
 from marimo._server.api.deps import AppState
 from marimo._server.api.endpoints.assets import (
@@ -19,9 +22,9 @@ from marimo._server.workspace import (
     EmptyWorkspace,
     FixedFilesWorkspace,
     SingleFileWorkspace,
-    serialize_file_key,
 )
 from marimo._session.model import SessionMode
+from marimo._utils.http import HTTPException
 from marimo._utils.marimo_path import MarimoPath
 from tests._server.mocks import (
     token_header,
@@ -45,11 +48,10 @@ def test_index(client: TestClient) -> None:
     response = client.get("/", headers=token_header())
     assert response.status_code == 200, response.text
     content = response.text
-    file_key = session_manager.workspace.get_unique_file_key()
-    assert file_key is not None
-    filename = serialize_file_key(file_key)
+    filename = session_manager.workspace.get_unique_file_key()
     title = parse_title(filename)
     assert f"<marimo-filename hidden>{filename}</marimo-filename>" in content
+    assert filename is not None
     assert filename in content
     assert '"mode": "edit"' in content
     assert f"<title>{title}</title>" in content
@@ -239,6 +241,91 @@ def test_index_with_directory_run_mode(
         assert "<marimo-filename" in content
         assert '"mode": "gallery"' in content
         assert "<title>marimo</title>" in content
+
+
+def test_index_with_directory_respects_inline_theme(
+    client: TestClient, tmp_path: Path
+) -> None:
+    # Regression test for #10056: a directory workspace sends a relative file
+    # key, and its inline theme must still be applied.
+    notebook = tmp_path / "notebook.py"
+    notebook.write_text(
+        textwrap.dedent(
+            """
+            # /// script
+            # [tool.marimo.display]
+            # theme = "dark"
+            # ///
+
+            import marimo
+
+            app = marimo.App()
+
+
+            @app.cell
+            def _():
+                import marimo as mo
+                return
+
+
+            if __name__ == "__main__":
+                app.run()
+            """
+        ).lstrip()
+    )
+
+    app_state = AppState.from_app(cast(Any, client.app))
+    app_state.session_manager.mode = SessionMode.RUN
+
+    with workspace_scope(
+        client, DirectoryWorkspace(str(tmp_path), include_markdown=False)
+    ):
+        response = client.get("/?file=notebook.py", headers=token_header())
+        assert response.status_code == 200, response.text
+        assert '"theme": "dark"' in response.text
+
+
+def test_config_manager_at_file_directory_keys(
+    client: TestClient, tmp_path: Path
+) -> None:
+    # `config_manager_at_file` resolves relative directory-workspace keys
+    # before reading inline metadata, and must not swallow the workspace's
+    # path validation.
+    notebook = tmp_path / "notebook.py"
+    notebook.write_text(
+        textwrap.dedent(
+            """
+            # /// script
+            # [tool.marimo.display]
+            # theme = "dark"
+            # ///
+
+            import marimo
+
+            app = marimo.App()
+            """
+        ).lstrip()
+    )
+
+    app_state = AppState(cast(Any, Mock(app=client.app)))
+
+    with workspace_scope(
+        client, DirectoryWorkspace(str(tmp_path), include_markdown=False)
+    ):
+        # Relative key resolves against the workspace and applies inline config.
+        resolved = app_state.config_manager_at_file("notebook.py").get_config()
+        assert resolved["display"]["theme"] == "dark"
+
+        # A missing/unsaved file (404) yields base config, no inline overrides.
+        missing = app_state.config_manager_at_file(
+            "does_not_exist.py"
+        ).get_config()
+        assert missing["display"]["theme"] != "dark"
+
+        # A rejected path (non-404, e.g. traversal) propagates rather than
+        # falling back to reading an unvalidated path.
+        with pytest.raises(HTTPException):
+            app_state.config_manager_at_file("../../../../etc/passwd")
 
 
 def test_favicon(client: TestClient) -> None:
@@ -499,11 +586,10 @@ def test_public_file_serving(client: TestClient) -> None:
     app_state = AppState.from_app(cast(Any, client.app))
     file_key = app_state.session_manager.workspace.get_unique_file_key()
     assert file_key is not None
-    filepath = serialize_file_key(file_key)
-    assert filepath.endswith(".py")
+    assert file_key.endswith(".py")
 
     # Create a test file in a public directory
-    notebook_dir = Path(filepath).parent
+    notebook_dir = Path(file_key).parent
     public_dir = notebook_dir / "public"
     public_dir.mkdir(parents=True, exist_ok=True)
     test_file = public_dir / "test.txt"
@@ -514,7 +600,7 @@ def test_public_file_serving(client: TestClient) -> None:
     assert response.status_code == 404
 
     # Test with notebook ID header
-    headers = {**token_header(), "X-Notebook-Id": filepath}
+    headers = {**token_header(), "X-Notebook-Id": file_key}
     response = client.get("/public/test.txt", headers=headers)
     assert response.status_code == 200
     assert response.text == "test content"
@@ -540,11 +626,10 @@ def test_public_file_security(client: TestClient) -> None:
     app_state = AppState.from_app(cast(Any, client.app))
     file_key = app_state.session_manager.workspace.get_unique_file_key()
     assert file_key is not None
-    filepath = serialize_file_key(file_key)
-    assert filepath.endswith(".py")
+    assert file_key.endswith(".py")
 
     # Setup notebook and directories
-    notebook_dir = Path(filepath).parent
+    notebook_dir = Path(file_key).parent
     public_dir = notebook_dir / "public"
     secret_dir = notebook_dir / "secret"
     public_dir.mkdir(parents=True, exist_ok=True)
@@ -563,7 +648,7 @@ def test_public_file_security(client: TestClient) -> None:
         app_manager = app_state.session_manager.app_manager(file_key)
         app_manager.filename = str(notebook_dir / "notebook.py")
 
-        headers = {**token_header(), "X-Notebook-Id": filepath}
+        headers = {**token_header(), "X-Notebook-Id": file_key}
 
         # Test normal file access
         response = client.get("/public/safe.txt", headers=headers)
@@ -598,13 +683,31 @@ def test_public_file_security(client: TestClient) -> None:
 
 def test_inject_service_worker() -> None:
     assert (
-        "const notebookId = 'path%2Fto%2Fnotebook.py';"
+        'const notebookId = "path%2Fto%2Fnotebook.py";'
         in _inject_service_worker("<body></body>", "path/to/notebook.py")
     )
     assert (
-        "const notebookId = 'c%3A%5Cpath%5Cto%5Cnotebook.py';"
+        'const notebookId = "c%3A%5Cpath%5Cto%5Cnotebook.py";'
         in _inject_service_worker("<body></body>", r"c:\path\to\notebook.py")
     )
+
+
+def test_inject_service_worker_escapes_file_key() -> None:
+    # The file key is user-controlled, so it must be emitted as a JSON string
+    # literal and not interpolated directly into the inline <script>. A single
+    # quote in the value must not be able to terminate the string literal.
+    payload = "__new__'-alert(document.domain)-'"
+    result = _inject_service_worker("<body></body>", payload)
+    # The value is emitted as a double-quoted JSON string literal, so the
+    # single quotes in the payload are inert.
+    assert "const notebookId = '" not in result
+    assert (
+        "const notebookId = \"__new__'-alert(document.domain)-'\";" in result
+    )
+    # `</script>` sequences in the value are neutralized too.
+    script_payload = "__new__</script><script>alert(1)</script>"
+    script_result = _inject_service_worker("<body></body>", script_payload)
+    assert "</script><script>" not in script_result
 
 
 def test_inject_service_worker_null_check() -> None:
@@ -736,7 +839,7 @@ def test_index_lsp_workspace_with_root_directory(
         client,
         DirectoryWorkspace(str(temp_project_dir), include_markdown=False),
     ):
-        response = client.get("/?file=__new__", headers=token_header())
+        response = client.get("/?file=__new__file.py", headers=token_header())
         root_path = temp_project_dir
         root_uri = json.dumps(root_path.as_uri())
         document_path = root_path.joinpath(DEFAULT_NOTEBOOK_NAME)
@@ -756,7 +859,7 @@ def test_index_lsp_workspace_with_sub_directory(
     with workspace_scope(
         client, DirectoryWorkspace(str(subdir), include_markdown=False)
     ):
-        response = client.get("/?file=__new__", headers=token_header())
+        response = client.get("/?file=__new__file.py", headers=token_header())
         root_path = temp_project_dir
         root_uri = json.dumps(root_path.as_uri())
         document_path = subdir.joinpath(DEFAULT_NOTEBOOK_NAME)

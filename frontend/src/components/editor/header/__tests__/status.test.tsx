@@ -68,10 +68,6 @@ describe("StatusOverlay disconnect indicator", () => {
 
   it.each([
     [
-      WebSocketClosedReason.MALFORMED_QUERY,
-      "the kernel did not recognize a request; please file a bug with marimo",
-    ],
-    [
       WebSocketClosedReason.KERNEL_STARTUP_ERROR,
       "Failed to start kernel sandbox",
     ],
@@ -90,19 +86,4 @@ describe("StatusOverlay disconnect indicator", () => {
       expect(onReconnect).not.toHaveBeenCalled();
     },
   );
-
-  it("does not render the disconnect icon when another tab has taken over", () => {
-    const onReconnect = vi.fn();
-    const { queryByTestId } = renderOverlay(
-      {
-        state: WebSocketState.CLOSED,
-        code: WebSocketClosedReason.ALREADY_RUNNING,
-        reason: "another browser tab is already connected to the kernel",
-        canTakeover: true,
-      },
-      onReconnect,
-    );
-
-    expect(queryByTestId("disconnected-indicator")).toBeNull();
-  });
 });

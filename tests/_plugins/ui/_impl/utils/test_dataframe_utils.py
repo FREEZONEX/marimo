@@ -45,9 +45,9 @@ def test_get_row_headers_pandas() -> None:
     df_multi = pd.DataFrame({"A": range(3)}, index=arrays)
     assert _get_row_headers(df_multi) in [
         # pandas 2.x
-        [("", ("string", "object")), ("", ("string", "object"))],
+        [("Index0", ("string", "object")), ("Index1", ("string", "object"))],
         # pandas 3.x (StringDtype default)
-        [("", ("string", "str")), ("", ("string", "str"))],
+        [("Index0", ("string", "str")), ("Index1", ("string", "str"))],
     ]
 
     # Test with RangeIndex
@@ -57,7 +57,7 @@ def test_get_row_headers_pandas() -> None:
     # Test with categorical Index
     df_cat = pd.DataFrame({"A": range(3)})
     df_cat.index = pd.CategoricalIndex(["a", "b", "c"])
-    assert _get_row_headers(df_cat) == [("", ("string", "category"))]
+    assert _get_row_headers(df_cat) == [("Index0", ("string", "category"))]
 
     # Test with named categorical Index
     df_cat = pd.DataFrame({"A": range(3)})
@@ -93,6 +93,48 @@ def test_get_table_manager() -> None:
 
 def test_get_default_csv_encoding():
     assert get_default_csv_encoding() == DEFAULT_CSV_ENCODING
+
+
+def test_download_as_tsv_uses_tab_separator() -> None:
+    from marimo._plugins.ui._impl.tables.default_table import (
+        DefaultTableManager,
+    )
+    from marimo._plugins.ui._impl.utils.dataframe import download_as
+    from marimo._utils.data_uri import from_data_uri
+
+    manager = DefaultTableManager([{"a": 1, "b": 2}, {"a": 3, "b": 4}])
+    url, filename = download_as(manager, "tsv")
+
+    assert filename.endswith(".tsv")
+    mimetype, payload = from_data_uri(url)
+    # The virtual file carries the tsv mimetype, not csv.
+    assert mimetype == "text/tab-separated-values"
+    text = payload.decode("utf-8")
+    assert text.splitlines()[0] == "a\tb"
+    assert "1\t2" in text
+
+
+def test_download_as_csv_honors_separator_option() -> None:
+    from marimo._plugins.ui._impl.tables.default_table import (
+        DefaultTableManager,
+    )
+    from marimo._plugins.ui._impl.utils.dataframe import (
+        DelimitedOptions,
+        DownloadOptions,
+        download_as,
+    )
+    from marimo._utils.data_uri import from_data_uri
+
+    manager = DefaultTableManager([{"a": 1, "b": 2}])
+    url, filename = download_as(
+        manager,
+        "csv",
+        options=DownloadOptions(delimited=DelimitedOptions(separator=";")),
+    )
+
+    assert filename.endswith(".csv")
+    text = from_data_uri(url)[1].decode("utf-8")
+    assert text.splitlines()[0] == "a;b"
 
 
 def test_union_tolerates_string_type_aliases() -> None:

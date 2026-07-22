@@ -174,6 +174,11 @@ class CellImpl:
     # unique id
     cell_id: CellId_t
 
+    # Subset of `temporaries` that are closed over (transitively) by a
+    # function, lambda, or class defined in this cell, and so must be retained
+    # in the kernel globals for those closures to be callable.
+    closed_over_temporaries: set[Name] = dataclasses.field(default_factory=set)
+
     # Markdown content of the cell if it exists
     markdown: str | None = None
 
@@ -481,8 +486,12 @@ class Cell:
         if hasattr(self, "_is_coro_cached"):
             return self._is_coro_cached
         assert self._app is not None
-        self._is_coro_cached: bool = self._app.runner.is_coroutine(
-            self._cell.cell_id
+        from marimo._runtime.runner import by_refs
+
+        # Currently expensive since `graph` triggers _maybe_initialize on the
+        # underlying App.
+        self._is_coro_cached: bool = by_refs.is_coroutine(
+            self._app.graph, self._cell.cell_id
         )
         return self._is_coro_cached
 
@@ -656,6 +665,8 @@ class Cell:
                 refs = {**from_setup, **refs}
 
         try:
+            # TODO(dmadisetti): consider recomputing since caching doesn't close
+            # closure over the correct set of refs, but this is also expensive.
             if self._is_coroutine:
                 return self._app.run_cell_async(cell=self, kwargs=refs)
             else:

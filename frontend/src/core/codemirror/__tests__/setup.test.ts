@@ -1,7 +1,7 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
 import { EditorState, type Extension } from "@codemirror/state";
-import { keymap } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
 import { describe, expect, test, vi } from "vitest";
 import { cellId } from "@/__tests__/branded";
 import { OverridingHotkeyProvider } from "@/core/hotkeys/hotkeys";
@@ -132,6 +132,67 @@ describe("snapshot all duplicate keymaps", () => {
     expect(Object.values(duplicates).flat().length).toMatchInlineSnapshot("18");
     expect(duplicates).toMatchSnapshot();
   });
+});
+
+test("auto_close_pairs: false removes closeBrackets keymaps", () => {
+  const withAutoClose = EditorState.create({
+    extensions: setup(),
+  });
+  const withoutAutoClose = EditorState.create({
+    extensions: setup({
+      completionConfig: {
+        ...getOpts().completionConfig,
+        auto_close_pairs: false,
+      },
+    }),
+  });
+
+  const keysWith = withAutoClose.facet(keymap).flat();
+  const keysWithout = withoutAutoClose.facet(keymap).flat();
+
+  // closeBracketsKeymap contributes Backspace and Enter handlers
+  expect(keysWith.length).toBeGreaterThan(keysWithout.length);
+
+  const hasBracketPairHandler = (state: EditorState) =>
+    state
+      .facet(keymap)
+      .flat()
+      .some((k) => k.run?.name === "deleteBracketPair");
+
+  expect(hasBracketPairHandler(withAutoClose)).toBe(true);
+  expect(hasBracketPairHandler(withoutAutoClose)).toBe(false);
+});
+
+test("go to definition falls through to lower-priority LSP keymap", () => {
+  const lspGoToDefinition = vi.fn(() => true);
+  const goToDefinitionKey = getOpts().hotkeys.getHotkey(
+    "cell.goToDefinition",
+  ).key;
+
+  const view = new EditorView({
+    state: EditorState.create({
+      doc: "parser.add_argument('--foo')",
+      selection: { anchor: "parser.".length },
+      extensions: [
+        ...setup(),
+        keymap.of([{ key: goToDefinitionKey, run: lspGoToDefinition }]),
+      ],
+    }),
+    parent: document.body,
+  });
+
+  try {
+    const event = new KeyboardEvent("keydown", {
+      key: goToDefinitionKey,
+      bubbles: true,
+      cancelable: true,
+    });
+    view.contentDOM.dispatchEvent(event);
+
+    expect(lspGoToDefinition).toHaveBeenCalledOnce();
+  } finally {
+    view.destroy();
+  }
 });
 
 test("placeholder adds another extension", () => {

@@ -88,7 +88,7 @@ class IPCQueueManagerImpl(QueueManager):
     @property
     def completion_queue(  # type: ignore[override]
         self,
-    ) -> QueueType[commands.CodeCompletionCommand]:
+    ) -> QueueType[commands.OutOfBandCommand]:
         return self._ipc.completion_queue
 
     @property
@@ -138,10 +138,10 @@ def construct_kernel_env(
     """Build environment variables for a kernel subprocess.
 
     Args:
-        base_env: Starting environment (typically ``os.environ.copy()``).
+        base_env: Starting environment (typically `os.environ.copy()`).
         venv_python: Path to the Python executable in the target venv.
         is_ephemeral_sandbox: Whether this is an ephemeral sandbox venv
-            built by ``build_sandbox_venv``.
+            built by `build_sandbox_venv`.
         writable: Whether the kernel venv supports package installs.
         kernel_pythonpath: Extra PYTHONPATH entries for read-only
             configured venvs that don't have marimo installed.
@@ -391,7 +391,8 @@ class IPCKernelManagerImpl(KernelManager):
                 LOGGER.debug("Sending SIGINT to kernel")
                 os.kill(self._process.pid, signal.SIGINT)
 
-    def close_kernel(self) -> None:
+    def close_kernel(self, *, graceful: bool = False) -> None:
+        del graceful  # unsupported here: IPC shutdown never waits for exit.
         if self._process is not None:
             self.queue_manager.put_control_request(
                 commands.StopKernelCommand()

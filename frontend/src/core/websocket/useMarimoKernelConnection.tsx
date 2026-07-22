@@ -1,6 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 
-import { useAtom, useSetAtom } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { useRef } from "react";
 import { useErrorBoundary } from "react-error-boundary";
 import { toast } from "@/components/ui/use-toast";
@@ -11,15 +11,13 @@ import type {
   NotificationMessageData,
   NotificationPayload,
 } from "@/core/kernel/messages";
-import {
-  MAX_RETRIES,
-  useConnectionTransport,
-} from "@/core/websocket/useWebSocket";
+import { TRANSPORT_EXHAUSTED_REASON } from "@/core/websocket/transports/ws";
+import { useConnectionTransport } from "@/core/websocket/useWebSocket";
 import { renderHTML } from "@/plugins/core/RenderHTML";
 import {
   handleWidgetMessage,
-  MODEL_MANAGER,
-} from "@/plugins/impl/anywidget/model";
+  WIDGET_REGISTRY,
+} from "@/plugins/impl/anywidget/registry";
 import { logNever } from "@/utils/assertNever";
 import { prettyError } from "@/utils/errors";
 import {
@@ -34,9 +32,13 @@ import { cacheInfoAtom } from "../cache/requests";
 import { SCRATCH_CELL_ID } from "../cells/ids";
 import { useRunsActions } from "../cells/runs";
 import { focusAndScrollCellOutputIntoView } from "../cells/scrollCellIntoView";
+import {
+  resyncBreakpoints,
+  setActiveLine,
+} from "../codemirror/cells/debugger-state";
 import type { CellData } from "../cells/types";
 import { capabilitiesAtom } from "../config/capabilities";
-import { useSetAppConfig } from "../config/config";
+import { connectionTransportTypeAtom, useSetAppConfig } from "../config/config";
 import { useDataSourceActions } from "../datasets/data-source-connections";
 import type { ConnectionName } from "../datasets/engines";
 import {
@@ -80,28 +82,38 @@ import {
 
 const SUPPORTS_LAZY_KERNELS = true;
 
+// All MARIMO_* reasons except TRANSPORT_EXHAUSTED are emitted by the backend
+// (marimo/_server/api/endpoints/ws_endpoint.py and ws/*.py). Keep in sync with
+// the backend literals. Over the SSE transport these arrive as in-band
+// `close` events rather than WebSocket close frames, so every terminal
+// reason must be classified here — an unclassified reason falls into the
+// retry path.
+export type CloseReason =
+  | "MARIMO_NO_FILE_KEY"
+  | "MARIMO_NO_SESSION_ID"
+  | "MARIMO_NO_SESSION"
+  | "MARIMO_SHUTDOWN"
+  | "MARIMO_KERNEL_STARTUP_ERROR"
+  | "MARIMO_UNAUTHORIZED"
+  | "MARIMO_KIOSK_NOT_ALLOWED"
+  | typeof TRANSPORT_EXHAUSTED_REASON;
+
 export type CloseDecision =
   | { kind: "terminal"; status: ConnectionStatus; closeTransport: boolean }
   | { kind: "gave-up"; status: ConnectionStatus }
   | { kind: "retry"; status: ConnectionStatus };
 
-export function classifyCloseEvent(
-  event: { reason?: string },
-  context: { retryCount: number; maxRetries: number },
-): CloseDecision {
-  switch (event.reason) {
-    case "MARIMO_ALREADY_CONNECTED":
+export function classifyCloseEvent(event: { reason?: string }): CloseDecision {
+  switch (event.reason as CloseReason | undefined) {
+    case TRANSPORT_EXHAUSTED_REASON:
       return {
-        kind: "terminal",
+        kind: "gave-up",
         status: {
           state: WebSocketState.CLOSED,
-          code: WebSocketClosedReason.ALREADY_RUNNING,
-          reason: "another browser tab is already connected to the kernel",
-          canTakeover: true,
+          code: WebSocketClosedReason.KERNEL_DISCONNECTED,
+          reason: "kernel not found",
         },
-        closeTransport: true,
       };
-    case "MARIMO_WRONG_KERNEL_ID":
     case "MARIMO_NO_FILE_KEY":
     case "MARIMO_NO_SESSION_ID":
     case "MARIMO_NO_SESSION":
@@ -115,16 +127,25 @@ export function classifyCloseEvent(
         },
         closeTransport: true,
       };
-    case "MARIMO_MALFORMED_QUERY":
+    case "MARIMO_UNAUTHORIZED":
       return {
         kind: "terminal",
         status: {
           state: WebSocketState.CLOSED,
-          code: WebSocketClosedReason.MALFORMED_QUERY,
-          reason:
-            "the kernel did not recognize a request; please file a bug with marimo",
+          code: WebSocketClosedReason.KERNEL_DISCONNECTED,
+          reason: "not authorized",
         },
-        closeTransport: false,
+        closeTransport: true,
+      };
+    case "MARIMO_KIOSK_NOT_ALLOWED":
+      return {
+        kind: "terminal",
+        status: {
+          state: WebSocketState.CLOSED,
+          code: WebSocketClosedReason.KERNEL_DISCONNECTED,
+          reason: "kiosk mode is not available for this session",
+        },
+        closeTransport: true,
       };
     case "MARIMO_KERNEL_STARTUP_ERROR":
       return {
@@ -144,18 +165,7 @@ export function classifyCloseEvent(
         logNever(event.reason as never);
       }
   }
-  // partysocket stops retrying silently once `maxRetries` is hit; surface
-  // CLOSED so callers can detect the give-up.
-  if (context.retryCount >= context.maxRetries) {
-    return {
-      kind: "gave-up",
-      status: {
-        state: WebSocketState.CLOSED,
-        code: WebSocketClosedReason.KERNEL_DISCONNECTED,
-        reason: "kernel not found",
-      },
-    };
-  }
+
   return {
     kind: "retry",
     status: { state: WebSocketState.CONNECTING },
@@ -213,6 +223,7 @@ export function useMarimoKernelConnection(opts: {
   const setKioskMode = useSetAtom(kioskModeAtom);
   const setCapabilities = useSetAtom(capabilitiesAtom);
   const runtimeManager = useRuntimeManager();
+  const transportType = useAtomValue(connectionTransportTypeAtom);
   const setCacheInfo = useSetAtom(cacheInfoAtom);
   const setKernelStartupError = useSetAtom(kernelStartupErrorAtom);
   const {
@@ -240,6 +251,11 @@ export function useMarimoKernelConnection(opts: {
           existingCells,
         });
         setKioskMode(msg.data.kiosk);
+        // A freshly started kernel has no breakpoints of its own; re-push
+        // the client's set so they still apply, and clear the stale
+        // highlighted line from the previous kernel instance.
+        setActiveLine(null);
+        resyncBreakpoints();
         return;
       }
 
@@ -267,7 +283,7 @@ export function useMarimoKernelConnection(opts: {
       }
 
       case "model-lifecycle":
-        handleWidgetMessage(MODEL_MANAGER, msg.data);
+        handleWidgetMessage(WIDGET_REGISTRY, msg.data);
         return;
 
       case "remove-ui-elements":
@@ -411,8 +427,18 @@ export function useMarimoKernelConnection(opts: {
       case "focus-cell":
         focusAndScrollCellOutputIntoView(msg.data.cell_id);
         return;
+      case "active-line":
+        setActiveLine(
+          msg.data.line == null
+            ? null
+            : { cellId: msg.data.cell_id, line: msg.data.line },
+        );
+        return;
       case "notebook-document-transaction":
         handleDocumentTransaction(msg.data.transaction);
+        return;
+      case "consumer-capabilities":
+        setKioskMode(!msg.data.consumer_capabilities.edit);
         return;
       default:
         logNever(msg.data);
@@ -440,7 +466,7 @@ export function useMarimoKernelConnection(opts: {
     }
     shouldTryReconnecting.current = true;
     setConnection({ state: WebSocketState.CONNECTING });
-    const healthy = await runtimeManager.isHealthy();
+    const healthy = await runtimeManager.reconcileFromHealth();
     if (!healthy) {
       shouldTryReconnecting.current = false;
       setConnection({
@@ -455,10 +481,19 @@ export function useMarimoKernelConnection(opts: {
 
   const ws = useConnectionTransport({
     static: isStaticNotebook(),
+    transportType,
     /**
      * Unique URL for this session.
      */
-    url: () => runtimeManager.getWsURL(sessionId).toString(),
+    url: () =>
+      transportType === "sse"
+        ? runtimeManager.getSseURL(sessionId).toString()
+        : runtimeManager.getWsURL(sessionId).toString(),
+    /**
+     * Auth headers for the SSE transport. WebSockets cannot send headers
+     * and instead put the access token in the URL.
+     */
+    headers: () => runtimeManager.headers(),
 
     /**
      * Open callback. Set the connection status to open.
@@ -512,10 +547,7 @@ export function useMarimoKernelConnection(opts: {
      */
     onClose: (e) => {
       Logger.warn("WebSocket closed", e.code, e.reason);
-      const decision = classifyCloseEvent(e, {
-        retryCount: ws.retryCount,
-        maxRetries: MAX_RETRIES,
-      });
+      const decision = classifyCloseEvent(e);
       setConnection(decision.status);
       if (decision.kind === "terminal" && decision.closeTransport) {
         ws.close(); // close to prevent reconnecting

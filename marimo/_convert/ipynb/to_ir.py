@@ -53,18 +53,18 @@ _CLOSE_P_RE = re.compile(r"</p>", re.IGNORECASE)
 
 
 def _strip_paragraph_tags(source: str) -> str:
-    """Remove bare ``<p>`` / ``</p>`` HTML tags from markdown source.
+    """Remove bare `<p>` / `</p>` HTML tags from markdown source.
 
-    Jupyter markdown cells often wrap content in ``<p>…</p>`` tags which are
+    Jupyter markdown cells often wrap content in `<p>…</p>` tags which are
     redundant in plain markdown and can break LaTeX rendering inside
-    ``mo.md()``.
+    `mo.md()`.
 
-    Only bare ``<p>`` tags (without attributes) are removed.  Styled tags such
-    as ``<p style="color: red">`` are preserved because they carry semantic
-    meaning.  The matching ``</p>`` is only removed when it closes a bare
-    ``<p>``.
+    Only bare `<p>` tags (without attributes) are removed.  Styled tags such
+    as `<p style="color: red">` are preserved because they carry semantic
+    meaning.  The matching `</p>` is only removed when it closes a bare
+    `<p>`.
 
-    Closing ``</p>`` tags for bare opens are replaced with a newline to
+    Closing `</p>` tags for bare opens are replaced with a newline to
     preserve paragraph separation.  Content inside fenced code blocks is
     left untouched.
     """
@@ -1266,7 +1266,7 @@ def bind_cell_metadata(
 
     - If "hide-cell" or the standard nbconvert "remove-input" tag is present,
       the cell is marked hidden (and the tag is consumed).
-    - The Jupyter UI hint ``metadata.jupyter.source_hidden`` is also treated as
+    - The Jupyter UI hint `metadata.jupyter.source_hidden` is also treated as
       a hidden-code signal.
     - Remaining tags (if any) are inserted as a comment at the top of the source.
     - If marimo-specific metadata is present, it is used to restore cell config.
@@ -1496,6 +1496,17 @@ def _transform_sources(
             source_transform.__name__, source_transform, sources
         )
 
+    # Handle exclamation marks before the comment-preserving transforms.
+    # `!`-command cells are invalid Python, and several of the downstream
+    # transforms (notably `transform_fixup_multiple_definitions`) compile the
+    # whole notebook at once and bail out entirely on a SyntaxError. Rewriting
+    # `!` commands into valid Python first keeps those optimizations enabled
+    # for the rest of the notebook. Handled specially since it returns an
+    # ExclamationMarkResult carrying pip-package/subprocess metadata.
+    exclamation_result = transform_exclamation_mark(sources)
+    sources = exclamation_result.transformed_sources
+    exclamation_metadata = exclamation_result
+
     # Create comment preserver from the simplified sources
     comment_preserver = CommentPreserver(sources)
 
@@ -1503,11 +1514,6 @@ def _transform_sources(
     for base_transform in comment_preserving_transforms:
         transform = comment_preserver(base_transform)
         sources = _run_transform(base_transform.__name__, transform, sources)
-
-    # Handle exclamation_mark specially since it returns ExclamationMarkResult
-    exclamation_result = transform_exclamation_mark(sources)
-    sources = exclamation_result.transformed_sources
-    exclamation_metadata = exclamation_result
 
     cells = bind_cell_metadata(sources, metadata, hide_flags)
 

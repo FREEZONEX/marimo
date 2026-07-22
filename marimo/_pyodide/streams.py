@@ -42,6 +42,13 @@ class PyodideStream(Stream):
     def write(self, data: KernelMessage) -> None:
         self.pipe(data)
 
+    def copy_for_thread(self) -> PyodideStream:
+        return PyodideStream(
+            pipe=self.pipe,
+            input_queue=self.input_queue,
+            cell_id=self.cell_id,
+        )
+
 
 class PyodideStdout(Stdout):
     encoding = sys.stdout.encoding
@@ -179,17 +186,3 @@ class PyodideStdin(Stdin):
     def _get_response(self) -> str:
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.stream.input_queue.get())
-
-    def readline(self, size: int | None = -1) -> str:  # type: ignore[override]
-        # size only included for compatibility with sys.stdin.readline API;
-        # we don't support it.
-        del size
-        return self._readline_with_prompt(prompt="")
-
-    def readlines(self, hint: int | None = -1) -> list[str]:  # type: ignore[override]
-        # Just an alias for readline.
-        #
-        # hint only included for compatibility with sys.stdin.readlines API;
-        # we don't support it.
-        del hint
-        return self._readline_with_prompt(prompt="").split("\n")

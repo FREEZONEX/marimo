@@ -23,6 +23,7 @@ from marimo._ast.app_config import _AppConfig
 from marimo._config.config import MarimoConfig
 from marimo._data.models import DataTableSource
 from marimo._messaging.notebook.document import NotebookCell
+from marimo._messaging.notebook.outputs import CellOutputs
 from marimo._types.encodable import Encodable
 from marimo._types.ids import CellId_t, RequestId, UIElementId, WidgetModelId
 
@@ -75,9 +76,9 @@ SerializedCLIArgs = dict[str, ListOrValue[Primitive]]
 def _user_to_dict(user: Any) -> dict[str, Encodable]:
     """Normalize an auth user into a serializable dict.
 
-    Starlette's authentication middleware sets ``request.scope["user"]`` to a
-    ``BaseUser`` instance (commonly ``SimpleUser``). Storing the raw object on
-    ``HTTPRequest.user`` breaks msgspec serialization on the IPC path. Convert
+    Starlette's authentication middleware sets `request.scope["user"]` to a
+    `BaseUser` instance (commonly `SimpleUser`). Storing the raw object on
+    `HTTPRequest.user` breaks msgspec serialization on the IPC path. Convert
     to a dict matching the documented contract: "info from authentication
     middleware (e.g., is_authenticated, username)".
     """
@@ -93,10 +94,10 @@ def _user_to_dict(user: Any) -> dict[str, Encodable]:
 
 
 def _meta_to_dict(meta: Any) -> dict[str, Encodable]:
-    """Normalize user-defined ``request.scope["meta"]`` at the boundary.
+    """Normalize user-defined `request.scope["meta"]` at the boundary.
 
-    Trusted shape per the public contract (``mo.app_meta().request``); we
-    just enforce dict-ness at the seam. Non-``Encodable`` values inside will
+    Trusted shape per the public contract (`mo.app_meta().request`); we
+    just enforce dict-ness at the seam. Non-`Encodable` values inside will
     surface at IPC encode time rather than being silently coerced.
     """
     if meta is None or not isinstance(meta, dict):
@@ -218,6 +219,27 @@ class DebugCellCommand(Command):
 
     def __repr__(self) -> str:
         return f"DebugCellCommand(cell={self.cell_id})"
+
+
+class SetBreakpointsCommand(Command):
+    """Set the live debugger's breakpoints (session-scoped, not persisted).
+
+    Replaces the full breakpoint set: the frontend always sends the complete
+    map of cell id -> 1-based line numbers. Only meaningful when the
+    `debugger` experimental feature is enabled.
+
+    Attributes:
+        breakpoints: Map of cell id to lines that have a breakpoint.
+        request: HTTP request context if available.
+    """
+
+    breakpoints: dict[CellId_t, list[int]]
+    # incoming request, e.g. from Starlette or FastAPI
+    request: HTTPRequest | None = None
+
+    def __repr__(self) -> str:
+        count = sum(len(lines) for lines in self.breakpoints.values())
+        return f"SetBreakpointsCommand(count={count})"
 
 
 class ExecuteCellCommand(Command):
@@ -360,11 +382,16 @@ class ExecuteScratchpadCommand(Command):
         notebook_cells: Snapshot of notebook cells from the session document.
             Used to populate the document ContextVar so code_mode can read
             cell ordering, code, names, and configs.
+        cell_outputs: Snapshot of per-cell outputs (main + console) from the
+            session view. Populates a parallel ContextVar so code_mode can
+            expose `cell.output` and `cell.console_outputs`. Frozen at
+            scratchpad start — not refreshed when `ctx.run_cell` produces
+            new outputs in the same batch.
         run_id: Optional correlation ID. When set, the
-            ``CompletedRunNotification`` emitted at the end of this command
-            carries the same ``run_id`` so a caller holding a
-            ``ScratchCellListener`` can filter for *its* completion and
-            ignore ``CompletedRun`` events from unrelated commands on the
+            `CompletedRunNotification` emitted at the end of this command
+            carries the same `run_id` so a caller holding a
+            `ScratchCellListener` can filter for *its* completion and
+            ignore `CompletedRun` events from unrelated commands on the
             same session.
     """
 
@@ -373,6 +400,8 @@ class ExecuteScratchpadCommand(Command):
     request: HTTPRequest | None = None
     # Document snapshot — set by the execution endpoint from session.document.
     notebook_cells: tuple[NotebookCell, ...] | None = None
+    # Output snapshot — set by the execution endpoint from session.session_view.
+    cell_outputs: CellOutputs | None = None
     run_id: str | None = None
 
 
@@ -669,6 +698,8 @@ class PreviewSQLTableCommand(Command):
         database: Database containing the table.
         schema: Schema containing the table.
         table_name: Table to preview.
+        schema_path: Path of nested schemas (relative to `database`) for
+            catalogs with nested schemas. Empty for the top level.
     """
 
     request_id: RequestId
@@ -676,6 +707,7 @@ class PreviewSQLTableCommand(Command):
     database: str
     schema: str
     table_name: str
+    schema_path: list[str] = msgspec.field(default_factory=list)
 
 
 class ListSQLTablesCommand(Command):
@@ -689,12 +721,15 @@ class ListSQLTablesCommand(Command):
         engine: SQL engine ('postgresql', 'mysql', 'duckdb', etc.).
         database: Database to query.
         schema: Schema to list tables from.
+        schema_path: Path of nested schemas (relative to `database`) for
+            catalogs with nested schemas. Empty for the top level.
     """
 
     request_id: RequestId
     engine: str
     database: str
     schema: str
+    schema_path: list[str] = msgspec.field(default_factory=list)
 
 
 class ListSQLSchemasCommand(Command):
@@ -707,11 +742,14 @@ class ListSQLSchemasCommand(Command):
         request_id: Unique identifier for this request.
         engine: SQL engine ('postgresql', 'mysql', 'duckdb', etc.).
         database: Database to query.
+        schema_path: Parent schema path whose child schemas to list.
+            Empty lists the database's top-level schemas.
     """
 
     request_id: RequestId
     engine: str
     database: str
+    schema_path: list[str] = msgspec.field(default_factory=list)
 
 
 class ListDataSourceConnectionCommand(Command):
@@ -760,12 +798,14 @@ class StorageListEntriesCommand(Command):
         namespace: Variable name identifying the storage backend.
         limit: Max entries to return.
         prefix: Path prefix to list (None = root).
+        page_token: Token for the next page of entries.
     """
 
     request_id: RequestId
     namespace: str
     limit: int
     prefix: str | None = None
+    page_token: str | None = None
 
 
 class StorageDownloadCommand(Command):
@@ -907,6 +947,7 @@ CommandMessage = (
     | ExecuteScratchpadCommand
     | ExecuteStaleCellsCommand
     | DebugCellCommand
+    | SetBreakpointsCommand
     | DeleteCellCommand
     | SyncGraphCommand
     | UpdateCellConfigCommand
@@ -942,4 +983,15 @@ CommandMessage = (
 
 All commands that can be sent to the kernel.
 
+"""
+
+
+OutOfBandCommand = CodeCompletionCommand | SetBreakpointsCommand
+"""Commands processed off the main control loop.
+
+Unlike the rest of `CommandMessage` (which the kernel handles serially, and so
+cannot be delivered while a cell is executing), these are drained by a
+background worker and applied immediately. A command belongs here when it is
+fire-and-forget, cheap to apply, and useful mid-execution. Add a member to this
+union and a branch to `Kernel.dispatch_out_of_band` to introduce a new one.
 """
