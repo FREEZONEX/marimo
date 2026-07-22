@@ -777,8 +777,13 @@ def test_get_dataframe_csv() -> None:
     import polars as pl
 
     data = "https://cdn.jsdelivr.net/npm/vega-datasets@v1.29.0/data/stocks.csv"
-    chart = altair_chart(alt.Chart(data).mark_point().encode(x="values:Q"))
-    assert isinstance(chart.dataframe, (pd.DataFrame, pl.DataFrame))
+    fake_payload = b"symbol,price\nMSFT,39.81\nAAPL,28.13\n"
+    with unittest.mock.patch(
+        "urllib.request.urlopen",
+        return_value=io.BytesIO(fake_payload),
+    ):
+        chart = altair_chart(alt.Chart(data).mark_point().encode(x="values:Q"))
+        assert isinstance(chart.dataframe, (pd.DataFrame, pl.DataFrame))
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
@@ -790,8 +795,18 @@ def test_get_dataframe_json() -> None:
     data = (
         "https://cdn.jsdelivr.net/npm/vega-datasets@v1.29.0/data/barley.json"
     )
-    chart = altair_chart(alt.Chart(data).mark_point().encode(x="values:Q"))
-    assert isinstance(chart.dataframe, (pd.DataFrame, pl.DataFrame))
+    fake_payload = json.dumps(
+        [
+            {"yield": 27.0, "variety": "Manchuria", "site": "University Farm"},
+            {"yield": 48.9, "variety": "Manchuria", "site": "Waseca"},
+        ]
+    ).encode("utf-8")
+    with unittest.mock.patch(
+        "urllib.request.urlopen",
+        return_value=io.BytesIO(fake_payload),
+    ):
+        chart = altair_chart(alt.Chart(data).mark_point().encode(x="values:Q"))
+        assert isinstance(chart.dataframe, (pd.DataFrame, pl.DataFrame))
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
@@ -840,6 +855,61 @@ def test_parse_spec_polars() -> None:
     # Replace data.url with a placeholder
     spec["data"] = {"url": "_placeholder_", "format": spec["data"]["format"]}
     snapshot("parse_spec_polars.txt", json.dumps(spec, indent=2))
+
+
+@pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
+@pytest.mark.parametrize(
+    ("transformer", "expected_format"),
+    [
+        ("marimo_csv", "csv"),
+        ("marimo_json", "json"),
+        ("marimo_arrow", "arrow"),
+        ("marimo", "csv"),
+    ],
+)
+def test_parse_spec_respects_active_marimo_transformer(
+    transformer: str, expected_format: str
+) -> None:
+    import altair as alt
+    import pandas as pd
+
+    from marimo._plugins.ui._impl.charts.altair_transformer import (
+        register_transformers,
+    )
+
+    register_transformers()
+    previous = alt.data_transformers.active
+    try:
+        alt.data_transformers.enable(transformer)
+        data = pd.DataFrame({"values": [1, 2, 3]})
+        chart = alt.Chart(data).mark_point().encode(x="values:Q")
+        spec = _parse_spec(chart)
+        assert spec["data"]["format"]["type"] == expected_format
+    finally:
+        alt.data_transformers.enable(previous)
+
+
+@pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
+def test_parse_spec_defaults_to_arrow() -> None:
+    import altair as alt
+    import pandas as pd
+
+    from marimo._plugins.ui._impl.charts.altair_transformer import (
+        register_transformers,
+    )
+
+    register_transformers()
+    previous = alt.data_transformers.active
+    try:
+        # A non-marimo transformer should not be respected; we default to
+        # marimo_arrow so the frontend can render the chart.
+        alt.data_transformers.enable("default")
+        data = pd.DataFrame({"values": [1, 2, 3]})
+        chart = alt.Chart(data).mark_point().encode(x="values:Q")
+        spec = _parse_spec(chart)
+        assert spec["data"]["format"]["type"] == "arrow"
+    finally:
+        alt.data_transformers.enable(previous)
 
 
 @pytest.mark.skipif(

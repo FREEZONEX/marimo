@@ -61,8 +61,10 @@ class Notification(msgspec.Struct, tag_field="op"):
 class CellNotification(Notification, tag="cell-op"):
     """Updates a cell's state in the frontend.
 
-    Only fields that are set (not None) will update the cell state.
-    Omitting a field leaves that aspect unchanged.
+    This is a partial update: each field carries its own "unchanged" semantics,
+    documented per field below. Most fields treat None as "unchanged"; fields
+    that need to distinguish "unchanged" from "clear" use msgspec.UNSET for the
+    former and None for the latter.
 
     Attributes:
         cell_id: Unique identifier of the cell being updated.
@@ -71,7 +73,7 @@ class CellNotification(Notification, tag="cell-op"):
         status: Execution status (idle/running/stale/queued/disabled-transitively).
         stale_inputs: Whether cell has stale inputs from changed dependencies.
         run_id: Execution run ID for tracing. Auto-set from context.
-        serialization: Serialization status (TopLevelHints).
+        serialization: Top-level reusability hint. UNSET unchanged, None clears, str sets.
         timestamp: Creation timestamp, auto-set.
     """
 
@@ -82,7 +84,10 @@ class CellNotification(Notification, tag="cell-op"):
     status: RuntimeStateType | None = None
     stale_inputs: bool | None = None
     run_id: RunId_t | None = None
-    serialization: str | None = None
+    # Tri-state partial update: UNSET (omitted on the wire) leaves the cell's
+    # serialization hint unchanged; None explicitly clears it (cell is no
+    # longer a top-level definition); a string sets it.
+    serialization: str | None | msgspec.UnsetType = msgspec.UNSET
     timestamp: float = msgspec.field(default_factory=lambda: time.time())
 
     def __post_init__(self) -> None:
@@ -126,6 +131,11 @@ class FunctionCallResultNotification(Notification, tag="function-call-result"):
         function_call_id: ID matching the original request.
         return_value: Function return value as JSON.
         status: Human-readable success/failure status.
+        found: Whether the requested function was located in the registry.
+            False signals a transient registry desync, so the request is safe
+            to retry. True means no retry will help: a non-ok status then
+            reflects a failure unrelated to lookup, such as the function
+            raising during execution or not being associated with a cell.
     """
 
     name: ClassVar[str] = "function-call-result"
@@ -133,6 +143,7 @@ class FunctionCallResultNotification(Notification, tag="function-call-result"):
     function_call_id: RequestId
     return_value: JSONType
     status: HumanReadableStatus
+    found: bool
 
 
 class RemoveUIElementsNotification(Notification, tag="remove-ui-elements"):
@@ -165,20 +176,73 @@ class UIElementMessageNotification(
     buffers: list[bytes] | None = None
 
 
+class EsmSpec(msgspec.Struct):
+    """Where the frontend imports a widget's ESM from, and which version.
+
+    Specs travel only on kernel-authored notifications, never in model
+    state: state is client-writable and echoed to peers, so executing
+    code from it would let one client run code on another.
+
+    Attributes:
+        url: URL to import the ESM from. A virtual file for inline
+            source; an external URL when `_esm` is itself a URL.
+        hash: Hash of the `_esm` string. Keys the frontend module cache
+            and signals code changes (hot reload).
+    """
+
+    url: str
+    hash: str
+
+    @staticmethod
+    def from_esm(esm: str) -> EsmSpec:
+        """Mint a spec for an `_esm` trait value."""
+        # Imported lazily: this module is low-level messaging, and
+        # mo_data pulls in the runtime/output machinery.
+        import marimo._output.data.data as mo_data
+        from marimo._utils.code import hash_code
+
+        return EsmSpec(url=mo_data.js(esm).url, hash=hash_code(esm))
+
+
 class ModelOpen(msgspec.Struct, tag="open", tag_field="method"):
-    """Initial widget state on creation."""
+    """Initial widget state on creation.
+
+    For anywidgets, the widget's ESM does not travel in `state`: the
+    comm strips `_esm` and sends an `EsmSpec` instead. `None` for
+    models with no ESM (e.g. traditional ipywidgets).
+
+    Attributes:
+        state: Initial trait values, minus `_esm`.
+        buffer_paths: Paths into `state` whose binary values were
+            extracted into `buffers`.
+        buffers: Binary payloads, parallel to `buffer_paths`.
+        esm_spec: Where to import this widget's ESM from.
+    """
 
     state: dict[str, Any]
     buffer_paths: list[list[str | int]]
     buffers: list[bytes]
+    esm_spec: EsmSpec | None = None
 
 
 class ModelUpdate(msgspec.Struct, tag="update", tag_field="method"):
-    """State sync - changed traits only."""
+    """State sync - changed traits only.
+
+    Attributes:
+        state: Changed trait values, minus `_esm` (see `ModelOpen`).
+        buffer_paths: Paths into `state` whose binary values were
+            extracted into `buffers`.
+        buffers: Binary payloads, parallel to `buffer_paths`.
+        esm_spec: Present only when the widget's `_esm` changed on a
+            live model (hot reload, edit mode only). A spec whose
+            `hash` differs from the current one tells the frontend the
+            widget's code changed and views must be rebuilt.
+    """
 
     state: dict[str, Any]
     buffer_paths: list[list[str | int]]
     buffers: list[bytes]
+    esm_spec: EsmSpec | None = None
 
 
 class ModelCustom(msgspec.Struct, tag="custom", tag_field="method"):
@@ -242,8 +306,8 @@ class CompletedRunNotification(Notification, tag="completed-run"):
 
     Attributes:
         run_id: Correlation ID echoed from the command that triggered
-            this completion. ``None`` for handlers that don't take a
-            ``run_id`` (everything except ``handle_execute_scratchpad``
+            this completion. `None` for handlers that don't take a
+            `run_id` (everything except `handle_execute_scratchpad`
             today). Consumers that want to wait for a specific command's
             completion filter on this field.
     """
@@ -279,6 +343,51 @@ class KernelCapabilitiesNotification(msgspec.Struct):
         self.pyrefly = DependencyManager.pyrefly.has()
 
 
+class ConsumerCapabilities(msgspec.Struct, frozen=True):
+    """Per-consumer access capabilities for a session connection.
+
+    - editor: `{edit: True, interact: True}`
+    - interactor: `{edit: False, interact: True}` (default for a secondary
+      connection: drives UI state but cannot edit the notebook)
+    - read-only viewer: `{edit: False, interact: False}` (opt-in, set by a
+      deployment's capability provider)
+
+    The server enforces these: control requests are gated against the issuing
+    consumer's stored capabilities at the control-request chokepoint (the
+    authority) and mirrored as an advisory HTTP 403 at the request handlers.
+    Commands classified as `read` in `marimo._session.capabilities` (such as
+    completions and previews) are always permitted.
+    """
+
+    edit: bool
+    interact: bool
+
+    # Canonical role presets. Declared here and assigned below the class
+    # because each value is an instance of the class itself, which does not
+    # exist yet inside the body (cf. `datetime.min`/`datetime.max`).
+    EDITOR: ClassVar[ConsumerCapabilities]
+    INTERACTOR: ClassVar[ConsumerCapabilities]
+    VIEWER: ClassVar[ConsumerCapabilities]
+
+
+ConsumerCapabilities.EDITOR = ConsumerCapabilities(edit=True, interact=True)
+ConsumerCapabilities.INTERACTOR = ConsumerCapabilities(
+    edit=False, interact=True
+)
+ConsumerCapabilities.VIEWER = ConsumerCapabilities(edit=False, interact=False)
+
+
+class ConsumerCapabilitiesNotification(
+    Notification, tag="consumer-capabilities"
+):
+    """
+    Notification of the frontend consumer's capabilities.
+    """
+
+    name: ClassVar[str] = "consumer-capabilities"
+    consumer_capabilities: ConsumerCapabilities
+
+
 class KernelReadyNotification(Notification, tag="kernel-ready"):
     """Kernel ready for execution. First notification sent at startup.
 
@@ -311,6 +420,7 @@ class KernelReadyNotification(Notification, tag="kernel-ready"):
     app_config: _AppConfig
     kiosk: bool
     capabilities: KernelCapabilitiesNotification
+    consumer_capabilities: ConsumerCapabilities
     auto_instantiated: bool = False
 
 
@@ -512,10 +622,13 @@ class SQLDatabaseMetadata(msgspec.Struct):
     Attributes:
         connection: Connection identifier.
         database: Database name.
+        schema_path: Parent schema path the schemas belong under. Empty for
+            the database's top level.
     """
 
     connection: str
     database: str
+    schema_path: list[str] = msgspec.field(default_factory=list)
 
 
 class SQLMetadata(msgspec.Struct, tag="sql-metadata"):
@@ -525,11 +638,14 @@ class SQLMetadata(msgspec.Struct, tag="sql-metadata"):
         connection: Connection identifier.
         database: Database name.
         schema: Schema name.
+        schema_path: Path of nested schemas (relative to `database`). Empty
+            for the top level.
     """
 
     connection: str
     database: str
     schema: str
+    schema_path: list[str] = msgspec.field(default_factory=list)
 
 
 class SQLTablePreviewNotification(Notification, tag="sql-table-preview"):
@@ -655,6 +771,7 @@ class StorageEntriesNotification(Notification, tag="storage-entries"):
         namespace: Variable name of the storage backend.
         prefix: The prefix that was listed (set by list_entries).
         query: The search query that was used (set by search).
+        next_page_token: Token for fetching the next page of entries.
         error: Error message if the operation failed.
     """
 
@@ -664,6 +781,7 @@ class StorageEntriesNotification(Notification, tag="storage-entries"):
     namespace: str
     prefix: str | None = None
     query: str | None = None
+    next_page_token: str | None = None
     error: str | None = None
 
 
@@ -760,6 +878,23 @@ class FocusCellNotification(Notification, tag="focus-cell"):
 
     name: ClassVar[str] = "focus-cell"
     cell_id: CellId_t
+
+
+class ActiveLineNotification(Notification, tag="active-line"):
+    """Reports the line a cell's frame watcher is currently executing.
+
+    Emitted on a timed heartbeat while a cell runs (only when the line
+    changed), so the editor can highlight the live line. A `None` line
+    clears the highlight (e.g. when the cell finishes).
+
+    Attributes:
+        cell_id: Cell whose frame is being watched.
+        line: 1-based line within the cell, or `None` to clear.
+    """
+
+    name: ClassVar[str] = "active-line"
+    cell_id: CellId_t
+    line: int | None = None
 
 
 class SecretKeysResultNotification(Notification, tag="secret-keys-result"):
@@ -867,6 +1002,10 @@ NotificationMessage = (
     | CacheInfoNotification
     # Kiosk
     | FocusCellNotification
+    # Debugger
+    | ActiveLineNotification
     # Document
     | NotebookDocumentTransactionNotification
+    # Consumer
+    | ConsumerCapabilitiesNotification
 )

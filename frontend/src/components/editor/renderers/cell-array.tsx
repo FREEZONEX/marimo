@@ -24,7 +24,7 @@ import { maybeAddMarimoImport } from "@/core/cells/add-missing-import";
 import { SETUP_CELL_ID } from "@/core/cells/ids";
 import { LanguageAdapters } from "@/core/codemirror/language/LanguageAdapters";
 import { MARKDOWN_INITIAL_HIDE_CODE } from "@/core/codemirror/language/languages/markdown";
-import { aiEnabledAtom } from "@/core/config/config";
+import { aiEnabledAtom, aiFeaturesEnabledAtom } from "@/core/config/config";
 import { canInteractWithAppAtom } from "@/core/network/connection";
 import { useBoolean } from "@/hooks/useBoolean";
 import { cn } from "@/utils/cn";
@@ -89,22 +89,32 @@ const CellArrayInternal: React.FC<CellArrayProps> = ({
   const { theme } = useTheme();
   const { toggleSidebarPanel } = useChromeActions();
 
+  const isPresenting = mode === "present";
+
   // Side-effects
   useFocusFirstEditor();
 
   // HOTKEYS
-  useHotkey("global.focusTop", actions.focusTopCell);
-  useHotkey("global.focusBottom", actions.focusBottomCell);
+  // Cell-editing hotkeys are disabled while presenting
+  const whilePresenting = { disabled: isPresenting };
+  useHotkey("global.focusTop", actions.focusTopCell, whilePresenting);
+  useHotkey("global.focusBottom", actions.focusBottomCell, whilePresenting);
   useHotkey("global.toggleSidebar", toggleSidebarPanel);
-  useHotkey("global.foldCode", actions.foldAll);
-  useHotkey("global.unfoldCode", actions.unfoldAll);
-  useHotkey("global.formatAll", () => {
-    formatAll();
-  });
+  useHotkey("global.foldCode", actions.foldAll, whilePresenting);
+  useHotkey("global.unfoldCode", actions.unfoldAll, whilePresenting);
+  useHotkey(
+    "global.formatAll",
+    () => {
+      formatAll();
+    },
+    whilePresenting,
+  );
   // Catch all to avoid native OS behavior
-  // Otherwise a user might try to hide a cell and accidentally hide the OS window
-  useHotkey("cell.hideCode", Functions.NOOP);
-  useHotkey("cell.format", Functions.NOOP);
+  // Otherwise a user might try to hide a cell and accidentally hide the OS
+  // window. While presenting, no cell editing is possible, so let the
+  // keystrokes reach the browser/OS.
+  useHotkey("cell.hideCode", Functions.NOOP, whilePresenting);
+  useHotkey("cell.format", Functions.NOOP, whilePresenting);
 
   const cellIds = useCellIds();
   const scrollKey = useScrollKey();
@@ -121,10 +131,11 @@ const CellArrayInternal: React.FC<CellArrayProps> = ({
   return (
     <VerticalLayoutWrapper
       // 'pb' allows the user to put the cell in the middle of the screen
-      className="pb-[40vh]"
+      className={cn(!isPresenting && "pb-[40vh]")}
       invisible={false}
       appConfig={appConfig}
-      innerClassName="pr-4" // For the floating actions
+      // 'pr' makes room for the floating actions
+      innerClassName={cn(!isPresenting && "pr-4")}
     >
       <PackageAlert />
       <StartupLogsAlert />
@@ -186,6 +197,7 @@ const CellColumn: React.FC<{
 
   const hasOnlyOneCell = cellIds.hasOnlyOneId();
   const hasSetupCell = cellIds.inOrderIds.includes(SETUP_CELL_ID);
+  const isPresenting = mode === "present";
 
   return (
     <Column
@@ -195,8 +207,9 @@ const CellColumn: React.FC<{
       canMoveRight={index < columnsLength - 1}
       width={appConfig.width}
       canDelete={columnsLength > 1}
+      presenting={isPresenting}
       footer={
-        hideControls ? null : (
+        hideControls || isPresenting ? null : (
           <AddCellButtons
             columnId={columnId}
             className={cn(
@@ -261,6 +274,7 @@ const AddCellButtons: React.FC<{
   const { createNewCell } = useCellActions();
   const [isAiButtonOpen, isAiButtonOpenActions] = useBoolean(false);
   const aiEnabled = useAtomValue(aiEnabledAtom);
+  const aiFeaturesEnabled = useAtomValue(aiFeaturesEnabledAtom);
   const canInteractWithApp = useAtomValue(canInteractWithAppAtom);
   const { handleClick } = useOpenSettingsToTab();
 
@@ -270,7 +284,7 @@ const AddCellButtons: React.FC<{
   );
 
   const renderBody = () => {
-    if (isAiButtonOpen) {
+    if (aiEnabled && isAiButtonOpen) {
       return <AddCellWithAI onClose={isAiButtonOpenActions.toggle} />;
     }
 
@@ -328,30 +342,32 @@ const AddCellButtons: React.FC<{
           <DatabaseIcon className="mr-2 size-4 shrink-0" />
           SQL
         </Button>
-        <Tooltip
-          content={
-            aiEnabled ? null : (
-              <span>AI provider not found or Edit model not selected</span>
-            )
-          }
-          delayDuration={100}
-          asChild={false}
-        >
-          <Button
-            className={buttonClass}
-            variant="text"
-            size="sm"
-            disabled={!canInteractWithApp}
-            onClick={
-              aiEnabled
-                ? isAiButtonOpenActions.toggle
-                : () => handleClick("ai", "ai-providers")
+        {aiEnabled && (
+          <Tooltip
+            content={
+              aiFeaturesEnabled ? null : (
+                <span>AI provider not found or Edit model not selected</span>
+              )
             }
+            delayDuration={100}
+            asChild={false}
           >
-            <SparklesIcon className="mr-2 size-4 shrink-0" />
-            Generate with AI
-          </Button>
-        </Tooltip>
+            <Button
+              className={buttonClass}
+              variant="text"
+              size="sm"
+              disabled={!canInteractWithApp}
+              onClick={
+                aiFeaturesEnabled
+                  ? isAiButtonOpenActions.toggle
+                  : () => handleClick("ai", "ai-providers")
+              }
+            >
+              <SparklesIcon className="mr-2 size-4 shrink-0" />
+              Generate with AI
+            </Button>
+          </Tooltip>
+        )}
       </>
     );
   };

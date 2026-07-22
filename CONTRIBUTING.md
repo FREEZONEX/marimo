@@ -47,7 +47,7 @@ If an issue does not have one of these two labels, assume it is **not ready** fo
 ### Why is maintainer approval required?
 
 **Deliberate design.** marimo is an intentionally designed project. We
-put just as much thought into the features we exclude as the ones we include, 
+put just as much thought into the features we exclude as the ones we include,
 in order to provide our users with a simple, consistent, delightful, and
 powerful experience.
 
@@ -84,7 +84,7 @@ _Note: We recommend that Windows developers use [WSL](https://learn.microsoft.co
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python package manager)
 - [Node.js](https://nodejs.org/) 22+
-- [pnpm](https://pnpm.io/installation) 9+
+- [pnpm](https://pnpm.io/installation) 10+
 
 ### Getting started
 
@@ -294,7 +294,7 @@ For the frontend, you can choose to run slower hot reloading for an environment 
 
 <table>
   <tr>
-    <th>Production</th>
+    <th>Production-esque</th>
     <th>Development</th>
   </tr>
   <tr>

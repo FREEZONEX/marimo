@@ -12,6 +12,7 @@ import { MockRequestClient } from "@/__mocks__/requests";
 import { aiCompletionCellAtom } from "@/core/ai/state";
 import type { CellActions } from "@/core/cells/cells";
 import { notebookAtom } from "@/core/cells/cells";
+import { signatureHintField } from "@/core/codemirror/completion/signature-hint";
 import {
   configOverridesAtom,
   platformAtom,
@@ -1207,6 +1208,21 @@ describe("useCellNavigationProps", () => {
   });
 
   describe("AI completion functionality", () => {
+    beforeEach(() => {
+      const config = defaultUserConfig();
+      store.set(userConfigAtom, {
+        ...config,
+        ai: {
+          ...config.ai,
+          models: {
+            displayed_models: [],
+            custom_models: [],
+            edit_model: "openai/gpt-4o",
+          },
+        },
+      });
+    });
+
     it("should toggle AI completion when shortcut is pressed", () => {
       const { result } = renderWithProvider(() =>
         useCellNavigationProps(cellId1, optionsWithMockEditor),
@@ -1807,6 +1823,38 @@ describe("useCellEditorNavigationProps", () => {
       });
 
       expect(mockCloseCompletion).toHaveBeenCalledWith(mockEditorView.current);
+      expect(focusCell).not.toHaveBeenCalled();
+    });
+
+    it("should dismiss the signature hint when Escape is pressed without exiting to command mode", () => {
+      mockSimplifySelection.mockReturnValue(false);
+      mockCompletionStatus.mockReturnValue(null);
+
+      const dispatch = vi.fn();
+      const mockEditorView = {
+        current: {
+          state: {
+            selection: { main: { from: 9, to: 9, empty: true } },
+            field: vi.fn((field: unknown) =>
+              field === signatureHintField ? { pos: 9 } : false,
+            ),
+          },
+          dispatch,
+        } as unknown as EditorView,
+      };
+
+      const { result } = renderWithProvider(() =>
+        useCellEditorNavigationProps(mockCellId, mockEditorView),
+      );
+
+      const mockEvent = Mocks.keyboardEvent({ key: "Escape" });
+
+      act(() => {
+        result.current.onKeyDown?.(mockEvent);
+      });
+
+      // The hint is dismissed (dispatch called) but we stay in edit mode.
+      expect(dispatch).toHaveBeenCalled();
       expect(focusCell).not.toHaveBeenCalled();
     });
 

@@ -30,13 +30,11 @@ import {
   undoLabelAtom,
   useCellActions,
 } from "../../../core/cells/cells";
-import { ConfigButton } from "../../app-config/app-config-button";
 import { renderShortcut } from "../../shortcuts/renderShortcut";
 import { Tooltip } from "../../ui/tooltip";
 import { useShouldShowInterrupt } from "../cell/useShouldShowInterrupt";
 import { HideInKioskMode } from "../kiosk-mode";
 import { LayoutSelect } from "../renderers/layout-select";
-import { CommandPaletteButton } from "./command-palette-button";
 
 interface ControlsProps {
   presenting: boolean;

@@ -18,7 +18,6 @@ from marimo._server.api.endpoints.ws.ws_connection_validator import (
 )
 from marimo._server.codes import WebSocketCodes
 from marimo._server.session_manager import SessionManager
-from marimo._server.workspace import serialize_file_key
 from marimo._session.model import ConnectionState, SessionMode
 from marimo._utils.parse_dataclass import parse_raw
 from tests._server.api.endpoints.ws_helpers import (
@@ -105,18 +104,18 @@ def test_allows_multiple_connections_with_other_sessions(
                 )
 
 
-def test_fails_on_multiple_connections_with_other_sessions(
+def test_second_connection_with_other_session_joins_as_viewer(
     client: TestClient,
 ) -> None:
     with client.websocket_connect(WS_URL) as websocket:
         data = websocket.receive_json()
         assert_kernel_ready_response(data)
-        with pytest.raises(WebSocketDisconnect) as exc_info:  # noqa: PT012
-            with client.websocket_connect(OTHER_WS_URL) as other_websocket:
-                other_websocket.receive_json()
-                raise AssertionError()
-        assert exc_info.value.code == 1003
-        assert exc_info.value.reason == "MARIMO_ALREADY_CONNECTED"
+        # A second EDIT connection is not refused; auto-routes to a viewer.
+        with client.websocket_connect(OTHER_WS_URL) as other_websocket:
+            assert_kernel_ready_response(
+                other_websocket.receive_json(),
+                create_response({"kiosk": True, "resumed": True}),
+            )
 
 
 def test_allows_multiple_connections_with_same_file(
@@ -136,7 +135,7 @@ def test_allows_multiple_connections_with_same_file(
                 assert_parse_ready_response(data)
 
 
-def test_fails_on_multiple_connections_with_same_file(
+def test_second_connection_with_same_file_joins_as_viewer(
     client: TestClient,
     temp_marimo_file: str,
 ) -> None:
@@ -145,12 +144,15 @@ def test_fails_on_multiple_connections_with_same_file(
     with client.websocket_connect(ws_1) as websocket:
         data = websocket.receive_json()
         assert_parse_ready_response(data)
-        with pytest.raises(WebSocketDisconnect) as exc_info:  # noqa: PT012
-            with client.websocket_connect(ws_2) as other_websocket:
-                other_websocket.receive_json()
-                raise AssertionError()
-        assert exc_info.value.code == 1003
-        assert exc_info.value.reason == "MARIMO_ALREADY_CONNECTED"
+        # A second EDIT connection is not refused; auto-routes to a viewer.
+        with client.websocket_connect(ws_2) as other_websocket:
+            viewer = parse_raw(
+                other_websocket.receive_json()["data"],
+                KernelReadyNotification,
+            )
+            assert viewer.kiosk is True
+            assert viewer.resumed is True
+            assert viewer.consumer_capabilities.edit is False
 
 
 async def test_file_watcher_calls_reload(client: TestClient) -> None:
@@ -164,9 +166,8 @@ async def test_file_watcher_calls_reload(client: TestClient) -> None:
     with client.websocket_connect(WS_URL) as websocket:
         data = websocket.receive_json()
         assert_kernel_ready_response(data)
-        file_key = session_manager.workspace.get_unique_file_key()
-        assert file_key
-        filename = serialize_file_key(file_key)
+        filename = session_manager.workspace.get_unique_file_key()
+        assert filename
         with open(filename, "a") as f:  # noqa: ASYNC230
             f.write("\n# test")
             f.close()
@@ -315,7 +316,7 @@ async def test_connects_to_existing_session_with_same_file(
                 # Check in the same room
                 session_manager = get_session_manager(client)
                 assert len(session_manager.sessions) == 1
-                assert len(session_manager.sessions["123"].consumers) == 2
+                assert session_manager.sessions["123"].room.size == 2
 
                 data2 = websocket2.receive_json()
                 assert_parse_ready_response(data2)
@@ -357,6 +358,20 @@ def test_ws_requires_authentication(client: TestClient) -> None:
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with client.websocket_connect("/ws"):
             raise AssertionError("Should not be able to connect without auth")
+
+    assert exc_info.value.code == WebSocketCodes.UNAUTHORIZED
+    assert exc_info.value.reason == "MARIMO_UNAUTHORIZED"
+
+
+def test_ws_rejects_invalid_token(client: TestClient) -> None:
+    """An incorrect access_token must be rejected, not just a missing one."""
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            "/ws?session_id=123&access_token=wrong-token"
+        ):
+            raise AssertionError(
+                "Should not be able to connect with an invalid token"
+            )
 
     assert exc_info.value.code == WebSocketCodes.UNAUTHORIZED
     assert exc_info.value.reason == "MARIMO_UNAUTHORIZED"
@@ -467,44 +482,91 @@ async def test_ttl_close_does_not_kill_session_owned_by_new_consumer(
       2. Consumer A disconnects → TTL timer scheduled
       3. Consumer B connects with same session_id → takes over session
       4. TTL timer fires → must NOT close the session
+
+    The TTL close callback is captured rather than scheduled on a real timer,
+    then fired by hand only after Consumer B has provably taken over. This
+    exercises the live guard in `_close` deterministically, without racing a
+    wall-clock timer against Consumer B's connect. Firing inline is safe: when
+    a consumer has taken over, `_close` short-circuits at the guard with only
+    synchronous reads and never touches the event loop.
     """
     session_manager = get_session_manager(client)
     session_manager.mode = SessionMode.RUN
     session_manager.ttl_seconds = 120  # enable TTL (run mode default)
 
-    # Step 1: Consumer A connects
-    with client.websocket_connect(WS_URL) as ws_a:
-        data = ws_a.receive_json()
-        assert_kernel_ready_response(data)
+    captured: list[Callable[[], None]] = []
+    real_get_running_loop = asyncio.get_running_loop
 
-        session = session_manager.get_session("123")
-        assert session is not None
+    class _CaptureCloseLoop:
+        """Event-loop wrapper that diverts only the TTL close callback.
 
-        # Override session TTL to a very short value for the test
-        session.ttl_seconds = 0.3
+        `_on_disconnect` schedules the session close via `call_later`; capturing
+        that one callback lets the test fire it on demand. Every other loop
+        operation forwards to the real loop untouched.
+        """
 
-    # Consumer A has disconnected — _on_disconnect schedules _close() in 0.3s
-    # Step 2: Consumer B connects immediately (before TTL fires)
-    with client.websocket_connect(WS_URL) as ws_b:
-        data = ws_b.receive_json()
-        assert data["op"] == "reconnected", (
-            f"Expected reconnected, got {data.get('op')} — "
-            "session may have been closed before Consumer B connected"
-        )
+        def __init__(self, loop: Any) -> None:
+            self._loop = loop
 
-        # Step 3: Wait for Consumer A's TTL timer to fire
-        # (Unit test test_ttl_close_skips_when_session_has_active_consumer
-        # verifies the fix; integration timing may vary with TestClient)
-        await asyncio.sleep(0.4)
+        def call_later(
+            self, delay: float, callback: Callable[[], None], *args: Any
+        ) -> Any:
+            if "_on_disconnect" in getattr(callback, "__qualname__", ""):
+                captured.append(callback)
+                return MagicMock()
+            return self._loop.call_later(delay, callback, *args)
 
-        # Session must still be alive — Consumer B is actively connected
-        # (Without the fix, the old handler's TTL timer would have killed it)
-        session = session_manager.get_session("123")
-        assert session is not None, (
-            "Session was killed by old handler's TTL timer "
-            "despite having an active consumer"
-        )
-        assert session.connection_state() == ConnectionState.OPEN
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._loop, name)
+
+    # Step 1: Consumer A connects → session created. Entered manually (not via
+    # `with`) because the disconnect must happen under the patch below; the
+    # try/finally guarantees the session is closed exactly once even if an
+    # assertion fails before the deliberate disconnect.
+    ws_a = client.websocket_connect(WS_URL)
+    ws_a.__enter__()
+    a_disconnected = False
+    try:
+        assert_kernel_ready_response(ws_a.receive_json())
+        assert session_manager.get_session("123") is not None
+
+        # Step 2: Consumer A disconnects under the patch so its TTL close is
+        # captured instead of scheduled. The patch stays active until the
+        # server loop has processed the disconnect.
+        with patch(
+            "marimo._server.api.endpoints.ws_endpoint.asyncio.get_running_loop",
+            lambda: _CaptureCloseLoop(real_get_running_loop()),
+        ):
+            a_disconnected = True
+            ws_a.__exit__(None, None, None)
+            for _ in range(200):
+                if captured:
+                    break
+                await asyncio.sleep(0.01)
+        assert captured, "Consumer A disconnect did not schedule a TTL close"
+
+        # Step 3: Consumer B takes over the same session
+        with client.websocket_connect(WS_URL) as ws_b:
+            data = ws_b.receive_json()
+            assert data["op"] == "reconnected", (
+                f"Expected reconnected, got {data.get('op')}"
+            )
+
+            # Step 4: Fire Consumer A's stale TTL close now that Consumer B is
+            # the active consumer. The guard must see B's OPEN session and skip
+            # the close.
+            for ttl_close in captured:
+                ttl_close()
+
+            session = session_manager.get_session("123")
+            assert session is not None, (
+                "Session was killed by old handler's TTL timer "
+                "despite having an active consumer"
+            )
+            assert session.connection_state() == ConnectionState.OPEN
+    finally:
+        if not a_disconnected:
+            ws_a.__exit__(None, None, None)
 
 
 def test_ttl_close_skips_when_session_has_active_consumer() -> None:

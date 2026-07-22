@@ -40,11 +40,14 @@ class CompletionConfig(TypedDict):
     - `signature_hint_on_typing`: if `False`, signature hint won't be shown when typing
     - `copilot`: one of `"github"`, `"codeium"`, or `"custom"`
     - `codeium_api_key`: the Codeium API key
+    - `auto_close_pairs`: if `False`, typing an opening bracket, parenthesis,
+    or quote will not automatically insert the closing character
     """
 
     activate_on_typing: bool
     signature_hint_on_typing: bool
     copilot: bool | Literal["github", "codeium", "custom"]
+    auto_close_pairs: NotRequired[bool]
 
     # Codeium
     codeium_api_key: NotRequired[str | None]
@@ -245,11 +248,20 @@ class ServerConfig(TypedDict):
         inside its static assets directory.
     - `disable_file_downloads`: if true, the file download button will be
         hidden in the file explorer.
+    - `transport`: experimental. The transport used to stream kernel
+        messages to the frontend, typically set with the
+        `MARIMO_SERVER_TRANSPORT` environment variable. `"websocket"`
+        (default) uses the `/ws` WebSocket endpoint; `"sse"` uses
+        server-sent events over HTTP, for deployments behind proxies or
+        services that do not support WebSockets. Terminal, LSP, and
+        real-time collaboration still require WebSockets; RTC is disabled
+        when using `"sse"`.
     """
 
     browser: Literal["default"] | str
     follow_symlink: bool
     disable_file_downloads: NotRequired[bool]
+    transport: NotRequired[Literal["websocket", "sse"]]
 
 
 @dataclass
@@ -264,7 +276,7 @@ class PackageManagementConfig(TypedDict):
     manager: Literal["pip", "rye", "uv", "poetry", "pixi"]
 
 
-CopilotMode = Literal["ask", "manual", "agent"]
+CopilotMode = Literal["ask", "manual", "agent", "code_mode"]
 
 
 @mddoc
@@ -295,6 +307,7 @@ class AiConfig(TypedDict, total=False):
 
     **Keys.**
 
+    - `enabled`: if `False`, hide AI actions and panels in the marimo UI
     - `rules`: custom rules to include in all AI completion prompts
     - `max_tokens`: the maximum number of tokens to use in AI completions
     - `mode`: the mode to use for AI completions. Can be one of: `"ask"` or `"manual"`
@@ -314,6 +327,7 @@ class AiConfig(TypedDict, total=False):
     - `open_ai_compatible`: the OpenAI-compatible config (deprecated, use custom_providers)
     """
 
+    enabled: NotRequired[bool]
     rules: NotRequired[str]
     max_tokens: NotRequired[int]
     mode: NotRequired[CopilotMode]
@@ -512,14 +526,14 @@ class LintConfig(TypedDict, total=False):
     """Configuration for lint rule selection.
 
     Follows ruff-inspired semantics for selecting which rules to run
-    during ``marimo check``.
+    during `marimo check`.
 
     **Keys.**
 
-    - ``select``: list of rule code prefixes that replaces the default
-      enabled set. Use ``"ALL"`` to select all rules.
-      Example: ``["MB", "MR001"]``
-    - ``ignore``: list of rule code prefixes to remove from the
+    - `select`: list of rule code prefixes that replaces the default
+      enabled set. Use `"ALL"` to select all rules.
+      Example: `["MB", "MR001"]`
+    - `ignore`: list of rule code prefixes to remove from the
       enabled set.
     """
 
@@ -565,10 +579,12 @@ class SharingConfig(TypedDict):
 
     - `html`: if `False`, HTML sharing options will be hidden from the UI
     - `wasm`: if `False`, WebAssembly sharing options will be hidden from the UI
+    - `molab`: if `False`, molab sharing options will be hidden from the UI
     """
 
     html: NotRequired[bool]
     wasm: NotRequired[bool]
+    molab: NotRequired[bool]
 
 
 @dataclass
@@ -593,6 +609,8 @@ class ExperimentalConfig(TypedDict, total=False):
     wasm_layouts: bool  # Used in playground (community cloud)
     rtc_v2: bool
     isolate_apps: bool
+    debugger: bool  # Live frame-watching debugger (gutter breakpoints + pdb)
+    line_timing: bool  # Active-line highlight + per-line timer (sys.settrace)
 
     # Internal features
     cache: CacheConfig
@@ -701,6 +719,7 @@ DEFAULT_CONFIG: MarimoConfig = {
         "activate_on_typing": True,
         "signature_hint_on_typing": False,
         "copilot": False,
+        "auto_close_pairs": True,
     },
     "display": {
         "theme": "light",
@@ -754,6 +773,7 @@ DEFAULT_CONFIG: MarimoConfig = {
         }
     },
     "ai": {
+        "enabled": True,
         "models": {
             "displayed_models": [],
             "custom_models": [],
@@ -782,7 +802,8 @@ def merge_default_config(
 
 
 def merge_config(
-    config: MarimoConfig, new_config: PartialMarimoConfig | MarimoConfig
+    config: MarimoConfig,
+    new_config: PartialMarimoConfig | MarimoConfig,
 ) -> MarimoConfig:
     """Merge a user configuration with a new configuration. The new config
     will take precedence over the default config.

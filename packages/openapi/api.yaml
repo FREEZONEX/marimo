@@ -1,5 +1,28 @@
 components:
   schemas:
+    ActiveLineNotification:
+      description: "Reports the line a cell's frame watcher is currently executing.\n\
+        \n    Emitted on a timed heartbeat while a cell runs (only when the line\n\
+        \    changed), so the editor can highlight the live line. A `None` line\n\
+        \    clears the highlight (e.g. when the cell finishes).\n\n    Attributes:\n\
+        \        cell_id: Cell whose frame is being watched.\n        line: 1-based\
+        \ line within the cell, or `None` to clear."
+      properties:
+        cell_id:
+          $ref: '#/components/schemas/CellId'
+        line:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          default: null
+        op:
+          enum:
+          - active-line
+      required:
+      - op
+      - cell_id
+      title: ActiveLineNotification
+      type: object
     AddPackageRequest:
       description: 'This can be a remove package or a local package.
 
@@ -94,7 +117,8 @@ components:
       title: AiCompletionRequest
       type: object
     AiConfig:
-      description: "Configuration options for AI.\n\n    **Keys.**\n\n    - `rules`:\
+      description: "Configuration options for AI.\n\n    **Keys.**\n\n    - `enabled`:\
+        \ if `False`, hide AI actions and panels in the marimo UI\n    - `rules`:\
         \ custom rules to include in all AI completion prompts\n    - `max_tokens`:\
         \ the maximum number of tokens to use in AI completions\n    - `mode`: the\
         \ mode to use for AI completions. Can be one of: `\"ask\"` or `\"manual\"\
@@ -119,6 +143,8 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/OpenAiConfig'
           type: object
+        enabled:
+          type: boolean
         github:
           $ref: '#/components/schemas/GitHubConfig'
         google:
@@ -131,6 +157,7 @@ components:
           enum:
           - agent
           - ask
+          - code_mode
           - manual
         models:
           $ref: '#/components/schemas/AiModelConfig'
@@ -377,16 +404,18 @@ components:
       format: cell-id
       type: string
     CellNotification:
-      description: "Updates a cell's state in the frontend.\n\n    Only fields that\
-        \ are set (not None) will update the cell state.\n    Omitting a field leaves\
-        \ that aspect unchanged.\n\n    Attributes:\n        cell_id: Unique identifier\
-        \ of the cell being updated.\n        output: Cell's output. Use CellOutput.empty()\
-        \ to clear.\n        console: Console messages. Single/list appends, [] clears,\
-        \ None unchanged.\n        status: Execution status (idle/running/stale/queued/disabled-transitively).\n\
+      description: "Updates a cell's state in the frontend.\n\n    This is a partial\
+        \ update: each field carries its own \"unchanged\" semantics,\n    documented\
+        \ per field below. Most fields treat None as \"unchanged\"; fields\n    that\
+        \ need to distinguish \"unchanged\" from \"clear\" use msgspec.UNSET for the\n\
+        \    former and None for the latter.\n\n    Attributes:\n        cell_id:\
+        \ Unique identifier of the cell being updated.\n        output: Cell's output.\
+        \ Use CellOutput.empty() to clear.\n        console: Console messages. Single/list\
+        \ appends, [] clears, None unchanged.\n        status: Execution status (idle/running/stale/queued/disabled-transitively).\n\
         \        stale_inputs: Whether cell has stale inputs from changed dependencies.\n\
         \        run_id: Execution run ID for tracing. Auto-set from context.\n  \
-        \      serialization: Serialization status (TopLevelHints).\n        timestamp:\
-        \ Creation timestamp, auto-set."
+        \      serialization: Top-level reusability hint. UNSET unchanged, None clears,\
+        \ str sets.\n        timestamp: Creation timestamp, auto-set."
       properties:
         cell_id:
           $ref: '#/components/schemas/CellId'
@@ -415,7 +444,6 @@ components:
           anyOf:
           - type: string
           - type: 'null'
-          default: null
         stale_inputs:
           anyOf:
           - type: boolean
@@ -511,6 +539,28 @@ components:
       - data
       title: CellOutput
       type: object
+    CellOutputs:
+      description: "Per-cell output snapshot delivered alongside the document snapshot.\n\
+        \n    `output` carries the cell's last main (rich display) output;\n    `console_outputs`\
+        \ carries the buffered stdout/stderr stream from\n    its last execution.\
+        \  Both are keyed by cell id; missing keys mean\n    \"no output captured\"\
+        \ (the cell never ran, or produced nothing on\n    that channel)."
+      properties:
+        console_outputs:
+          additionalProperties:
+            items:
+              $ref: '#/components/schemas/CellOutput'
+            type: array
+          type: object
+        output:
+          additionalProperties:
+            $ref: '#/components/schemas/CellOutput'
+          type: object
+      required:
+      - output
+      - console_outputs
+      title: CellOutputs
+      type: object
     ChatAttachment:
       properties:
         content_type:
@@ -566,8 +616,6 @@ components:
 
         See pydantic_ai.ui.vercel_ai.request_types.UIMessage or Vercel AI SDK documentation.'
       properties:
-        context:
-          $ref: '#/components/schemas/AiCompletionContext'
         includeOtherCode:
           type: string
         model:
@@ -596,7 +644,6 @@ components:
           - type: 'null'
           default: null
       required:
-      - context
       - includeOtherCode
       - uiMessages
       title: ChatRequest
@@ -733,10 +780,10 @@ components:
     CompletedRunNotification:
       description: "Run of submitted cells and descendants completed.\n\n    Attributes:\n\
         \        run_id: Correlation ID echoed from the command that triggered\n \
-        \           this completion. ``None`` for handlers that don't take a\n   \
-        \         ``run_id`` (everything except ``handle_execute_scratchpad``\n  \
-        \          today). Consumers that want to wait for a specific command's\n\
-        \            completion filter on this field."
+        \           this completion. `None` for handlers that don't take a\n     \
+        \       `run_id` (everything except `handle_execute_scratchpad`\n        \
+        \    today). Consumers that want to wait for a specific command's\n      \
+        \      completion filter on this field."
       properties:
         op:
           enum:
@@ -757,7 +804,8 @@ components:
         \ the completion hotkey is entered\n    - `signature_hint_on_typing`: if `False`,\
         \ signature hint won't be shown when typing\n    - `copilot`: one of `\"github\"\
         `, `\"codeium\"`, or `\"custom\"`\n    - `codeium_api_key`: the Codeium API\
-        \ key"
+        \ key\n    - `auto_close_pairs`: if `False`, typing an opening bracket, parenthesis,\n\
+        \    or quote will not automatically insert the closing character"
       properties:
         activate_on_typing:
           type: boolean
@@ -765,6 +813,8 @@ components:
           anyOf:
           - type: string
           - type: 'null'
+        auto_close_pairs:
+          type: boolean
         base_url:
           anyOf:
           - type: string
@@ -830,6 +880,40 @@ components:
       - prefix_length
       - options
       title: CompletionResultNotification
+      type: object
+    ConsumerCapabilities:
+      description: "Per-consumer access capabilities for a session connection.\n\n\
+        \    - editor: `{edit: True, interact: True}`\n    - interactor: `{edit: False,\
+        \ interact: True}` (default for a secondary\n      connection: drives UI state\
+        \ but cannot edit the notebook)\n    - read-only viewer: `{edit: False, interact:\
+        \ False}` (opt-in, set by a\n      deployment's capability provider)\n\n \
+        \   The server enforces these: control requests are gated against the issuing\n\
+        \    consumer's stored capabilities at the control-request chokepoint (the\n\
+        \    authority) and mirrored as an advisory HTTP 403 at the request handlers.\n\
+        \    Commands classified as `read` in `marimo._session.capabilities` (such\
+        \ as\n    completions and previews) are always permitted."
+      properties:
+        edit:
+          type: boolean
+        interact:
+          type: boolean
+      required:
+      - edit
+      - interact
+      title: ConsumerCapabilities
+      type: object
+    ConsumerCapabilitiesNotification:
+      description: Notification of the frontend consumer's capabilities.
+      properties:
+        consumer_capabilities:
+          $ref: '#/components/schemas/ConsumerCapabilities'
+        op:
+          enum:
+          - consumer-capabilities
+      required:
+      - op
+      - consumer_capabilities
+      title: ConsumerCapabilitiesNotification
       type: object
     CopyNotebookRequest:
       properties:
@@ -1160,7 +1244,9 @@ components:
     Database:
       description: "Represents a collection of schemas.\n\nAttributes:\n    name (str):\
         \ The name of the database\n    dialect (str): The dialect of the database\n\
-        \    schemas (List[Schema]): List of schemas in the database\n    engine (Optional[VariableName]):\
+        \    schemas (List[Schema]): List of schemas in the database.\n    schemas_resolved\
+        \ (bool): True when `schemas` has been enumerated.\n        False when schema\
+        \ discovery was deferred. Defaults to True\n    engine (Optional[VariableName]):\
         \ Database engine or connection handler, if any."
       properties:
         dialect:
@@ -1176,6 +1262,9 @@ components:
           items:
             $ref: '#/components/schemas/Schema'
           type: array
+        schemas_resolved:
+          default: true
+          type: boolean
       required:
       - name
       - dialect
@@ -1424,6 +1513,25 @@ components:
       - theme
       title: DisplayConfig
       type: object
+    EsmSpec:
+      description: "Where the frontend imports a widget's ESM from, and which version.\n\
+        \n    Specs travel only on kernel-authored notifications, never in model\n\
+        \    state: state is client-writable and echoed to peers, so executing\n \
+        \   code from it would let one client run code on another.\n\n    Attributes:\n\
+        \        url: URL to import the ESM from. A virtual file for inline\n    \
+        \        source; an external URL when `_esm` is itself a URL.\n        hash:\
+        \ Hash of the `_esm` string. Keys the frontend module cache\n            and\
+        \ signals code changes (hot reload)."
+      properties:
+        hash:
+          type: string
+        url:
+          type: string
+      required:
+      - url
+      - hash
+      title: EsmSpec
+      type: object
     ExecuteCellCommand:
       description: "Execute a single cell.\n\n    Executes a cell with the provided\
         \ code. Dependent cells may be\n    re-executed based on the reactive execution\
@@ -1511,13 +1619,22 @@ components:
         \        request: HTTP request context if available.\n        notebook_cells:\
         \ Snapshot of notebook cells from the session document.\n            Used\
         \ to populate the document ContextVar so code_mode can read\n            cell\
-        \ ordering, code, names, and configs.\n        run_id: Optional correlation\
-        \ ID. When set, the\n            ``CompletedRunNotification`` emitted at the\
-        \ end of this command\n            carries the same ``run_id`` so a caller\
-        \ holding a\n            ``ScratchCellListener`` can filter for *its* completion\
-        \ and\n            ignore ``CompletedRun`` events from unrelated commands\
-        \ on the\n            same session."
+        \ ordering, code, names, and configs.\n        cell_outputs: Snapshot of per-cell\
+        \ outputs (main + console) from the\n            session view. Populates a\
+        \ parallel ContextVar so code_mode can\n            expose `cell.output` and\
+        \ `cell.console_outputs`. Frozen at\n            scratchpad start \u2014 not\
+        \ refreshed when `ctx.run_cell` produces\n            new outputs in the same\
+        \ batch.\n        run_id: Optional correlation ID. When set, the\n       \
+        \     `CompletedRunNotification` emitted at the end of this command\n    \
+        \        carries the same `run_id` so a caller holding a\n            `ScratchCellListener`\
+        \ can filter for *its* completion and\n            ignore `CompletedRun` events\
+        \ from unrelated commands on the\n            same session."
       properties:
+        cellOutputs:
+          anyOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CellOutputs'
+          default: null
         code:
           type: string
         notebookCells:
@@ -1547,6 +1664,11 @@ components:
       type: object
     ExecuteScratchpadRequest:
       properties:
+        cellOutputs:
+          anyOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CellOutputs'
+          default: null
         code:
           type: string
         notebookCells:
@@ -1692,9 +1814,9 @@ components:
     FileCreateMultipartRequest:
       description: "multipart/form-data body for POST /api/files/create.\n\n    Schema-only:\
         \ this struct exists to describe the multipart shape in\n    OpenAPI. At runtime,\
-        \ the endpoint reads the string fields from\n    ``MultipartRequest.body``\
-        \ and the uploaded bytes from\n    ``MultipartRequest.files[\"file\"]`` \u2014\
-        \ ``body.file`` is never populated."
+        \ the endpoint reads the string fields from\n    `MultipartRequest.body` and\
+        \ the uploaded bytes from\n    `MultipartRequest.files[\"file\"]` \u2014 `body.file`\
+        \ is never populated."
       properties:
         file:
           anyOf:
@@ -2036,8 +2158,15 @@ components:
       description: "Result of a frontend-initiated function call.\n\n    Attributes:\n\
         \        function_call_id: ID matching the original request.\n        return_value:\
         \ Function return value as JSON.\n        status: Human-readable success/failure\
-        \ status."
+        \ status.\n        found: Whether the requested function was located in the\
+        \ registry.\n            False signals a transient registry desync, so the\
+        \ request is safe\n            to retry. True means no retry will help: a\
+        \ non-ok status then\n            reflects a failure unrelated to lookup,\
+        \ such as the function\n            raising during execution or not being\
+        \ associated with a cell."
       properties:
+        found:
+          type: boolean
         function_call_id:
           $ref: '#/components/schemas/RequestId'
         op:
@@ -2051,6 +2180,7 @@ components:
       - function_call_id
       - return_value
       - status
+      - found
       title: FunctionCallResultNotification
       type: object
     GetCacheInfoCommand:
@@ -2437,6 +2567,8 @@ components:
           items:
             $ref: '#/components/schemas/CellConfig'
           type: array
+        consumer_capabilities:
+          $ref: '#/components/schemas/ConsumerCapabilities'
         kiosk:
           type: boolean
         last_executed_code:
@@ -2482,6 +2614,7 @@ components:
       - app_config
       - kiosk
       - capabilities
+      - consumer_capabilities
       title: KernelReadyNotification
       type: object
     KernelStartupErrorNotification:
@@ -2497,6 +2630,17 @@ components:
       - op
       - error
       title: KernelStartupErrorNotification
+      type: object
+    KernelStatusResponse:
+      properties:
+        state:
+          enum:
+          - idle
+          - running
+          - stopped
+      required:
+      - state
+      title: KernelStatusResponse
       type: object
     KeymapConfig:
       description: "Configuration for keymaps.\n\n    **Keys.**\n\n    - `preset`:\
@@ -2534,6 +2678,7 @@ components:
           - $ref: '#/components/schemas/ExecuteScratchpadCommand'
           - $ref: '#/components/schemas/ExecuteStaleCellsCommand'
           - $ref: '#/components/schemas/DebugCellCommand'
+          - $ref: '#/components/schemas/SetBreakpointsCommand'
           - $ref: '#/components/schemas/DeleteCellCommand'
           - $ref: '#/components/schemas/SyncGraphCommand'
           - $ref: '#/components/schemas/UpdateCellConfigCommand'
@@ -2579,6 +2724,7 @@ components:
               refresh-installed-modules: '#/components/schemas/RefreshInstalledModulesCommand'
               refresh-secrets: '#/components/schemas/RefreshSecretsCommand'
               rename-notebook: '#/components/schemas/RenameNotebookCommand'
+              set-breakpoints: '#/components/schemas/SetBreakpointsCommand'
               stop-kernel: '#/components/schemas/StopKernelCommand'
               storage-download: '#/components/schemas/StorageDownloadCommand'
               storage-list-entries: '#/components/schemas/StorageListEntriesCommand'
@@ -2668,9 +2814,12 @@ components:
           - $ref: '#/components/schemas/CacheClearedNotification'
           - $ref: '#/components/schemas/CacheInfoNotification'
           - $ref: '#/components/schemas/FocusCellNotification'
+          - $ref: '#/components/schemas/ActiveLineNotification'
           - $ref: '#/components/schemas/NotebookDocumentTransactionNotification'
+          - $ref: '#/components/schemas/ConsumerCapabilitiesNotification'
           discriminator:
             mapping:
+              active-line: '#/components/schemas/ActiveLineNotification'
               alert: '#/components/schemas/AlertNotification'
               banner: '#/components/schemas/BannerNotification'
               cache-cleared: '#/components/schemas/CacheClearedNotification'
@@ -2678,6 +2827,7 @@ components:
               cell-op: '#/components/schemas/CellNotification'
               completed-run: '#/components/schemas/CompletedRunNotification'
               completion-result: '#/components/schemas/CompletionResultNotification'
+              consumer-capabilities: '#/components/schemas/ConsumerCapabilitiesNotification'
               data-column-preview: '#/components/schemas/DataColumnPreviewNotification'
               data-source-connections: '#/components/schemas/DataSourceConnectionsNotification'
               datasets: '#/components/schemas/DatasetsNotification'
@@ -2746,11 +2896,11 @@ components:
       type: object
     LintConfig:
       description: "Configuration for lint rule selection.\n\n    Follows ruff-inspired\
-        \ semantics for selecting which rules to run\n    during ``marimo check``.\n\
-        \n    **Keys.**\n\n    - ``select``: list of rule code prefixes that replaces\
-        \ the default\n      enabled set. Use ``\"ALL\"`` to select all rules.\n \
-        \     Example: ``[\"MB\", \"MR001\"]``\n    - ``ignore``: list of rule code\
-        \ prefixes to remove from the\n      enabled set."
+        \ semantics for selecting which rules to run\n    during `marimo check`.\n\
+        \n    **Keys.**\n\n    - `select`: list of rule code prefixes that replaces\
+        \ the default\n      enabled set. Use `\"ALL\"` to select all rules.\n   \
+        \   Example: `[\"MB\", \"MR001\"]`\n    - `ignore`: list of rule code prefixes\
+        \ to remove from the\n      enabled set."
       properties:
         ignore:
           items:
@@ -2801,7 +2951,9 @@ components:
         \ schemas in a database. Used by the SQL editor for\n    schema selection.\n\
         \n    Attributes:\n        request_id: Unique identifier for this request.\n\
         \        engine: SQL engine ('postgresql', 'mysql', 'duckdb', etc.).\n   \
-        \     database: Database to query."
+        \     database: Database to query.\n        schema_path: Parent schema path\
+        \ whose child schemas to list.\n            Empty lists the database's top-level\
+        \ schemas."
       properties:
         database:
           type: string
@@ -2809,6 +2961,11 @@ components:
           type: string
         requestId:
           $ref: '#/components/schemas/RequestId'
+        schemaPath:
+          default: []
+          items:
+            type: string
+          type: array
         type:
           enum:
           - list-sql-schemas
@@ -2827,6 +2984,11 @@ components:
           type: string
         requestId:
           $ref: '#/components/schemas/RequestId'
+        schemaPath:
+          default: []
+          items:
+            type: string
+          type: array
       required:
       - requestId
       - engine
@@ -2839,7 +3001,8 @@ components:
         \n    Attributes:\n        request_id: Unique identifier for this request.\n\
         \        engine: SQL engine ('postgresql', 'mysql', 'duckdb', etc.).\n   \
         \     database: Database to query.\n        schema: Schema to list tables\
-        \ from."
+        \ from.\n        schema_path: Path of nested schemas (relative to `database`)\
+        \ for\n            catalogs with nested schemas. Empty for the top level."
       properties:
         database:
           type: string
@@ -2849,6 +3012,11 @@ components:
           $ref: '#/components/schemas/RequestId'
         schema:
           type: string
+        schemaPath:
+          default: []
+          items:
+            type: string
+          type: array
         type:
           enum:
           - list-sql-tables
@@ -2870,6 +3038,11 @@ components:
           $ref: '#/components/schemas/RequestId'
         schema:
           type: string
+        schemaPath:
+          default: []
+          items:
+            type: string
+          type: array
       required:
       - requestId
       - engine
@@ -3439,7 +3612,14 @@ components:
       title: ModelLifecycleNotification
       type: object
     ModelOpen:
-      description: Initial widget state on creation.
+      description: "Initial widget state on creation.\n\n    For anywidgets, the widget's\
+        \ ESM does not travel in `state`: the\n    comm strips `_esm` and sends an\
+        \ `EsmSpec` instead. `None` for\n    models with no ESM (e.g. traditional\
+        \ ipywidgets).\n\n    Attributes:\n        state: Initial trait values, minus\
+        \ `_esm`.\n        buffer_paths: Paths into `state` whose binary values were\n\
+        \            extracted into `buffers`.\n        buffers: Binary payloads,\
+        \ parallel to `buffer_paths`.\n        esm_spec: Where to import this widget's\
+        \ ESM from."
       properties:
         buffer_paths:
           items:
@@ -3453,6 +3633,11 @@ components:
           items:
             $ref: '#/components/schemas/Base64String'
           type: array
+        esm_spec:
+          anyOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/EsmSpec'
+          default: null
         method:
           enum:
           - open
@@ -3491,7 +3676,14 @@ components:
       title: ModelRequest
       type: object
     ModelUpdate:
-      description: State sync - changed traits only.
+      description: "State sync - changed traits only.\n\n    Attributes:\n       \
+        \ state: Changed trait values, minus `_esm` (see `ModelOpen`).\n        buffer_paths:\
+        \ Paths into `state` whose binary values were\n            extracted into\
+        \ `buffers`.\n        buffers: Binary payloads, parallel to `buffer_paths`.\n\
+        \        esm_spec: Present only when the widget's `_esm` changed on a\n  \
+        \          live model (hot reload, edit mode only). A spec whose\n       \
+        \     `hash` differs from the current one tells the frontend the\n       \
+        \     widget's code changed and views must be rebuilt."
       properties:
         buffer_paths:
           items:
@@ -3505,6 +3697,11 @@ components:
           items:
             $ref: '#/components/schemas/Base64String'
           type: array
+        esm_spec:
+          anyOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/EsmSpec'
+          default: null
         method:
           enum:
           - update
@@ -3582,7 +3779,9 @@ components:
       title: MultipleDefinitionError
       type: object
     NotebookCell:
-      description: "A single cell in the document. Mutable \u2014 owned by the document."
+      description: "A single cell in the document. Mutable \u2014 owned by the document.\n\
+        \n    `version` increments on each `SetCode` that actually changes\n    `code`.\
+        \ Other property changes don't bump it."
       properties:
         code:
           type: string
@@ -3592,6 +3791,9 @@ components:
           $ref: '#/components/schemas/CellId'
         name:
           type: string
+        version:
+          default: 0
+          type: integer
       required:
       - id
       - code
@@ -3826,7 +4028,9 @@ components:
         \ Attributes:\n        request_id: Unique identifier for this request.\n \
         \       engine: SQL engine ('postgresql', 'mysql', 'duckdb', etc.).\n    \
         \    database: Database containing the table.\n        schema: Schema containing\
-        \ the table.\n        table_name: Table to preview."
+        \ the table.\n        table_name: Table to preview.\n        schema_path:\
+        \ Path of nested schemas (relative to `database`) for\n            catalogs\
+        \ with nested schemas. Empty for the top level."
       properties:
         database:
           type: string
@@ -3836,6 +4040,11 @@ components:
           $ref: '#/components/schemas/RequestId'
         schema:
           type: string
+        schemaPath:
+          default: []
+          items:
+            type: string
+          type: array
         tableName:
           type: string
         type:
@@ -3860,6 +4069,11 @@ components:
           $ref: '#/components/schemas/RequestId'
         schema:
           type: string
+        schemaPath:
+          default: []
+          items:
+            type: string
+          type: array
         tableName:
           type: string
       required:
@@ -4092,8 +4306,8 @@ components:
       type: object
     ReorderCells:
       description: "Replace the full cell ordering.\n\n    Cell IDs present in the\
-        \ document but missing from ``cell_ids``\n    are appended at the end. IDs\
-        \ not in the document are ignored."
+        \ document but missing from `cell_ids`\n    are appended at the end. IDs not\
+        \ in the document are ignored."
       properties:
         cellIds:
           items:
@@ -4221,12 +4435,19 @@ components:
       type: object
     SQLDatabaseMetadata:
       description: "SQL database metadata.\n\n    Attributes:\n        connection:\
-        \ Connection identifier.\n        database: Database name."
+        \ Connection identifier.\n        database: Database name.\n        schema_path:\
+        \ Parent schema path the schemas belong under. Empty for\n            the\
+        \ database's top level."
       properties:
         connection:
           type: string
         database:
           type: string
+        schema_path:
+          default: []
+          items:
+            type: string
+          type: array
       required:
       - connection
       - database
@@ -4235,7 +4456,8 @@ components:
     SQLMetadata:
       description: "SQL database and schema metadata.\n\n    Attributes:\n       \
         \ connection: Connection identifier.\n        database: Database name.\n \
-        \       schema: Schema name."
+        \       schema: Schema name.\n        schema_path: Path of nested schemas\
+        \ (relative to `database`). Empty\n            for the top level."
       properties:
         connection:
           type: string
@@ -4243,6 +4465,11 @@ components:
           type: string
         schema:
           type: string
+        schema_path:
+          default: []
+          items:
+            type: string
+          type: array
         type:
           enum:
           - sql-metadata
@@ -4412,13 +4639,33 @@ components:
       title: SaveUserConfigurationRequest
       type: object
     Schema:
+      description: "Represents a database schema and its tables.\n\nA schema may itself\
+        \ contain nested child schemas, e.g. for catalogs with\nhierarchical namespaces\
+        \ such as Iceberg (`top.nested.deep`).\n\nAttributes:\n    name (str): The\
+        \ name of the schema.\n    tables (List[DataTable]): Tables in this schema.\n\
+        \    tables_resolved (bool): True when `tables` has been enumerated\n    \
+        \    False when table discovery was deferred. Defaults to True\n    child_schemas\
+        \ (List[Schema]): Nested child schemas (sub-namespaces).\n    child_schemas_resolved\
+        \ (bool): True when `child_schemas` has been\n        enumerated. False when\
+        \ discovery was deferred. Defaults to True"
       properties:
+        child_schemas:
+          default: []
+          items:
+            $ref: '#/components/schemas/Schema'
+          type: array
+        child_schemas_resolved:
+          default: true
+          type: boolean
         name:
           type: string
         tables:
           items:
             $ref: '#/components/schemas/DataTable'
           type: array
+        tables_resolved:
+          default: true
+          type: boolean
       required:
       - name
       - tables
@@ -4495,7 +4742,14 @@ components:
         \ Python's webbrowser module (eg, `\"firefox\"` or `\"chrome\"`)\n    - `follow_symlink`:\
         \ if true, the server will follow symlinks it finds\n        inside its static\
         \ assets directory.\n    - `disable_file_downloads`: if true, the file download\
-        \ button will be\n        hidden in the file explorer."
+        \ button will be\n        hidden in the file explorer.\n    - `transport`:\
+        \ experimental. The transport used to stream kernel\n        messages to the\
+        \ frontend, typically set with the\n        `MARIMO_SERVER_TRANSPORT` environment\
+        \ variable. `\"websocket\"`\n        (default) uses the `/ws` WebSocket endpoint;\
+        \ `\"sse\"` uses\n        server-sent events over HTTP, for deployments behind\
+        \ proxies or\n        services that do not support WebSockets. Terminal, LSP,\
+        \ and\n        real-time collaboration still require WebSockets; RTC is disabled\n\
+        \        when using `\"sse\"`."
       properties:
         browser:
           anyOf:
@@ -4506,6 +4760,10 @@ components:
           type: boolean
         follow_symlink:
           type: boolean
+        transport:
+          enum:
+          - sse
+          - websocket
       required:
       - browser
       - follow_symlink
@@ -4514,6 +4772,50 @@ components:
     SessionId:
       format: session-id
       type: string
+    SetBreakpointsCommand:
+      description: "Set the live debugger's breakpoints (session-scoped, not persisted).\n\
+        \n    Replaces the full breakpoint set: the frontend always sends the complete\n\
+        \    map of cell id -> 1-based line numbers. Only meaningful when the\n  \
+        \  `debugger` experimental feature is enabled.\n\n    Attributes:\n      \
+        \  breakpoints: Map of cell id to lines that have a breakpoint.\n        request:\
+        \ HTTP request context if available."
+      properties:
+        breakpoints:
+          additionalProperties:
+            items:
+              type: integer
+            type: array
+          type: object
+        request:
+          anyOf:
+          - $ref: '#/components/schemas/HTTPRequest'
+          - type: 'null'
+          default: null
+        type:
+          enum:
+          - set-breakpoints
+      required:
+      - type
+      - breakpoints
+      title: SetBreakpointsCommand
+      type: object
+    SetBreakpointsRequest:
+      properties:
+        breakpoints:
+          additionalProperties:
+            items:
+              type: integer
+            type: array
+          type: object
+        request:
+          anyOf:
+          - $ref: '#/components/schemas/HTTPRequest'
+          - type: 'null'
+          default: null
+      required:
+      - breakpoints
+      title: SetBreakpointsRequest
+      type: object
     SetCode:
       description: Replace a cell's source code.
       properties:
@@ -4597,9 +4899,12 @@ components:
       description: "Configuration for sharing features.\n\n    **Keys.**\n\n    -\
         \ `html`: if `False`, HTML sharing options will be hidden from the UI\n  \
         \  - `wasm`: if `False`, WebAssembly sharing options will be hidden from the\
-        \ UI"
+        \ UI\n    - `molab`: if `False`, molab sharing options will be hidden from\
+        \ the UI"
       properties:
         html:
+          type: boolean
+        molab:
           type: boolean
         wasm:
           type: boolean
@@ -4846,7 +5151,8 @@ components:
         \ entries returned by the operation.\n        namespace: Variable name of\
         \ the storage backend.\n        prefix: The prefix that was listed (set by\
         \ list_entries).\n        query: The search query that was used (set by search).\n\
-        \        error: Error message if the operation failed."
+        \        next_page_token: Token for fetching the next page of entries.\n \
+        \       error: Error message if the operation failed."
       properties:
         entries:
           items:
@@ -4859,6 +5165,11 @@ components:
           default: null
         namespace:
           type: string
+        next_page_token:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
         op:
           enum:
           - storage-entries
@@ -4923,12 +5234,18 @@ components:
         \ and virtual directories at one level.\n\n    Attributes:\n        request_id:\
         \ Unique identifier for this request.\n        namespace: Variable name identifying\
         \ the storage backend.\n        limit: Max entries to return.\n        prefix:\
-        \ Path prefix to list (None = root)."
+        \ Path prefix to list (None = root).\n        page_token: Token for the next\
+        \ page of entries."
       properties:
         limit:
           type: integer
         namespace:
           type: string
+        pageToken:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
         prefix:
           anyOf:
           - type: string
@@ -4952,6 +5269,11 @@ components:
           type: integer
         namespace:
           type: string
+        pageToken:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
         prefix:
           anyOf:
           - type: string
@@ -5080,6 +5402,7 @@ components:
             enum:
             - agent
             - ask
+            - code_mode
             - manual
           type: array
         name:
@@ -5101,8 +5424,8 @@ components:
       type: object
     Transaction:
       description: "An atomic batch of changes applied to a NotebookDocument.\n\n\
-        \    ``source`` identifies the writer (e.g. ``\"frontend\"``, ``\"kernel\"\
-        ``).\n    ``version`` is ``None`` when created and stamped by\n    ``NotebookDocument.apply()``."
+        \    `source` identifies the writer (e.g. `\"frontend\"`, `\"kernel\"`).\n\
+        \    `version` is `None` when created and stamped by\n    `NotebookDocument.apply()`."
       properties:
         changes:
           items:
@@ -6175,6 +6498,29 @@ paths:
               schema:
                 $ref: '#/components/schemas/FileDeleteResponse'
           description: Delete a file or directory
+  /api/files/download:
+    get:
+      parameters:
+      - description: Path of the file to download
+        in: query
+        name: path
+        required: true
+        schema:
+          type: string
+      responses:
+        200:
+          content:
+            application/octet-stream:
+              schema:
+                format: binary
+                type: string
+          description: Stream the file as an attachment
+        400:
+          description: Path is missing or is a directory
+        403:
+          description: File downloads are disabled
+        404:
+          description: File not found
   /api/files/file_details:
     post:
       requestBody:
@@ -6489,6 +6835,26 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
           description: Interrupt the kernel's execution
+  /api/kernel/pdb/breakpoints:
+    post:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetBreakpointsRequest'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+          description: Set the live debugger's breakpoints for the session.
   /api/kernel/pdb/pm:
     post:
       parameters:
@@ -6740,6 +7106,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
           description: Shutdown the kernel
+  /api/kernel/status:
+    get:
+      parameters:
+      - in: header
+        name: Marimo-Session-Id
+        required: true
+        schema:
+          type: string
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KernelStatusResponse'
+          description: Report whether the kernel is currently executing. `running`
+            means at least one cell is queued or running; `idle` means the kernel
+            is alive but not executing; `stopped` means the kernel process is not
+            running.
   /api/kernel/stdin:
     post:
       parameters:

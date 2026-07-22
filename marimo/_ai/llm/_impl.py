@@ -1,16 +1,14 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 import re
 from typing import TYPE_CHECKING, Any, cast
 
 from marimo import _loggers
-from marimo._ai._pydantic_ai_utils import generate_id
+from marimo._ai._pydantic_ai_utils import generate_id, sanitize_part
 from marimo._plugins.ui._impl.chat.chat import AI_SDK_VERSION, DONE_CHUNK
-from marimo._utils.dicts import remove_none_values
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Generator
@@ -747,18 +745,14 @@ class pydantic_ai(ChatModel):
             if not message.id:
                 LOGGER.warning("Message %s has no id", message)
 
+            # Prefer the raw wire payload when we have it so fields outside
+            # marimo's lossy dataclasses (`approval`, `providerExecuted`,
+            # `preliminary`, ...) survive the round-trip into pydantic-ai.
             parts: list[UIMessagePart] = []
             if message.parts:
                 parts = cast(
                     list[UIMessagePart],
-                    [
-                        self._remove_none_values(
-                            dataclasses.asdict(part)
-                            if dataclasses.is_dataclass(part)
-                            else part
-                        )
-                        for part in message.parts
-                    ],
+                    [sanitize_part(p) for p in message.raw_or_dumped_parts()],
                 )
             if not parts:
                 if message.content is not None:
@@ -784,11 +778,6 @@ class pydantic_ai(ChatModel):
             )
         return ui_messages
 
-    def _remove_none_values(self, obj: dict[str, Any]) -> dict[str, Any]:
-        if isinstance(obj, dict) and hasattr(obj, "items"):
-            return remove_none_values(obj)
-        return obj
-
     def _serialize_vercel_ai_chunk(
         self, chunk: BaseChunk
     ) -> dict[str, Any] | None:
@@ -807,21 +796,6 @@ class pydantic_ai(ChatModel):
                     result,
                 )
             return result  # type: ignore[no-any-return]
-        except TypeError:
-            # Fallback for pydantic-ai < 1.52.0 which doesn't have sdk_version param
-            try:
-                # by_alias=True: Use camelCase keys expected by Vercel AI SDK.
-                # exclude_none=True: Remove null values which cause validation errors.
-                serialized = chunk.model_dump(
-                    mode="json", by_alias=True, exclude_none=True
-                )
-            except Exception as e:
-                LOGGER.error("Error serializing vercel ai chunk: %s", e)
-                return None
-            else:
-                if serialized.get("type") == "done":
-                    return None
-                return serialized
         except Exception as e:
             LOGGER.error("Error serializing vercel ai chunk: %s", e)
             return None
@@ -849,7 +823,11 @@ class pydantic_ai(ChatModel):
             messages=ui_messages,
         )
 
-        adapter = VercelAIAdapter(agent=self.agent, run_input=run_input)
+        adapter = VercelAIAdapter(
+            agent=self.agent,
+            run_input=run_input,
+            sdk_version=AI_SDK_VERSION,
+        )
         event_stream = adapter.run_stream(model_settings=model_settings)
         async for event in event_stream:
             if serialized := self._serialize_vercel_ai_chunk(event):

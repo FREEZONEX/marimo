@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ipaddress
-import socket
 from typing import TYPE_CHECKING, Any
 
 from marimo import _loggers
@@ -12,7 +10,10 @@ from marimo._server.ai.mcp.config import is_mcp_config_empty
 from marimo._server.ai.tools.tool_manager import setup_tool_manager
 from marimo._server.api.deps import AppState, AppStateBase
 from marimo._server.api.interrupt import InterruptHandler
-from marimo._server.api.utils import open_url_in_browser
+from marimo._server.api.utils import (
+    format_url_host,
+    open_url_in_browser,
+)
 from marimo._server.lsp import any_lsp_server_running
 from marimo._server.print import (
     print_experimental_features,
@@ -25,7 +26,7 @@ from marimo._server.session_manager import SessionManager
 from marimo._server.tokens import AuthToken
 from marimo._server.utils import initialize_mimetypes
 from marimo._server.uvicorn_utils import close_uvicorn
-from marimo._server.workspace import NewFileKey
+from marimo._server.workspace import NEW_FILE
 from marimo._session.model import SessionMode
 from marimo._utils.asyncio_utils import cancel_and_wait, supervised_task
 from marimo._utils.subprocess import cancel_pending_reaps
@@ -174,7 +175,7 @@ async def logging(app: Starlette) -> AsyncIterator[None]:
             file_name=file.name if file else None,
             url=_startup_url(state),
             run=manager.mode == SessionMode.RUN,
-            new=isinstance(workspace.get_unique_file_key(), NewFileKey),
+            new=workspace.get_unique_file_key() == NEW_FILE,
             network=state.host == "0.0.0.0",
             startup_tip=state.startup_tip,
         )
@@ -217,7 +218,7 @@ async def signal_handler(app: Starlette) -> AsyncIterator[None]:
 async def server_registry(app: Starlette) -> AsyncIterator[None]:
     """Register this server in the local registry for discovery.
 
-    Only servers started **without** an auth token (``--no-token``)
+    Only servers started **without** an auth token (`--no-token`)
     are registered.  This ensures only servers that have explicitly
     opted into relaxed local access are discoverable.
     """
@@ -271,48 +272,10 @@ async def reap_subprocesses(app: Starlette) -> AsyncIterator[None]:
     await cancel_pending_reaps()
 
 
-def _pretty_host(host: str, port: int) -> str:
-    """Replace loopback addresses with 'localhost' for display.
-
-    Uses ipaddress for a reliable cross-platform loopback check (covers
-    127.0.0.1, ::1, and the full 127.0.0.0/8 range).  Falls back to
-    socket.getnameinfo only for non-IP hosts.  getnameinfo is skipped for
-    raw IP addresses because it can hang on Windows/CI for link-local IPv6.
-    """
-    try:
-        if ipaddress.ip_address(host).is_loopback:
-            return "localhost"
-    except ValueError:
-        # Not a valid IP literal — might be a hostname; try getnameinfo
-        try:
-            if (
-                socket.getnameinfo((host, port), socket.NI_NOFQDN)[0]
-                == "localhost"
-            ):
-                return "localhost"
-        except Exception:
-            pass
-    return host
-
-
 def _startup_url(state: AppStateBase) -> str:
-    host = state.host.strip(
-        "[]"
-    )  # normalize: remove brackets if user passed [addr]
+    url_host = format_url_host(state.host, state.port)
     port = state.port
 
-    # Strip IPv6 zone ID (e.g. fe80::1%eth0 -> fe80::1); zone IDs are
-    # interface-specific and not valid in URLs.
-    # Must happen before _pretty_host — zone IDs can cause getnameinfo
-    # to hang on Windows/CI.
-    host = host.split("%")[0]
-
-    # pretty printing: show "localhost" for loopback addresses
-    host = _pretty_host(host, port)
-
-    url_host_bare = host
-    # IPv6 addresses must be wrapped in brackets in URLs (RFC 3986)
-    url_host = f"[{url_host_bare}]" if ":" in url_host_bare else url_host_bare
     url = f"http://{url_host}:{port}{state.base_url}"
     if port == 80:
         url = f"http://{url_host}{state.base_url}"
@@ -325,18 +288,10 @@ def _startup_url(state: AppStateBase) -> str:
 
 
 def _mcp_startup_url(state: AppStateBase) -> str:
-    host = state.host.strip(
-        "[]"
-    )  # normalize: remove brackets if user passed [addr]
+    url_host = format_url_host(state.host, state.port)
     port = state.port
     base_url = state.base_url
 
-    # Strip zone ID, then pretty-print loopback (same logic as _startup_url)
-    host = host.split("%")[0]
-    host = _pretty_host(host, port)
-
-    url_host_bare = host
-    url_host = f"[{url_host_bare}]" if ":" in url_host_bare else url_host_bare
     # Construct MCP endpoint URL
     mcp_prefix = "/mcp"
     mcp_name = "server"

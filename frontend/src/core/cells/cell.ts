@@ -73,7 +73,11 @@ export function transitionCell(
   nextCell.output = message.output ?? nextCell.output;
   nextCell.staleInputs = message.stale_inputs ?? nextCell.staleInputs;
   nextCell.status = message.status ?? nextCell.status;
-  nextCell.serialization = message.serialization;
+  // Tri-state partial update: an omitted field (undefined) leaves the hint
+  // unchanged; null explicitly clears it; a string sets it.
+  if (message.serialization !== undefined) {
+    nextCell.serialization = message.serialization;
+  }
 
   let didInterruptFromThisMessage = false;
 
@@ -114,9 +118,11 @@ export function transitionCell(
   // Coalesce console outputs, which are streamed during execution.
   let consoleOutputs = cell.consoleOutputs;
 
-  // If interrupted on the incoming message,
-  // remove the debugger and resolve all stdin for previous console outputs
-  if (didInterruptFromThisMessage) {
+  // When the cell is interrupted or finishes (idle), there is no live
+  // stdin/pdb session, so resolve any dangling stdin prompt. This removes the
+  // debugger box — e.g. after quitting pdb with `q`, which stops the cell
+  // (idle) rather than interrupting it.
+  if (didInterruptFromThisMessage || message.status === "idle") {
     nextCell.debuggerActive = false;
     consoleOutputs = consoleOutputs.map((output) => {
       if (output.channel === "stdin") {

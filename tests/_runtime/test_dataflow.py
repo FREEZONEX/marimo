@@ -10,6 +10,9 @@ from marimo._ast import compiler
 from marimo._ast.visitor import Name, VariableData
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._runtime import dataflow
+from marimo._runtime.runner import by_refs
+from marimo._runtime.runner.by_refs import _get_ancestors
+from marimo._types.ids import CellId_t
 
 parse_cell = partial(compiler.compile_cell, cell_id="0")
 
@@ -578,6 +581,90 @@ class TestSQL:
         multiply_defined = graph.get_multiply_defined()
         assert multiply_defined == []
 
+    def test_qualified_sql_table_in_defining_cells(self):
+        graph = dataflow.DirectedGraph()
+        code = "t1 = 123"
+        first_cell = parse_cell(code)
+        graph.register_cell(CellId_t("0"), first_cell)
+
+        code = 'mo.sql("CREATE TABLE schema1.t1 (i INTEGER, j INTEGER)")'
+        second_cell = parse_cell(code)
+        graph.register_cell(CellId_t("1"), second_cell)
+
+        assert graph.get_defining_cells("t1") == {
+            CellId_t("0"),
+            CellId_t("1"),
+        }
+        assert graph.get_multiply_defined() == []
+
+    def test_redefine_sql_table_same_name_diff_schema(self):
+        graph = dataflow.DirectedGraph()
+        code = 'mo.sql("CREATE TABLE finance.datalake.xx (id INT)")'
+        first_cell = parse_cell(code)
+        graph.register_cell(CellId_t("0"), first_cell)
+
+        code = 'mo.sql("CREATE TABLE finance.information_layer.xx (id INT)")'
+        second_cell = parse_cell(code)
+        graph.register_cell(CellId_t("1"), second_cell)
+
+        assert graph.cells == {
+            "0": first_cell,
+            "1": second_cell,
+        }
+        assert graph.get_multiply_defined() == []
+
+    def test_redefine_sql_table_same_name_diff_catalog(self):
+        graph = dataflow.DirectedGraph()
+        code = 'mo.sql("CREATE TABLE catalog_one.schema_name.xx (id INT)")'
+        first_cell = parse_cell(code)
+        graph.register_cell(CellId_t("0"), first_cell)
+
+        code = 'mo.sql("CREATE TABLE catalog_two.schema_name.xx (id INT)")'
+        second_cell = parse_cell(code)
+        graph.register_cell(CellId_t("1"), second_cell)
+
+        assert graph.get_multiply_defined() == []
+
+    def test_redefine_sql_table_same_qualified_name(self):
+        graph = dataflow.DirectedGraph()
+        code = 'mo.sql("CREATE TABLE finance.datalake.xx (id INT)")'
+        first_cell = parse_cell(code)
+        graph.register_cell(CellId_t("0"), first_cell)
+
+        code = 'mo.sql("CREATE TABLE finance.datalake.xx (id INT)")'
+        second_cell = parse_cell(code)
+        graph.register_cell(CellId_t("1"), second_cell)
+
+        assert graph.get_multiply_defined() == ["xx"]
+
+    def test_redefine_sql_table_unqualified_same_name(self):
+        graph = dataflow.DirectedGraph()
+        code = 'mo.sql("CREATE TABLE xx (id INT)")'
+        first_cell = parse_cell(code)
+        graph.register_cell(CellId_t("0"), first_cell)
+
+        code = 'mo.sql("CREATE TABLE xx (id INT)")'
+        second_cell = parse_cell(code)
+        graph.register_cell(CellId_t("1"), second_cell)
+
+        assert graph.get_multiply_defined() == ["xx"]
+
+    def test_delete_redefined_sql_table_clears_conflict(self):
+        graph = dataflow.DirectedGraph()
+        code = 'mo.sql("CREATE TABLE finance.datalake.xx (id INT)")'
+        first_cell = parse_cell(code)
+        graph.register_cell(CellId_t("0"), first_cell)
+
+        code = 'mo.sql("CREATE TABLE finance.datalake.xx (id INT)")'
+        second_cell = parse_cell(code)
+        graph.register_cell(CellId_t("1"), second_cell)
+
+        assert graph.get_multiply_defined() == ["xx"]
+
+        graph.delete_cell(CellId_t("1"))
+
+        assert graph.get_multiply_defined() == []
+
     def test_sql_table_schema_to_python_ref(self):
         graph = dataflow.DirectedGraph()
         code = 'df = mo.sql("CREATE TABLE t1 (i INTEGER, j INTEGER)")'
@@ -944,7 +1031,7 @@ def test_is_disabled() -> None:
 
 
 def test_runner_sync() -> None:
-    """Test the Runner class for synchronous execution."""
+    """Synchronous Cell.run(**kwargs) path. Must work without an event loop."""
     graph = dataflow.DirectedGraph()
 
     # Create a chain of cells: 0 -> 1 -> 2
@@ -960,18 +1047,15 @@ def test_runner_sync() -> None:
     third_cell = compiler.compile_cell(code, cell_id="2")
     graph.register_cell("2", third_cell)
 
-    # Create a runner
-    runner = dataflow.Runner(graph)
-
     # Run the last cell
-    output, defs = runner.run_cell_sync("2", {})
+    output, defs = by_refs.run_cell_sync(graph, "2", {})
 
     # Check output and definitions
     assert output == 25  # 10 * 2 + 5
     assert defs == {"z": 25}
 
     # Run the last cell with substituted values
-    output, defs = runner.run_cell_sync("2", {"y": 50})
+    output, defs = by_refs.run_cell_sync(graph, "2", {"y": 50})
 
     # Check output and definitions with substituted value
     assert output == 55  # 50 + 5
@@ -979,14 +1063,14 @@ def test_runner_sync() -> None:
 
     # Try to run with an invalid argument
     try:
-        runner.run_cell_sync("2", {"invalid": 100})
+        by_refs.run_cell_sync(graph, "2", {"invalid": 100})
         raise AssertionError("Should have raised an exception")
     except ValueError:
         pass  # Expected
 
 
 def test_runner_ancestors() -> None:
-    """Test that the Runner correctly identifies ancestors based on refs."""
+    """Ancestor pruning based on substituted refs."""
     graph = dataflow.DirectedGraph()
 
     # Create cells with different refs/defs patterns
@@ -1002,19 +1086,16 @@ def test_runner_ancestors() -> None:
     third_cell = compiler.compile_cell(code, cell_id="2")
     graph.register_cell("2", third_cell)
 
-    # Create a runner
-    runner = dataflow.Runner(graph)
-
     # Get ancestors of the third cell
-    ancestors = runner._get_ancestors(graph.cells["2"], {})
+    ancestors = _get_ancestors(graph, graph.cells["2"], {})
     assert ancestors == {"0", "1"}
 
     # When substituting y, only cell 0 should be an ancestor
-    ancestors = runner._get_ancestors(graph.cells["2"], {"y": 30})
+    ancestors = _get_ancestors(graph, graph.cells["2"], {"y": 30})
     assert ancestors == {"0"}
 
     # When substituting both x and y, there should be no ancestors
-    ancestors = runner._get_ancestors(graph.cells["2"], {"x": 40, "y": 30})
+    ancestors = _get_ancestors(graph, graph.cells["2"], {"x": 40, "y": 30})
     assert ancestors == set()
 
 

@@ -15,8 +15,6 @@ from marimo._server.models.home import MarimoFile
 from marimo._server.workspace import (
     DirectoryWorkspace,
     FixedFilesWorkspace,
-    PathFileKey,
-    serialize_file_key,
 )
 from marimo._session.model import SessionMode
 from tests._server.mocks import get_session_manager, token_header, with_session
@@ -33,10 +31,10 @@ HEADERS = {
 
 @with_session(SESSION_ID)
 def test_workspace_files(client: TestClient) -> None:
-    current_file_key = get_session_manager(
+    current_filename = get_session_manager(
         client
     ).workspace.get_unique_file_key()
-    assert current_file_key
+    assert current_filename
 
     response = client.post(
         "/api/home/workspace_files",
@@ -46,7 +44,7 @@ def test_workspace_files(client: TestClient) -> None:
     body = response.json()
     files = body["files"]
     assert len(files) == 1
-    assert files[0]["path"] == serialize_file_key(current_file_key)
+    assert files[0]["path"] == current_filename
     # Check that new fields are present
     assert "hasMore" in body
     assert "fileCount" in body
@@ -67,10 +65,10 @@ def test_workspace_files_no_files(client: TestClient) -> None:
 
 @with_session(SESSION_ID)
 def test_running_notebooks(client: TestClient) -> None:
-    current_file_key = get_session_manager(
+    current_filename = get_session_manager(
         client
     ).workspace.get_unique_file_key()
-    assert current_file_key
+    assert current_filename
 
     response = client.post(
         "/api/home/running_notebooks",
@@ -79,7 +77,7 @@ def test_running_notebooks(client: TestClient) -> None:
     body = response.json()
     files = body["files"]
     assert len(files) == 1
-    assert files[0]["path"] == serialize_file_key(current_file_key)
+    assert files[0]["path"] == current_filename
 
 
 # TODO: Debug on Windows
@@ -126,8 +124,23 @@ def test_workspace_files_in_run_mode(client: TestClient) -> None:
     session_manager.mode = SessionMode.RUN
 
     with tempfile.TemporaryDirectory() as temp_dir:
+        marker = Path(temp_dir) / "marker.txt"
         marimo_file = Path(temp_dir) / "notebook.py"
-        marimo_file.write_text("import marimo\napp = marimo.App()")
+        marimo_file.write_text(
+            f"""# /// script
+# [tool.marimo.opengraph]
+# title = "Static Title"
+# generator = "generate_opengraph"
+# ///
+import marimo
+app = marimo.App()
+with app.setup:
+    open({str(marker)!r}, "w").write("executed")
+def generate_opengraph(context, parent):
+    return {{"title": "Dynamic Title"}}
+""",
+            encoding="utf-8",
+        )
 
         non_marimo_file = Path(temp_dir) / "text.txt"
         non_marimo_file.write_text("This is not a marimo file")
@@ -147,6 +160,8 @@ def test_workspace_files_in_run_mode(client: TestClient) -> None:
         assert len(files) == 1
         assert body["root"] == temp_dir
         assert files[0]["path"] == marimo_file.name
+        assert files[0]["opengraph"]["title"] == "Static Title"
+        assert not marker.exists()
 
 
 @with_session(SESSION_ID)
@@ -381,7 +396,7 @@ def test_tutorial_file_accessible_after_open(client: TestClient) -> None:
 
     # Try to get a file manager for the tutorial file
     # This should not raise an HTTPException about being outside the directory
-    file_manager = session_manager.app_manager(PathFileKey(tutorial_path))
+    file_manager = session_manager.app_manager(tutorial_path)
     assert file_manager is not None
     assert file_manager.path == tutorial_path
 

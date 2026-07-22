@@ -62,12 +62,36 @@ function safeJSONParse(message: string): unknown {
   }
 }
 
+/**
+ * A failed HTTP response. Carries the status code so callers can branch on it
+ * (e.g. treat a capability 403 as a benign viewer state). The response body is
+ * kept as `cause` so `prettyError` can surface its `detail`.
+ */
+export class HTTPError extends Error {
+  readonly status: number;
+
+  constructor(status: number, statusText: string, body?: unknown) {
+    super(statusText, { cause: body });
+    this.name = "HTTPError";
+    this.status = status;
+  }
+}
+
 export class CellNotInitializedError extends Error {
   constructor(
     message = "The cell containing this UI element has not been run yet. Please run the cell first.",
   ) {
     super(message);
     this.name = "CellNotInitializedError";
+  }
+}
+
+export class FunctionNotFoundError extends Error {
+  constructor(
+    message = "This UI element could not reach its function on the kernel. Try re-running the cell.",
+  ) {
+    super(message);
+    this.name = "FunctionNotFoundError";
   }
 }
 

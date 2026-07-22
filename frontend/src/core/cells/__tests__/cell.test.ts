@@ -1,9 +1,10 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 import { describe, expect, it } from "vitest";
-import type { OutputMessage } from "@/core/kernel/messages";
+import type { CellMessage, OutputMessage } from "@/core/kernel/messages";
 import type { RuntimeState } from "@/core/network/types";
 import type { Seconds } from "@/utils/time";
-import { outputIsLoading, outputIsStale } from "../cell";
+import { outputIsLoading, outputIsStale, transitionCell } from "../cell";
+import { createCellRuntimeState } from "../types";
 
 const STATUSES: RuntimeState[] = [
   "queued",
@@ -189,5 +190,70 @@ describe("outputIsStale", () => {
     };
     const edited = false;
     expect(outputIsStale(cell, edited)).toBe(false);
+  });
+});
+
+describe("transitionCell serialization", () => {
+  function cellMessage(serialization?: string | null): CellMessage {
+    return {
+      cell_id: "cell-1",
+      ...(serialization === undefined ? {} : { serialization }),
+    } as CellMessage;
+  }
+
+  it("leaves the hint unchanged when serialization is omitted", () => {
+    const cell = createCellRuntimeState({ serialization: "Valid" });
+    expect(transitionCell(cell, cellMessage()).serialization).toBe("Valid");
+  });
+
+  it("clears the hint when serialization is null", () => {
+    const cell = createCellRuntimeState({ serialization: "Valid" });
+    expect(transitionCell(cell, cellMessage(null)).serialization).toBeNull();
+  });
+
+  it("sets the hint when serialization is a string", () => {
+    const cell = createCellRuntimeState();
+    expect(transitionCell(cell, cellMessage("Valid")).serialization).toBe(
+      "Valid",
+    );
+  });
+});
+
+describe("transitionCell stdin resolution", () => {
+  function stdinOutput(): OutputMessage {
+    return {
+      channel: "stdin",
+      mimetype: "text/plain",
+      data: "(Pdb) ",
+      timestamp: Date.now() as Seconds,
+    } as OutputMessage;
+  }
+
+  it("resolves a dangling pdb prompt when the cell goes idle", () => {
+    // A paused-pdb cell shows an unanswered stdin prompt (the debugger box);
+    // once it finishes (e.g. after quitting with `q`), the box is removed.
+    const cell = createCellRuntimeState({
+      status: "running",
+      debuggerActive: true,
+      consoleOutputs: [stdinOutput()],
+    });
+    const next = transitionCell(cell, {
+      cell_id: "cell-1",
+      status: "idle",
+    } as CellMessage);
+    expect(next.debuggerActive).toBe(false);
+    expect(next.consoleOutputs[0].response).toBe("");
+  });
+
+  it("leaves an unanswered prompt interactive while still running", () => {
+    const cell = createCellRuntimeState({
+      status: "running",
+      consoleOutputs: [stdinOutput()],
+    });
+    const next = transitionCell(cell, {
+      cell_id: "cell-1",
+      status: null,
+    } as CellMessage);
+    expect(next.consoleOutputs[0].response).toBeUndefined();
   });
 });

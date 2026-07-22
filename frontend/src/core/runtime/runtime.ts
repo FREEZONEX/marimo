@@ -44,17 +44,22 @@ export class RuntimeManager {
     return this.httpURL.origin === window.location.origin;
   }
 
+  private get isServerless(): boolean {
+    return isWasm() || isIslands() || isStaticNotebook();
+  }
+
   /**
    * The base URL of the runtime.
    */
-  formatHttpURL(
-    path?: string,
-    searchParams?: URLSearchParams,
+  formatHttpURL({
+    path = "",
+    searchParams,
     restrictToKnownQueryParams = true,
-  ): URL {
-    if (!path) {
-      path = "";
-    }
+  }: {
+    path?: string;
+    searchParams?: URLSearchParams;
+    restrictToKnownQueryParams?: boolean;
+  }): URL {
     // URL may be something like "http://localhost:8000?auth=123"
     const baseUrl = this.httpURL;
     const currentParams = new URLSearchParams(window.location.search);
@@ -81,64 +86,98 @@ export class RuntimeManager {
     return baseUrl;
   }
 
-  formatWsURL(path: string, searchParams?: URLSearchParams): URL {
-    // We don't restrict to known query parameters, since mo.query_params()
-    // can accept arbitrary parameters.
-    const url = this.formatHttpURL(
-      path,
-      searchParams,
-      /* restrictToKnownQueryParams =*/ false,
-    );
-
-    // For cross-origin runtimes, pass the auth token as a query parameter.
-    // WebSocket connections cannot send custom headers (no Authorization
-    // header), and cross-origin cookies are blocked by browsers, so the
-    // access_token query param is the only way to authenticate.
+  /**
+   * Channels that cannot send custom headers (WebSockets, and browser
+   * navigations such as file downloads) carry the auth token as a query
+   * param instead, but only when cross-origin. Same-origin requests
+   * authenticate via the session cookie, which keeps the token out of
+   * browser history and logs; cross-origin cookies are blocked by browsers,
+   * so the access_token query param is the only option there.
+   */
+  private appendCrossOriginAuth(url: URL): URL {
     if (!this.isSameOrigin && this.config.authToken) {
       url.searchParams.set(KnownQueryParams.accessToken, this.config.authToken);
     }
+    return url;
+  }
 
-    return asWsUrl(url.toString());
+  /**
+   * An HTTP URL for requests made by browser navigation (e.g. anchor-click
+   * downloads), which cannot attach auth headers.
+   */
+  formatNavigableHttpURL(path: string, searchParams?: URLSearchParams): URL {
+    const url = this.formatHttpURL({ path, searchParams });
+    // Drop any token inherited from the current page's query params; re-add it
+    // only when cross-origin. Same-origin downloads authenticate via the
+    // session cookie, so a token in the URL would needlessly leak into
+    // proxy/server logs.
+    url.searchParams.delete(KnownQueryParams.accessToken);
+    return this.appendCrossOriginAuth(url);
+  }
+
+  formatWsURL(path: string, searchParams?: URLSearchParams): URL {
+    // We don't restrict to known query parameters, since mo.query_params()
+    // can accept arbitrary parameters.
+    const url = this.formatHttpURL({
+      path,
+      searchParams,
+      restrictToKnownQueryParams: false,
+    });
+    return asWsUrl(this.appendCrossOriginAuth(url).toString());
+  }
+
+  /**
+   * Search params for a session connection: the base URL's params, merged
+   * with the current page's, plus the session id.
+   */
+  private getSessionSearchParams(sessionId: SessionId): URLSearchParams {
+    const baseUrl = new URL(this.config.url);
+    const searchParams = new URLSearchParams(baseUrl.search);
+
+    // Merge in current page's query parameters
+    const currentParams = new URLSearchParams(window.location.search);
+    currentParams.forEach((value, key) => {
+      // Don't override base URL params
+      if (!searchParams.has(key)) {
+        searchParams.set(key, value);
+      }
+    });
+
+    searchParams.set(KnownQueryParams.sessionId, sessionId);
+    return searchParams;
   }
 
   /**
    * The WebSocket URL of the runtime.
    */
   getWsURL(sessionId: SessionId): URL {
-    const baseUrl = new URL(this.config.url);
-    const searchParams = new URLSearchParams(baseUrl.search);
+    return this.formatWsURL("/ws", this.getSessionSearchParams(sessionId));
+  }
 
-    // Merge in current page's query parameters
-    const currentParams = new URLSearchParams(window.location.search);
-    currentParams.forEach((value, key) => {
-      // Don't override base URL params
-      if (!searchParams.has(key)) {
-        searchParams.set(key, value);
-      }
+  /**
+   * The SSE URL of the runtime; the http(s) alternative to `getWsURL`
+   * when `server.transport` is `"sse"`. Unlike WebSockets, SSE requests
+   * can send headers, so auth travels in the Authorization header
+   * (see `headers()`) instead of the URL.
+   */
+  getSseURL(sessionId: SessionId): URL {
+    const url = this.formatHttpURL({
+      path: "/sse",
+      searchParams: this.getSessionSearchParams(sessionId),
+      restrictToKnownQueryParams: false,
     });
-
-    searchParams.set(KnownQueryParams.sessionId, sessionId);
-    return this.formatWsURL("/ws", searchParams);
+    // The page URL can still carry access_token (merged in from the
+    // current page's params, before auth cleanup strips it); never
+    // forward it — a token in the URL leaks into proxy/server logs.
+    url.searchParams.delete(KnownQueryParams.accessToken);
+    return url;
   }
 
   /**
    * The WebSocket Sync URL of the runtime, for real-time updates.
    */
   getWsSyncURL(sessionId: SessionId): URL {
-    const baseUrl = new URL(this.config.url);
-    const searchParams = new URLSearchParams(baseUrl.search);
-
-    // Merge in current page's query parameters
-    const currentParams = new URLSearchParams(window.location.search);
-    currentParams.forEach((value, key) => {
-      // Don't override base URL params
-      if (!searchParams.has(key)) {
-        searchParams.set(key, value);
-      }
-    });
-
-    searchParams.set(KnownQueryParams.sessionId, sessionId);
-    return this.formatWsURL("/ws_sync", searchParams);
+    return this.formatWsURL("/ws_sync", this.getSessionSearchParams(sessionId));
   }
 
   /**
@@ -168,45 +207,63 @@ export class RuntimeManager {
   }
 
   getAiURL(path: "completion" | "chat"): URL {
-    return this.formatHttpURL(`/api/ai/${path}`);
+    return this.formatHttpURL({ path: `/api/ai/${path}` });
   }
 
   /**
    * The URL of the health check endpoint.
    */
   healthURL(): URL {
-    return this.formatHttpURL("/health");
+    return this.formatHttpURL({ path: "/health" });
   }
 
-  async isHealthy(): Promise<boolean> {
-    // Always healthy if WASM, Islands, or a static notebook (no server)
-    if (isWasm() || isIslands() || isStaticNotebook()) {
-      return true;
-    }
-
+  private async fetchHealth(): Promise<Response | null> {
     try {
-      const response = await fetch(this.healthURL().toString());
-      // If there is a redirect, update the URL in the config
-      if (response.redirected) {
-        Logger.debug(`Runtime redirected to ${response.url}`);
-        // strip /health from the URL, using URL parsing to handle query params
-        const redirected = new URL(response.url);
-        redirected.pathname = redirected.pathname.replace(/\/health$/, "");
-        this.config.url = redirected.toString();
-      }
-
-      const success = response.ok;
-      if (success) {
-        this.setDOMBaseUri(this.config.url);
-      }
-      return success;
+      return await fetch(this.healthURL().toString());
     } catch (error) {
       Logger.error(
         `Failed to check health: ${error instanceof Error ? error.message : "Unknown error"}`,
         { cause: error },
       );
+      return null;
+    }
+  }
+
+  async reconcileFromHealth(): Promise<boolean> {
+    // Always healthy if WASM, Islands, or a static notebook (no server)
+    if (this.isServerless) {
+      return true;
+    }
+
+    const response = await this.fetchHealth();
+
+    if (!response) {
       return false;
     }
+
+    if (response.redirected) {
+      Logger.debug(`Runtime redirected to ${response.url}`);
+      // strip /health from the URL, using URL parsing to handle query params
+      const redirected = new URL(response.url);
+      redirected.pathname = redirected.pathname.replace(/\/health$/, "");
+      this.config.url = redirected.toString();
+    }
+
+    if (response.ok) {
+      this.setDOMBaseUri(this.config.url);
+    }
+
+    return response.ok;
+  }
+
+  async probeHealth(): Promise<boolean> {
+    // Always healthy if WASM, Islands, or a static notebook (no server)
+    if (this.isServerless) {
+      return true;
+    }
+
+    const response = await this.fetchHealth();
+    return response?.ok ?? false;
   }
 
   /**
@@ -251,7 +308,7 @@ export class RuntimeManager {
     const growthFactor = 1.2;
     const maxDelay = 2000;
 
-    while (!(await this.isHealthy())) {
+    while (!(await this.reconcileFromHealth())) {
       if (retries >= maxRetries) {
         Logger.error(`Failed to connect after ${maxRetries} retries`);
         this.initialHealthyCheck.reject(

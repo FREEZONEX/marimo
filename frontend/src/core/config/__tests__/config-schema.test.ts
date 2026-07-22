@@ -4,6 +4,7 @@ import { createStore } from "jotai";
 import { expect, test } from "vitest";
 import {
   configOverridesAtom,
+  connectionTransportTypeAtom,
   resolvedMarimoConfigAtom,
   userConfigAtom,
 } from "../config";
@@ -46,6 +47,7 @@ test("default UserConfig - empty", () => {
     {
       "ai": {
         "custom_providers": {},
+        "enabled": true,
         "inline_tooltip": false,
         "mode": "manual",
         "models": {
@@ -56,6 +58,7 @@ test("default UserConfig - empty", () => {
       },
       "completion": {
         "activate_on_typing": true,
+        "auto_close_pairs": true,
         "copilot": false,
         "signature_hint_on_typing": false,
       },
@@ -117,6 +120,7 @@ test("default UserConfig - one level", () => {
     {
       "ai": {
         "custom_providers": {},
+        "enabled": true,
         "inline_tooltip": false,
         "mode": "manual",
         "models": {
@@ -127,6 +131,7 @@ test("default UserConfig - one level", () => {
       },
       "completion": {
         "activate_on_typing": true,
+        "auto_close_pairs": true,
         "copilot": false,
         "signature_hint_on_typing": false,
       },
@@ -291,4 +296,20 @@ test("resolvedMarimoConfigAtom overrides correctly and does not mutate the origi
     },
     formatting: { line_length: 79 },
   });
+});
+
+test("connectionTransportTypeAtom defaults to websocket", () => {
+  const store = createStore();
+  store.set(userConfigAtom, defaultUserConfig());
+  expect(store.get(connectionTransportTypeAtom)).toBe("websocket");
+});
+
+test("connectionTransportTypeAtom reads server.transport", () => {
+  const store = createStore();
+  const config = defaultUserConfig();
+  store.set(userConfigAtom, {
+    ...config,
+    server: { ...config.server, transport: "sse" },
+  });
+  expect(store.get(connectionTransportTypeAtom)).toBe("sse");
 });

@@ -4,50 +4,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Logger } from "@/utils/Logger";
 import { WebSocketClosedReason, WebSocketState } from "../types";
 import { classifyCloseEvent } from "../useMarimoKernelConnection";
-import { MAX_RETRIES } from "../useWebSocket";
 
-function classify(
-  reason: string | undefined,
-  retryCount = 0,
-  maxRetries = MAX_RETRIES,
-) {
-  return classifyCloseEvent({ reason }, { retryCount, maxRetries });
+function classify(reason: string | undefined) {
+  return classifyCloseEvent({ reason });
 }
 
 describe("classifyCloseEvent", () => {
   describe("transient closes (default branch)", () => {
-    it("retries when retryCount < maxRetries", () => {
-      const decision = classify(undefined, 0);
+    it("retries on empty/undefined reason", () => {
+      const decision = classify(undefined);
       expect(decision.kind).toBe("retry");
       expect(decision.status).toEqual({ state: WebSocketState.CONNECTING });
     });
 
-    it("retries on each intermediate close event during a retry storm", () => {
-      for (let n = 0; n < MAX_RETRIES; n++) {
-        const decision = classify(undefined, n);
-        expect(decision.kind).toBe("retry");
-        expect(decision.status).toEqual({ state: WebSocketState.CONNECTING });
-      }
-    });
-
-    it("transitions to CLOSED when retryCount reaches maxRetries", () => {
-      const decision = classify(undefined, MAX_RETRIES);
-      expect(decision.kind).toBe("gave-up");
-      expect(decision.status).toEqual({
-        state: WebSocketState.CLOSED,
-        code: WebSocketClosedReason.KERNEL_DISCONNECTED,
-        reason: "kernel not found",
-      });
-    });
-
-    it("transitions to CLOSED when retryCount exceeds maxRetries", () => {
-      const decision = classify(undefined, MAX_RETRIES + 5);
-      expect(decision.kind).toBe("gave-up");
-    });
-
     it("treats unknown reason strings as transient and logs a warning", () => {
       const logger = vi.spyOn(Logger, "warn").mockImplementation(() => {});
-      const decision = classify("something-else", 3);
+      const decision = classify("something-else");
       expect(decision.kind).toBe("retry");
       expect(logger).toHaveBeenCalled();
       logger.mockRestore();
@@ -59,27 +31,17 @@ describe("classifyCloseEvent", () => {
   });
 
   describe("terminal closes (server-initiated)", () => {
-    it("MARIMO_ALREADY_CONNECTED → terminal + closeTransport, with takeover", () => {
-      const decision = classify("MARIMO_ALREADY_CONNECTED", 0);
-      expect(decision.kind).toBe("terminal");
-      expect(decision.status).toMatchObject({
-        state: WebSocketState.CLOSED,
-        code: WebSocketClosedReason.ALREADY_RUNNING,
-        canTakeover: true,
-      });
-      if (decision.kind === "terminal") {
-        expect(decision.closeTransport).toBe(true);
-      }
-    });
-
     it.each([
-      "MARIMO_WRONG_KERNEL_ID",
       "MARIMO_NO_FILE_KEY",
       "MARIMO_NO_SESSION_ID",
       "MARIMO_NO_SESSION",
       "MARIMO_SHUTDOWN",
+      // Delivered as in-band close events by the SSE transport; must be
+      // terminal or a rejected client would reconnect forever.
+      "MARIMO_UNAUTHORIZED",
+      "MARIMO_KIOSK_NOT_ALLOWED",
     ])("%s → terminal with KERNEL_DISCONNECTED, closes transport", (reason) => {
-      const decision = classify(reason, 0);
+      const decision = classify(reason);
       expect(decision.kind).toBe("terminal");
       expect(decision.status).toMatchObject({
         state: WebSocketState.CLOSED,
@@ -90,20 +52,8 @@ describe("classifyCloseEvent", () => {
       }
     });
 
-    it("MARIMO_MALFORMED_QUERY → terminal but does NOT close transport", () => {
-      const decision = classify("MARIMO_MALFORMED_QUERY", 0);
-      expect(decision.kind).toBe("terminal");
-      expect(decision.status).toMatchObject({
-        state: WebSocketState.CLOSED,
-        code: WebSocketClosedReason.MALFORMED_QUERY,
-      });
-      if (decision.kind === "terminal") {
-        expect(decision.closeTransport).toBe(false);
-      }
-    });
-
     it("MARIMO_KERNEL_STARTUP_ERROR → terminal + closeTransport", () => {
-      const decision = classify("MARIMO_KERNEL_STARTUP_ERROR", 0);
+      const decision = classify("MARIMO_KERNEL_STARTUP_ERROR");
       expect(decision.kind).toBe("terminal");
       expect(decision.status).toMatchObject({
         state: WebSocketState.CLOSED,
@@ -113,25 +63,17 @@ describe("classifyCloseEvent", () => {
         expect(decision.closeTransport).toBe(true);
       }
     });
-
-    it("terminal closes ignore retryCount entirely", () => {
-      const decision = classify("MARIMO_SHUTDOWN", 99);
-      expect(decision.kind).toBe("terminal");
-    });
   });
 
-  describe("retry budget exhaustion", () => {
-    it("yields retry on attempts 1..maxRetries-1 and gave-up on the final close", () => {
-      const states: string[] = [];
-      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        states.push(classify(undefined, attempt - 1).kind);
-      }
-      states.push(classify(undefined, MAX_RETRIES).kind);
-
-      expect(states).toEqual([
-        ...Array.from({ length: MAX_RETRIES }, () => "retry"),
-        "gave-up",
-      ]);
+  describe("transport exhaustion", () => {
+    it("MARIMO_TRANSPORT_EXHAUSTED → gave-up with KERNEL_DISCONNECTED", () => {
+      const decision = classify("MARIMO_TRANSPORT_EXHAUSTED");
+      expect(decision.kind).toBe("gave-up");
+      expect(decision.status).toEqual({
+        state: WebSocketState.CLOSED,
+        code: WebSocketClosedReason.KERNEL_DISCONNECTED,
+        reason: "kernel not found",
+      });
     });
   });
 });

@@ -3,13 +3,19 @@
 import { useMemo, useRef, useState } from "react";
 import type { EditorView } from "@codemirror/view";
 import { useAtomValue } from "jotai";
+import useEvent from "react-use-event-hook";
+import { cellDomProps } from "@/components/editor/common";
 import { CellEditor } from "@/components/editor/cell/code/cell-editor";
+import { LanguageToggles } from "@/components/editor/cell/code/language-toggle";
 import { CellStatusComponent } from "@/components/editor/cell/CellStatus";
 import { RunButton } from "@/components/editor/cell/RunButton";
 import { StopButton } from "@/components/editor/cell/StopButton";
 import { useRunCell } from "@/components/editor/cell/useRunCells";
 import { Slide as CellOutputSlide } from "@/components/slides/slide";
-import { useUserConfig } from "@/core/config/config";
+import { maybeAddMarimoImport } from "@/core/cells/add-missing-import";
+import { outputIsStale } from "@/core/cells/cell";
+import { useCellActions } from "@/core/cells/cells";
+import { autoInstantiateAtom, useUserConfig } from "@/core/config/config";
 import {
   cellNeedsRun,
   cellStatusClasses,
@@ -21,7 +27,7 @@ import { connectionAtom } from "@/core/network/connection";
 import { useTheme } from "@/theme/useTheme";
 import { cn } from "@/utils/cn";
 import { ReadonlyCode } from "../editor/code/readonly-python-code";
-import { languageAdapterFromCode } from "@/core/codemirror/language/extension";
+import { getReadonlyCodeDisplay } from "@/core/cells/readonly-code-display";
 
 type RuntimeCell = CellRuntimeState & CellData;
 
@@ -36,11 +42,23 @@ export const SlideCellView = ({ cell }: { cell: RuntimeCell }) => {
   const { theme } = useTheme();
   const runCell = useRunCell(cell.id);
   const connection = useAtomValue(connectionAtom);
+  const cellActions = useCellActions();
+  const autoInstantiate = useAtomValue(autoInstantiateAtom);
   const editorViewRef = useRef<EditorView | null>(null);
   const editorViewParentRef = useRef<HTMLDivElement | null>(null);
   const [languageAdapter, setLanguageAdapter] = useState<
     LanguageAdapterType | undefined
   >();
+
+  const afterToggleLanguage = useEvent(() => {
+    maybeAddMarimoImport({
+      autoInstantiate,
+      createNewCell: cellActions.createNewCell,
+    });
+  });
+
+  // Must be a stable identity: it feeds the editor's `extensions` memo
+  const showHiddenCode = useEvent(() => undefined);
 
   const cellOutputPosition = userConfig.display.cell_output;
   const hasOutput = cell.output != null;
@@ -79,6 +97,7 @@ export const SlideCellView = ({ cell }: { cell: RuntimeCell }) => {
       cellId={cell.id}
       status={cell.status}
       output={cell.output}
+      stale={outputIsStale(cell, false)}
     />
   );
 
@@ -96,6 +115,13 @@ export const SlideCellView = ({ cell }: { cell: RuntimeCell }) => {
         lastRunStartTimestamp={cell.lastRunStartTimestamp}
         uninstantiated={uninstantiated}
       />
+      <LanguageToggles
+        code={cell.code}
+        editorView={editorViewRef.current}
+        currentLanguageAdapter={languageAdapter}
+        onAfterToggle={afterToggleLanguage}
+        className="flex items-center gap-1"
+      />
       <div className="flex items-center shadow-none gap-1">
         <RunButton
           edited={cell.edited}
@@ -111,7 +137,11 @@ export const SlideCellView = ({ cell }: { cell: RuntimeCell }) => {
   );
 
   const editor = (
-    <div className={editorWrapperClassName}>
+    <div
+      tabIndex={-1}
+      className={editorWrapperClassName}
+      {...cellDomProps(cell.id, cell.name)}
+    >
       <CellEditor
         theme={theme}
         showPlaceholder={false}
@@ -130,11 +160,18 @@ export const SlideCellView = ({ cell }: { cell: RuntimeCell }) => {
         hasOutput={hasOutput}
         // hide_code is intentionally overridden in the slide view; the editor
         // is unmounted entirely when the user toggles code off.
-        showHiddenCode={() => undefined}
+        showHiddenCode={showHiddenCode}
         languageAdapter={languageAdapter}
         setLanguageAdapter={setLanguageAdapter}
         showLanguageToggles={false}
+        // The reveal.js transforms in slides view break the inline AI
+        // tooltip's fixed positioning, so disable it here.
+        inlineAiTooltip={false}
         outputArea={cellOutputPosition}
+        // Parent tooltips (completions, hover, signature help) to the Reveal
+        // viewport so they stay visible when presenting fullscreen; `#App` sits
+        // outside the fullscreened subtree and would never paint.
+        tooltipParentSelector=".reveal-viewport"
       />
       {toolbar}
     </div>
@@ -153,22 +190,24 @@ export const SlideCellReadOnlyView = ({ cell }: { cell: RuntimeCell }) => {
   const [userConfig] = useUserConfig();
   const cellOutputPosition = userConfig.display.cell_output;
 
-  const language = useMemo(() => {
-    const adapter = languageAdapterFromCode(cell.code.trim());
-    return adapter.type === "sql" ? "sql" : "python";
-  }, [cell.code]);
+  const display = useMemo(() => getReadonlyCodeDisplay(cell.code), [cell.code]);
 
   const output = (
     <CellOutputSlide
       cellId={cell.id}
       status={cell.status}
       output={cell.output}
+      stale={outputIsStale(cell, false)}
     />
   );
 
   const editor = (
     <div className="marimo-cell">
-      <ReadonlyCode code={cell.code} language={language} showHideCode={false} />
+      <ReadonlyCode
+        code={display.code}
+        language={display.language}
+        showHideCode={false}
+      />
     </div>
   );
 

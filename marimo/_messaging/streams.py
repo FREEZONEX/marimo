@@ -145,6 +145,18 @@ class ThreadSafeStream(Stream):
                     e,
                 )
 
+    def copy_for_thread(self) -> ThreadSafeStream:
+        stream = type(self)(
+            pipe=self.pipe,
+            input_queue=self.input_queue,
+            redirect_console=False,
+            cell_id=self.cell_id,
+        )
+        # The parent stream and thread copy write to the same pipe. Share the
+        # transport lock so pipe.send() remains serialized across both views.
+        stream.stream_lock = self.stream_lock
+        return stream
+
     def flush_console(self) -> None:
         """Force the buffered console writer to flush immediately.
 
@@ -465,20 +477,6 @@ class ThreadSafeStdin(Stdin):
             self._stream.console_msg_cv.notify()
 
         return self._stream.input_queue.get()
-
-    def readline(self, size: int | None = -1) -> str:  # type: ignore[override]
-        # size only included for compatibility with sys.stdin.readline API;
-        # we don't support it.
-        del size
-        return self._readline_with_prompt(prompt="")
-
-    def readlines(self, hint: int | None = -1) -> list[str]:  # type: ignore[override]
-        # Just an alias for readline.
-        #
-        # hint only included for compatibility with sys.stdin.readlines API;
-        # we don't support it.
-        del hint
-        return self._readline_with_prompt(prompt="").split("\n")
 
 
 @contextlib.contextmanager

@@ -9,7 +9,6 @@ import {
   CopyMinusIcon,
   DownloadIcon,
   ExternalLinkIcon,
-  EyeOffIcon,
   FilePlus2Icon,
   FolderPlusIcon,
   ListTreeIcon,
@@ -42,6 +41,7 @@ import {
   MENU_ITEM_ICON_CLASS,
   RefreshIconButton,
   TreeChevron,
+  VisibilityToggleButton,
 } from "@/components/editor/file-tree/tree-actions";
 import { MarimoIcon, MarimoPlusIcon } from "@/components/icons/marimo-icons";
 import { Spinner } from "@/components/icons/spinner";
@@ -62,16 +62,14 @@ import type { FileInfo } from "@/core/network/types";
 import { isWasm } from "@/core/wasm/utils";
 import { useAsyncData } from "@/hooks/useAsyncData";
 import { ErrorBanner } from "@/plugins/impl/common/error-banner";
-import { deserializeBlob } from "@/utils/blob";
 import { cn } from "@/utils/cn";
 import { copyToClipboard } from "@/utils/copy";
-import { downloadBlob } from "@/utils/download";
-import { type Base64String, base64ToDataURL } from "@/utils/json/base64";
 import { openNotebook } from "@/utils/links";
 import type { FilePath } from "@/utils/paths";
 import { makeDuplicateName } from "@/utils/pathUtils";
 import { jotaiJsonStorage } from "@/utils/storage/jotai";
 import { useTreeDndManager } from "./dnd-wrapper";
+import { downloadFile } from "./download";
 import { FileViewer } from "./file-viewer";
 import type { RequestingTree } from "./requesting-tree";
 import { openStateAtom, treeAtom } from "./state";
@@ -198,6 +196,7 @@ export const FileExplorer: React.FC<{
       <Toolbar
         onRefresh={handleRefresh}
         onHidden={handleHiddenFilesToggle}
+        showHiddenFiles={showHiddenFiles}
         onCreateFile={handleCreateFile}
         onCreateNotebook={handleCreateNotebook}
         onCreateFolder={handleCreateFolder}
@@ -265,6 +264,7 @@ const INDENT_STEP = 15;
 interface ToolbarProps {
   onRefresh: () => void;
   onHidden: () => void;
+  showHiddenFiles: boolean;
   onCreateFile: () => void;
   onCreateNotebook: () => void;
   onCreateFolder: () => void;
@@ -275,6 +275,7 @@ interface ToolbarProps {
 const Toolbar = ({
   onRefresh,
   onHidden,
+  showHiddenFiles,
   onCreateFile,
   onCreateNotebook,
   onCreateFolder,
@@ -334,16 +335,13 @@ const Toolbar = ({
         data-testid="file-explorer-refresh-button"
         onClick={onRefresh}
       />
-      <Tooltip content="Toggle hidden files">
-        <Button
-          data-testid="file-explorer-hidden-files-button"
-          onClick={onHidden}
-          variant="text"
-          size="xs"
-        >
-          <EyeOffIcon size={16} />
-        </Button>
-      </Tooltip>
+      <VisibilityToggleButton
+        data-testid="file-explorer-hidden-files-button"
+        isVisible={showHiddenFiles}
+        onToggle={onHidden}
+        showTooltip="Show hidden files"
+        hideTooltip="Hide hidden files"
+      />
       <Tooltip content="Collapse all folders">
         <Button
           data-testid="file-explorer-collapse-button"
@@ -393,7 +391,7 @@ const Show = ({
 };
 
 const Node = ({ node, style, dragHandle }: NodeRendererProps<FileInfo>) => {
-  const { openFile, sendFileDetails } = useRequestClient();
+  const { openFile } = useRequestClient();
   const disableFileDownloads = useAtomValue(disableFileDownloadsAtom);
 
   const fileType: FileIconType = node.data.isDirectory
@@ -645,23 +643,7 @@ const Node = ({ node, style, dragHandle }: NodeRendererProps<FileInfo>) => {
             <>
               <DropdownMenuItem
                 onSelect={async () => {
-                  const details = await sendFileDetails({
-                    path: node.data.path,
-                  });
-                  if (details.isBase64 && details.contents) {
-                    const blob = deserializeBlob(
-                      base64ToDataURL(
-                        details.contents as Base64String,
-                        details.mimeType || "application/octet-stream",
-                      ),
-                    );
-                    downloadBlob(blob, node.data.name);
-                  } else {
-                    downloadBlob(
-                      new Blob([details.contents || ""]),
-                      node.data.name,
-                    );
-                  }
+                  await downloadFile(node.data.path, node.data.name);
                 }}
                 data-testid="file-explorer-download-menu-item"
               >

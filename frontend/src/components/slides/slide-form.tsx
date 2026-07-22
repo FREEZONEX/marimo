@@ -10,6 +10,7 @@ import {
   PanelRightOpenIcon,
   KeyboardIcon,
 } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   Select,
@@ -22,19 +23,29 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { CellId } from "@/core/cells/ids";
 import { cn } from "@/utils/cn";
 import type {
+  DeckVerticalAlign,
   DeckTransition,
   SlidesLayout,
   SlideType,
 } from "../editor/renderers/slides-layout/types";
-import { useState } from "react";
+import { useAtom } from "jotai";
+import { atomWithStorage } from "jotai/utils";
 import { Tooltip } from "../ui/tooltip";
 import { Button } from "../ui/button";
 import { Kbd } from "../ui/kbd";
 import type { RuntimeCell } from "@/core/cells/types";
+import { jotaiJsonStorage } from "@/utils/storage/jotai";
 
 export const DEFAULT_SLIDE_TYPE: SlideType = "slide";
 export const DEFAULT_DECK_TRANSITION: DeckTransition = "slide";
+export const DEFAULT_DECK_VERTICAL_ALIGN: DeckVerticalAlign = "center";
 const COLLAPSED_CONFIG_WIDTH = 36;
+const slideConfigOpenAtom = atomWithStorage<boolean>(
+  "marimo:slides:config-open",
+  true,
+  jotaiJsonStorage,
+  { getOnInit: true },
+);
 
 export interface SlideTypeOption {
   value: SlideType;
@@ -107,6 +118,30 @@ const DECK_TRANSITION_OPTIONS: DeckTransitionOption[] = [
     description: "Rotate with a concave curve.",
   },
   { value: "zoom", label: "Zoom", description: "Zoom into the next slide." },
+];
+
+interface DeckVerticalAlignOption {
+  value: DeckVerticalAlign;
+  label: string;
+  description: string;
+}
+
+const DECK_VERTICAL_ALIGN_OPTIONS: DeckVerticalAlignOption[] = [
+  {
+    value: "center",
+    label: "Center",
+    description: "Vertically center each slide's content.",
+  },
+  {
+    value: "top",
+    label: "Top",
+    description: "Align content to the top, like the cell view.",
+  },
+  {
+    value: "bottom",
+    label: "Bottom",
+    description: "Align content to the bottom of each slide.",
+  },
 ];
 
 const SlidesForm = ({
@@ -188,13 +223,22 @@ const SlideConfigForm = ({
   setLayout: (layout: SlidesLayout) => void;
   cellId: CellId;
 }) => {
-  const currentSlideType: SlideType =
-    layout.cells.get(cellId)?.type ?? DEFAULT_SLIDE_TYPE;
+  const currentConfig = layout.cells.get(cellId);
+  const currentSlideType: SlideType = currentConfig?.type ?? DEFAULT_SLIDE_TYPE;
+  const showCode = currentConfig?.showCode ?? false;
 
   const handleSlideTypeChange = (value: SlideType) => {
-    const existingConfig = layout.cells.get(cellId);
     const newCells = new Map(layout.cells);
-    newCells.set(cellId, { ...existingConfig, type: value });
+    newCells.set(cellId, { ...currentConfig, type: value });
+    setLayout({
+      ...layout,
+      cells: newCells,
+    });
+  };
+
+  const handleShowCodeChange = (checked: boolean) => {
+    const newCells = new Map(layout.cells);
+    newCells.set(cellId, { ...currentConfig, showCode: checked });
     setLayout({
       ...layout,
       cells: newCells,
@@ -253,6 +297,18 @@ const SlideConfigForm = ({
           );
         })}
       </RadioGroup>
+      <div className="flex items-center gap-2">
+        <label htmlFor="slide-show-code" className="text-sm">
+          Show code
+        </label>
+        <Switch
+          id="slide-show-code"
+          aria-label="Show code"
+          checked={showCode}
+          onCheckedChange={handleShowCodeChange}
+          size="sm"
+        />
+      </div>
     </div>
   );
 };
@@ -270,10 +326,23 @@ const DeckConfigForm = ({
     (opt) => opt.value === currentTransition,
   )?.description;
 
+  const currentVerticalAlign: DeckVerticalAlign =
+    layout.deck?.verticalAlign ?? DEFAULT_DECK_VERTICAL_ALIGN;
+  const activeVerticalAlignDescription = DECK_VERTICAL_ALIGN_OPTIONS.find(
+    (opt) => opt.value === currentVerticalAlign,
+  )?.description;
+
   const handleTransitionChange = (value: DeckTransition) => {
     setLayout({
       ...layout,
       deck: { ...layout.deck, transition: value },
+    });
+  };
+
+  const handleVerticalAlignChange = (value: DeckVerticalAlign) => {
+    setLayout({
+      ...layout,
+      deck: { ...layout.deck, verticalAlign: value },
     });
   };
 
@@ -307,6 +376,39 @@ const DeckConfigForm = ({
           <p className="text-xs text-foreground/70">{activeDescription}</p>
         )}
       </div>
+      <div className="flex flex-col gap-1.5">
+        <label
+          htmlFor="deck-vertical-align"
+          className="font-semibold text-sm text-foreground"
+        >
+          Vertical alignment
+        </label>
+        <Select
+          value={currentVerticalAlign}
+          onValueChange={(value) =>
+            handleVerticalAlignChange(value as DeckVerticalAlign)
+          }
+        >
+          <SelectTrigger
+            id="deck-vertical-align"
+            aria-label="Vertical alignment"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {DECK_VERTICAL_ALIGN_OPTIONS.map(({ value, label }) => (
+              <SelectItem key={value} value={value}>
+                {label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {activeVerticalAlignDescription && (
+          <p className="text-xs text-foreground/70">
+            {activeVerticalAlignDescription}
+          </p>
+        )}
+      </div>
     </div>
   );
 };
@@ -322,7 +424,7 @@ export const SlideSidebar = ({
   setLayout: (layout: SlidesLayout) => void;
   activeConfigCell?: RuntimeCell;
 }) => {
-  const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const [isConfigOpen, setIsConfigOpen] = useAtom(slideConfigOpenAtom);
 
   return (
     <aside
@@ -350,7 +452,7 @@ export const SlideSidebar = ({
             variant="ghost"
             size="icon"
             className="h-7 w-7 text-muted-foreground hover:text-foreground"
-            onClick={() => setIsConfigOpen(!isConfigOpen)}
+            onClick={() => setIsConfigOpen((open) => !open)}
             aria-expanded={isConfigOpen}
             aria-controls="slide-config-panel"
           >
