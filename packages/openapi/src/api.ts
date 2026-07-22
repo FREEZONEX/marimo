@@ -5159,6 +5159,7 @@ export interface components {
         | components["schemas"]["SyncGraphCommand"]
         | components["schemas"]["UpdateCellConfigCommand"]
         | components["schemas"]["InstallPackagesCommand"]
+        | components["schemas"]["RefreshInstalledModulesCommand"]
         | components["schemas"]["UpdateUIElementCommand"]
         | components["schemas"]["ModelCommand"]
         | components["schemas"]["InvokeFunctionCommand"]
@@ -6060,6 +6061,19 @@ export interface components {
     ReconnectedNotification: {
       /** @enum {unknown} */
       op: "reconnected";
+    };
+    /**
+     * RefreshInstalledModulesCommand
+     * @description Refresh kernel state after packages were installed externally.
+     *
+     *         Used when the server installs packages outside the kernel's normal
+     *         installation flow, but the current edit session still needs to see the
+     *         modules immediately without restarting the kernel process.
+     */
+    RefreshInstalledModulesCommand: {
+      modules: string[];
+      /** @enum {unknown} */
+      type: "refresh-installed-modules";
     };
     /**
      * RefreshSecretsCommand
