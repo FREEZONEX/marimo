@@ -1,5 +1,6 @@
 /* Copyright 2026 Marimo. All rights reserved. */
 import { loadPyodide, type PyodideInterface } from "pyodide";
+import type { PyCallable, PyProxy } from "pyodide/ffi";
 import type { UserConfig } from "@/core/config/config-schema";
 import type { NotificationPayload } from "@/core/kernel/messages";
 import type { JsonString } from "@/utils/json/base64";
@@ -12,6 +13,12 @@ import type { SerializedBridge, WasmController } from "./types";
 import { shouldLoadDuckDBPackages } from "../utils";
 
 const MAKE_SNAPSHOT = false;
+type SessionResources = [
+  bridge: PyProxy,
+  init: PyCallable,
+  packages: PyProxy,
+  stop: PyCallable,
+];
 
 // This class initializes the wasm environment
 // We would like this initialization to be parallelizable
@@ -25,6 +32,9 @@ const MAKE_SNAPSHOT = false;
 
 export class DefaultWasmController implements WasmController {
   protected pyodide: PyodideInterface | null = null;
+  private packageLoadQueue = Promise.resolve();
+  private sessionGeneration = 0;
+  private activeSessionStops = new Set<PyCallable>();
 
   get requirePyodide() {
     invariant(this.pyodide, "Pyodide not loaded");
@@ -55,6 +65,10 @@ export class DefaultWasmController implements WasmController {
     // Load pyodide and packages
     const span = t.startSpan("loadPyodide");
     try {
+      // Without this, this fails in Firefox with
+      // `Could not extract indexURL path from pyodide module`
+      // This fixes for Firefox and does not break Chrome/others
+      const indexURL = `https://cdn.jsdelivr.net/pyodide/${opts.pyodideVersion}/full/`;
       const pyodide = await loadPyodide({
         // Perf: These get loaded while pyodide is being bootstrapped
         packages: [
@@ -68,10 +82,14 @@ export class DefaultWasmController implements WasmController {
         ],
         _makeSnapshot: MAKE_SNAPSHOT,
         lockFileURL: `https://wasm.marimo.app/pyodide-lock.json?v=${opts.version}&pyodide=${opts.pyodideVersion}`,
-        // Without this, this fails in Firefox with
-        // `Could not extract indexURL path from pyodide module`
-        // This fixes for Firefox and does not break Chrome/others
-        indexURL: `https://cdn.jsdelivr.net/pyodide/${opts.pyodideVersion}/full/`,
+        indexURL,
+        // Since Pyodide 0.28.0, when lockFileURL is set, the package base URL
+        // defaults to the lockfile's URL (wasm.marimo.app) instead of indexURL.
+        // Unlike Node, browsers get no CDN fallback on a failed fetch, so we
+        // should pin packageBaseUrl back to the jsDelivr CDN  to restore
+        // the resolution akin to pre-0.28.
+        packageBaseUrl: indexURL,
+        convertNullToNone: true,
       });
       this.pyodide = pyodide;
       span.end("ok");
@@ -103,6 +121,7 @@ export class DefaultWasmController implements WasmController {
     onMessage: (message: JsonString<NotificationPayload>) => void;
     userConfig: UserConfig;
   }): Promise<SerializedBridge> {
+    const sessionGeneration = this.sessionGeneration;
     const { code, filename, onMessage, queryParameters, userConfig } = opts;
     // We pass down a messenger object to the code
     // This is used to have synchronous communication between the JS and Python code
@@ -118,47 +137,129 @@ export class DefaultWasmController implements WasmController {
 
     const span = t.startSpan("startSession.runPython");
     const nbFilename = filename || WasmFileSystem.NOTEBOOK_FILENAME;
-    const [bridge, init, packages] = this.requirePyodide.runPython(
+    const sessionResources = this.requirePyodide.runPython(
       `
       print("[py] Starting marimo...")
       import asyncio
+      import gc
       import js
       from marimo._pyodide.bootstrap import create_session, instantiate
 
       assert js.messenger, "messenger is not defined"
       assert js.query_params, "query_params is not defined"
 
-      session, bridge = create_session(
-        filename="${nbFilename}",
-        query_params=js.query_params.to_py(),
-        message_callback=js.messenger.callback,
-        user_config=js.user_config.to_py(),
-      )
+      def create_session_resources():
+        session, bridge = create_session(
+          filename="${nbFilename}",
+          query_params=js.query_params.to_py(),
+          message_callback=js.messenger.callback,
+          user_config=js.user_config.to_py(),
+        )
+        session_task = None
 
-      def init(auto_instantiate=True):
-        instantiate(session, auto_instantiate)
-        asyncio.create_task(session.start())
+        def init(auto_instantiate=True):
+          nonlocal session_task
+          instantiate(session, auto_instantiate)
+          session_task = asyncio.create_task(session.start())
 
-      # Find the packages to install
-      with open("${nbFilename}", "r") as f:
-        packages = session.find_packages(f.read())
+        async def stop():
+          nonlocal bridge, session, session_task
+          task = session_task
+          kernel_task = getattr(session, "kernel_task", None)
+          if kernel_task is None:
+            if task is not None:
+              task.cancel()
+          else:
+            kernel_task.stop()
+          if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+          if bridge is not None:
+            bridge.session = None
+          task = None
+          kernel_task = None
+          session_task = None
+          session = None
+          bridge = None
+          gc.collect()
 
-      bridge, init, packages`,
-    );
+        with open("${nbFilename}", "r") as f:
+          packages = session.find_packages(f.read())
+
+        return bridge, init, packages, stop
+
+      create_session_resources()`,
+    ) as PyProxy;
     span.end();
-
-    const foundPackages = new Set<string>(packages.toJs());
+    let bridgeProxy!: PyProxy;
+    let initSession!: PyCallable;
+    let packagesProxy!: PyProxy;
+    let stopSession!: PyCallable;
+    try {
+      [bridgeProxy, initSession, packagesProxy, stopSession] =
+        sessionResources as unknown as SessionResources;
+    } finally {
+      sessionResources.destroy();
+    }
+    let foundPackages: Set<string>;
+    try {
+      foundPackages = new Set<string>(packagesProxy.toJs());
+    } catch (error) {
+      bridgeProxy.destroy();
+      initSession.destroy();
+      stopSession.destroy();
+      throw error;
+    } finally {
+      packagesProxy.destroy();
+    }
+    this.activeSessionStops.add(stopSession);
 
     // Fire and forget:
     // Load notebook dependencies and instantiate the session
     // We don't want to wait for this to finish,
     // so we can show the initial code immediately giving
     // a sense of responsiveness.
-    void this.loadNotebookDeps(code, foundPackages).then(() => {
-      return init(userConfig.runtime.auto_instantiate);
+    const dependenciesReady = this.packageLoadQueue.then(() => {
+      if (sessionGeneration !== this.sessionGeneration) {
+        return;
+      }
+      return this.loadNotebookDeps(code, foundPackages);
     });
+    this.packageLoadQueue = dependenciesReady.catch(() => undefined);
+    void dependenciesReady
+      .then(() => {
+        if (sessionGeneration !== this.sessionGeneration) {
+          return;
+        }
+        return initSession(userConfig.runtime.auto_instantiate);
+      })
+      .catch((error: unknown) => {
+        Logger.error("Failed to load notebook dependencies", error);
+      })
+      .finally(() => initSession.destroy());
 
-    return bridge;
+    return bridgeProxy as unknown as SerializedBridge;
+  }
+
+  async stopSession(): Promise<void> {
+    this.sessionGeneration += 1;
+    const stops = [...this.activeSessionStops];
+    let hasFailure = false;
+    let firstFailure: unknown;
+    for (const stop of stops) {
+      try {
+        await stop();
+        this.activeSessionStops.delete(stop);
+        stop.destroy();
+      } catch (error) {
+        if (!hasFailure) {
+          hasFailure = true;
+          firstFailure = error;
+        }
+      }
+    }
+    if (hasFailure) {
+      throw firstFailure;
+    }
   }
 
   private async loadNotebookDeps(code: string, foundPackages: Set<string>) {

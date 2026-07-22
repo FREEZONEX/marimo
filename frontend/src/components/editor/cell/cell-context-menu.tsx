@@ -23,7 +23,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useCellData, useCellRuntime } from "@/core/cells/cells";
 import { CellOutputId } from "@/core/cells/ids";
 import { isOutputEmpty } from "@/core/cells/outputs";
-import { goToDefinitionAtCursorPosition } from "@/core/codemirror/go-to-definition/utils";
+import { goToDefinitionWithLspFallback } from "@/core/codemirror/go-to-definition/utils";
 import { sendToPanelManager } from "@/core/vscode/vscode-bindings";
 import { copyImageToClipboard, copyToClipboard } from "@/utils/copy";
 import { getImageExtension } from "@/utils/filenames";
@@ -39,12 +39,18 @@ interface Props extends Pick<
   "cellId" | "getEditorView"
 > {
   children: React.ReactNode;
+  /**
+   * If true, the custom context menu is disabled and the native one is used
+   * (e.g. while presenting).
+   */
+  disabled?: boolean;
 }
 
 export const CellActionsContextMenu = ({
   children,
   cellId,
   getEditorView,
+  disabled,
 }: Props) => {
   const cellData = useCellData(cellId);
   const cellRuntime = useCellRuntime(cellId);
@@ -61,6 +67,7 @@ export const CellActionsContextMenu = ({
   });
   const [imageRightClicked, setImageRightClicked] =
     React.useState<HTMLImageElement>();
+  const suppressCloseAutoFocus = React.useRef(false);
 
   const DEFAULT_CONTEXT_MENU_ITEMS: ActionButton[] = [
     {
@@ -166,7 +173,10 @@ export const CellActionsContextMenu = ({
       handle: () => {
         const editorView = getEditorView();
         if (editorView) {
-          goToDefinitionAtCursorPosition(editorView);
+          // Only suppress focus restoration when we actually navigated;
+          // otherwise let Radix return focus to the trigger cell.
+          suppressCloseAutoFocus.current =
+            goToDefinitionWithLspFallback(editorView);
         }
       },
     },
@@ -183,6 +193,7 @@ export const CellActionsContextMenu = ({
   return (
     <ContextMenu>
       <ContextMenuTrigger
+        disabled={disabled}
         onContextMenu={(evt) => {
           if (evt.target instanceof HTMLImageElement) {
             setImageRightClicked(evt.target);
@@ -194,7 +205,16 @@ export const CellActionsContextMenu = ({
       >
         {children}
       </ContextMenuTrigger>
-      <ContextMenuContent className="w-[300px]" scrollable={true}>
+      <ContextMenuContent
+        className="w-[300px]"
+        scrollable={true}
+        onCloseAutoFocus={(evt) => {
+          if (suppressCloseAutoFocus.current) {
+            evt.preventDefault();
+            suppressCloseAutoFocus.current = false;
+          }
+        }}
+      >
         {visibleActions.map((group, i) => (
           <Fragment key={i}>
             {group.map((action) => {

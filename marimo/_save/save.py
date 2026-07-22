@@ -6,6 +6,7 @@ import asyncio
 import functools
 import inspect
 import io
+import linecache
 import sys
 import threading
 import time
@@ -38,6 +39,8 @@ from marimo._ast.transformers import (
 from marimo._ast.variables import is_mangled_local, unmangle_local
 from marimo._messaging.tracebacks import write_traceback
 from marimo._runtime.context import get_context, safe_get_context
+from marimo._runtime.dataflow import DirectedGraph
+from marimo._runtime.scratch import SCRATCH_CELL_ID
 from marimo._runtime.side_effect import SideEffect
 from marimo._runtime.state import State
 from marimo._save.cache import (
@@ -59,6 +62,7 @@ from marimo._save.loaders import (
     LoaderPartial,
     LoaderType,
     MemoryLoader,
+    resolve_loader,
 )
 from marimo._save.stores.file import FileStore
 from marimo._save.toplevel import get_cell_id_from_scope, graph_from_scope
@@ -71,7 +75,6 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
-    from marimo._runtime.dataflow import DirectedGraph
     from marimo._save.stores import Store
 
 P = ParamSpec("P")
@@ -169,8 +172,15 @@ class _cache_call(CacheContext, Generic[P, R]):
                 ctx.cell_id or ctx.execution_context.cell_id or CellId_t("")
             )
             # If the cell ID is "external", that means it's not from the main
-            # graph but rather from an embedded graph.
-            self._external = is_external_cell_id(maybe_cell_id)
+            # graph but rather from an embedded graph. The scratchpad cell
+            # also lives outside the main graph (it's only registered in a
+            # Runner-local DirectedGraph during run_scratchpad), so it
+            # follows the same code path: defer to graph_from_scope at call
+            # time, no main-graph lookup.
+            self._external = (
+                is_external_cell_id(maybe_cell_id)
+                or maybe_cell_id == SCRATCH_CELL_ID
+            )
             if not self._external:
                 graph = ctx.graph
                 glbls = ctx.globals
@@ -710,6 +720,23 @@ class _cache_context(SkipContext, CacheContext):
                     code = cell.code
                 elif cell_id in graph.cells:
                     code = graph.cells[cell_id].code
+                elif cell_id == SCRATCH_CELL_ID:
+                    # The scratchpad cell lives in a Runner-local graph,
+                    # not in ctx.graph (the kernel's main graph). Pull
+                    # source from linecache, which compile_cell populated
+                    # when the scratchpad was compiled. Use an empty
+                    # graph + empty cell_id for the BlockHasher call
+                    # below, mirroring how `@mo.cache._set_context`
+                    # handles cells outside the main graph.
+                    lines = linecache.getlines(filename)
+                    if not lines:
+                        raise CacheException(
+                            "Could not resolve cell for cache."
+                            f"{UNEXPECTED_FAILURE_BOILERPLATE}"
+                        )
+                    code = "".join(lines)
+                    graph = DirectedGraph()
+                    cell_id = CellId_t("")
                 else:
                     raise CacheException(
                         "Could not resolve cell for cache."
@@ -1157,7 +1184,7 @@ def lru_cache(  # type: ignore[misc]
             *args,
             pin_modules=pin_modules,
             loader=MemoryLoader.partial(max_size=maxsize),
-            _frame_offset=2,
+            _frame_offset=2 if callable(arg) else 1,
             **kwargs,
         ),
     )
@@ -1301,7 +1328,8 @@ def persistent_cache(  # type: ignore[misc]
             "provide one or the other."
         )
 
-    # Providing a save_path forces the store to be a FileStore
+    # Providing a save_path forces the store to be a FileStore (works in
+    # Pyodide too, via its in-memory MEMFS, for in-session caching).
     if save_path is not None:
         store = FileStore(save_path)
 
@@ -1309,7 +1337,7 @@ def persistent_cache(  # type: ignore[misc]
     if store is not None:
         partial_args["store"] = store
 
-    loader = PERSISTENT_LOADERS[method].partial(**partial_args)
+    loader = resolve_loader(PERSISTENT_LOADERS[method]).partial(**partial_args)
     # Injection hook for testing
     if "_loader" in kwargs:
         loader = kwargs.pop("_loader")

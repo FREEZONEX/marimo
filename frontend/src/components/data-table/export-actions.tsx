@@ -9,7 +9,6 @@ import {
   TableIcon,
 } from "lucide-react";
 import React from "react";
-import { useLocale } from "react-aria";
 import { downloadSizeLimitAtom } from "./download-policy/atoms";
 import { logNever } from "@/utils/assertNever";
 import { cn } from "@/utils/cn";
@@ -20,7 +19,6 @@ import { Filenames } from "@/utils/filenames";
 import {
   jsonParseWithSpecialChar,
   jsonToMarkdown,
-  jsonToTSV,
 } from "@/utils/json/json-parser";
 import { MissingPackagePrompt } from "../datasources/missing-package-prompt";
 import { Button } from "../ui/button";
@@ -68,7 +66,12 @@ const FILE_TYPES = {
   },
 } as const;
 
-const downloadOptions = [FILE_TYPES.CSV, FILE_TYPES.JSON, FILE_TYPES.PARQUET];
+const downloadOptions = [
+  FILE_TYPES.CSV,
+  FILE_TYPES.TSV,
+  FILE_TYPES.JSON,
+  FILE_TYPES.PARQUET,
+];
 const copyOptions = [
   FILE_TYPES.TSV,
   FILE_TYPES.JSON,
@@ -78,6 +81,15 @@ const copyOptions = [
 
 type DownloadFormat = (typeof downloadOptions)[number]["format"];
 type CopyFormat = (typeof copyOptions)[number]["format"];
+
+// Each clipboard-copy format fetches from a backend download format, then
+// transforms the payload client-side as needed.
+const COPY_SOURCE_FORMAT: Record<CopyFormat, DownloadFormat> = {
+  csv: "csv",
+  tsv: "tsv",
+  json: "json",
+  markdown: "json",
+};
 
 export interface ExportActionProps {
   downloadAs: (req: { format: DownloadFormat }) => Promise<{
@@ -91,6 +103,7 @@ export interface ExportActionProps {
   // marimo-lsp inside VS Code) declares a download size cap. Null/undefined
   // means "no info" and the gate stays disabled (fail-open).
   sizeBytes?: number | null;
+  sizeBytesIsLoading?: boolean;
 }
 
 const labelForDownloadFormat = (format: DownloadFormat): string =>
@@ -99,14 +112,19 @@ const labelForCopyFormat = (format: CopyFormat): string =>
   copyOptions.find((opt) => opt.format === format)?.label ?? format;
 
 export const ExportMenu: React.FC<ExportActionProps> = (props) => {
-  const { locale } = useLocale();
-  const [open, setOpen] = React.useState(false);
+  const [downloadMenuOpen, setDownloadMenuOpen] = React.useState(false);
   const policy = useAtomValue(downloadSizeLimitAtom);
-  const disabled = !!(
+  const overLimit = !!(
     policy &&
     props.sizeBytes != null &&
     props.sizeBytes > policy.limitBytes
   );
+  const disabled = !!(policy && (props.sizeBytesIsLoading || overLimit));
+  const tooltipContent = !disabled
+    ? "Export"
+    : props.sizeBytesIsLoading
+      ? "Checking download size…"
+      : policy?.unavailableMessage;
 
   const button = (
     <Button
@@ -116,7 +134,7 @@ export const ExportMenu: React.FC<ExportActionProps> = (props) => {
       disabled={disabled}
       className={cn(
         "print:hidden text-xs gap-1",
-        open ? "text-primary" : "text-muted-foreground",
+        downloadMenuOpen ? "text-primary" : "text-muted-foreground",
       )}
     >
       <DownloadIcon className="w-3.5 h-3.5" />
@@ -206,7 +224,7 @@ export const ExportMenu: React.FC<ExportActionProps> = (props) => {
     await withLoadingToast(
       `Preparing ${labelForCopyFormat(format)} for clipboard...`,
       async () => {
-        const sourceFormat: DownloadFormat = format === "csv" ? "csv" : "json";
+        const sourceFormat = COPY_SOURCE_FORMAT[format];
         const result = await resolveDownloadUrl(sourceFormat, () => {
           void handleClipboardCopy(format);
         });
@@ -216,19 +234,15 @@ export const ExportMenu: React.FC<ExportActionProps> = (props) => {
 
         let text: string;
         switch (format) {
-          case "tsv": {
-            const json = await fetchJson(result.url);
-            text = jsonToTSV(json, locale);
+          case "tsv":
+          case "csv":
+            text = await fetchText(result.url);
             break;
-          }
           case "json": {
             const json = await fetchJson(result.url);
             text = JSON.stringify(json, null, 2);
             break;
           }
-          case "csv":
-            text = await fetchText(result.url);
-            break;
           case "markdown": {
             const json = await fetchJson(result.url);
             text = jsonToMarkdown(json);
@@ -248,10 +262,14 @@ export const ExportMenu: React.FC<ExportActionProps> = (props) => {
   };
 
   return (
-    <DropdownMenu modal={false} open={open} onOpenChange={setOpen}>
+    <DropdownMenu
+      modal={false}
+      open={downloadMenuOpen}
+      onOpenChange={setDownloadMenuOpen}
+    >
       <Tooltip
-        content={disabled ? policy?.unavailableMessage : "Export"}
-        open={open ? false : undefined}
+        content={tooltipContent}
+        open={downloadMenuOpen ? false : undefined}
       >
         <DropdownMenuTrigger asChild={true} disabled={disabled}>
           <span tabIndex={disabled ? 0 : -1} className="inline-flex">

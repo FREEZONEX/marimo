@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     import asyncio
     import threading
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Iterator
 
     from marimo._config.manager import MarimoConfigManager
     from marimo._messaging.notebook.document import NotebookDocument
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     )
     from marimo._session.notebook.file_manager import AppFileManager
     from marimo._session.queue import ProcessLike, QueueType
+    from marimo._session.room import Room
     from marimo._session.state.session_view import SessionView
     from marimo._types.ids import ConsumerId
     from marimo._utils.typed_connection import TypedConnection
@@ -41,7 +42,7 @@ class QueueManager(Protocol):
 
     control_queue: QueueType[commands.CommandMessage]
     set_ui_element_queue: QueueType[commands.BatchableCommand]
-    completion_queue: QueueType[commands.CodeCompletionCommand]
+    completion_queue: QueueType[commands.OutOfBandCommand]
     input_queue: QueueType[str]
     stream_queue: QueueType[KernelMessage | None] | None
     win32_interrupt_queue: QueueType[bool] | None
@@ -77,8 +78,13 @@ class KernelManager(Protocol):
         """Interrupt the running kernel."""
         ...
 
-    def close_kernel(self) -> None:
-        """Close the kernel and clean up resources."""
+    def close_kernel(self, *, graceful: bool = False) -> None:
+        """Close the kernel and clean up resources.
+
+        When `graceful` is True, wait (join) for the kernel to flush pending
+        work (e.g. cache writes) before killing it. The join is off by default
+        so event-loop callers aren't stalled by it.
+        """
         ...
 
     @property
@@ -109,13 +115,13 @@ class KernelState(Enum):
 class KernelExitInfo:
     """Information about how a kernel exited.
 
-    Populated after the kernel task has stopped. ``exitcode`` follows the
-    convention of ``multiprocessing.Process.exitcode``: ``>= 0`` for a normal
-    exit with that status, and ``< 0`` if the process was terminated by signal
-    ``-exitcode``. ``None`` means the exit status is unavailable -- either the
+    Populated after the kernel task has stopped. `exitcode` follows the
+    convention of `multiprocessing.Process.exitcode`: `>= 0` for a normal
+    exit with that status, and `< 0` if the process was terminated by signal
+    `-exitcode`. `None` means the exit status is unavailable -- either the
     task has not yet terminated, or the underlying task type does not expose
-    one (e.g. threads). ``cause`` is a short machine-readable tag and
-    ``message`` is a human-readable one-liner suitable for logs or end-user
+    one (e.g. threads). `cause` is a short machine-readable tag and
+    `message` is a human-readable one-liner suitable for logs or end-user
     display.
     """
 
@@ -133,15 +139,11 @@ class Session(Protocol):
     session_view: SessionView
     ttl_seconds: int
     scratchpad_lock: asyncio.Lock
+    room: Room
 
     @property
     def document(self) -> NotebookDocument:
         """The notebook document this session reflects."""
-        ...
-
-    @property
-    def consumers(self) -> Mapping[SessionConsumer, ConsumerId]:
-        """Get the consumers in the session."""
         ...
 
     def kernel_state(self) -> KernelState:
@@ -153,18 +155,14 @@ class Session(Protocol):
         ...
 
     def kernel_exit_info(self) -> KernelExitInfo | None:
-        """Describe how the kernel exited, or ``None`` if it is still running.
+        """Describe how the kernel exited, or `None` if it is still running.
 
-        Only meaningful once ``kernel_state() == KernelState.STOPPED``.
+        Only meaningful once `kernel_state() == KernelState.STOPPED`.
         """
         ...
 
     def try_interrupt(self) -> None:
         """Try to interrupt the kernel."""
-        ...
-
-    def flush_messages(self) -> None:
-        """Flush any pending messages."""
         ...
 
     async def rename_path(self, new_path: str) -> None:
@@ -226,6 +224,9 @@ class Session(Protocol):
         """Attach an extension for the duration of the context."""
         ...
 
-    def close(self) -> None:
-        """Close the session."""
+    def close(self, *, graceful: bool = False) -> None:
+        """Close the session.
+
+        See `KernelManager.close_kernel` for `graceful`.
+        """
         ...

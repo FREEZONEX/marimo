@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import re
 import signal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -29,8 +28,8 @@ from marimo._runtime import commands, handlers, patches
 from marimo._runtime.commands import (
     AppMetadata,
     BatchableCommand,
-    CodeCompletionCommand,
     CommandMessage,
+    OutOfBandCommand,
     UpdateUserConfigCommand,
 )
 from marimo._runtime.marimo_pdb import MarimoPdb
@@ -74,6 +73,7 @@ if TYPE_CHECKING:
 
     from marimo._ast.cell import CellConfig
     from marimo._messaging.types import KernelMessage
+    from marimo._runtime.context.types import RuntimeContext
     from marimo._session.notebook.file_manager import AppFileManager
     from marimo._types.ids import CellId_t
 
@@ -91,8 +91,9 @@ class AsyncQueueManager:
         # set UI elements duplicated in another queue so they can be batched
         self.set_ui_element_queue = asyncio.Queue[BatchableCommand]()
 
-        # Code completion requests are sent through a separate queue
-        self.completion_queue = asyncio.Queue[commands.CodeCompletionCommand]()
+        # Off-main-loop commands (completions + breakpoints) go through a
+        # separate queue.
+        self.completion_queue = asyncio.Queue[commands.OutOfBandCommand]()
 
         # Input messages for the user's Python code are sent through the
         # input queue
@@ -116,6 +117,8 @@ class PyodideSession:
         user_config: MarimoConfig,
     ) -> None:
         """Initialize kernel and client connection to it."""
+        from marimo._runtime.kernel_lifecycle import make_control_enqueuer
+
         self.app_manager = app
         self.mode = mode
         self.app_metadata = app_metadata
@@ -123,6 +126,10 @@ class PyodideSession:
         self.session_consumer = on_write
         self.session_view = SessionView()
         self._initial_user_config = user_config
+        self._enqueue_control_request = make_control_enqueuer(
+            self._queue_manager.control_queue,
+            self._queue_manager.set_ui_element_queue,
+        )
 
         self.consumers: list[Callable[[KernelMessage], None]] = [
             lambda msg: self.session_consumer(msg),
@@ -148,12 +155,7 @@ class PyodideSession:
         await self.kernel_task.start()
 
     def put_control_request(self, request: commands.CommandMessage) -> None:
-        self._queue_manager.control_queue.put_nowait(request)
-        if isinstance(
-            request,
-            (commands.UpdateUIElementCommand, commands.ModelCommand),
-        ):
-            self._queue_manager.set_ui_element_queue.put_nowait(request)
+        self._enqueue_control_request(request)
 
     def put_completion_request(
         self, request: commands.CodeCompletionCommand
@@ -171,46 +173,18 @@ class PyodideSession:
 
         # Prefer dependencies from script metadata
         try:
+            from marimo._runtime.packages.utils import (
+                filter_requirements_for_emscripten,
+                strip_requirement_name,
+            )
+
             reader = PyProjectReader.from_script(code)
-            script_deps = reader.dependencies
-
-            def strip_version(dep: str) -> str:
-                """
-                Strip version specifiers from a dependency string.
-                Handles PEP 440 version specifiers, extras, and URLs.
-                """
-                if not dep or not isinstance(dep, str):
-                    return dep if isinstance(dep, str) else ""
-
-                # Strip whitespace
-                dep = dep.strip()
-                if not dep:
-                    return dep
-
-                # Handle URL dependencies (package @ <url>) - leave as-is
-                # PEP 508 allows various URL schemes: http, https, git+https, git+ssh, file, ftp, etc.
-                if "@" in dep:
-                    _, rhs = dep.split("@", 1)
-                    rhs = rhs.strip()
-                    # Check for URL scheme pattern (e.g., https://, git+https://, file://)
-                    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", rhs):
-                        return dep
-
-                # Handle environment markers (package>=1.0; python_version>='3.8')
-                if ";" in dep:
-                    dep = dep.split(";")[0].strip()
-
-                # Split on PEP 440 version specifiers: ==, !=, <=, >=, <, >, ~=, ===
-                # Must check multi-char operators first to avoid partial matches
-                parts = re.split(
-                    r"\s*(?:===|==|!=|<=|>=|~=|<|>)\s*", dep, maxsplit=1
-                )
-
-                # Return the package name (first part), preserving extras like 'package[extra]'
-                return parts[0].strip() if parts else dep
+            script_deps = filter_requirements_for_emscripten(
+                reader.dependencies
+            )
 
             if len(script_deps) > 0:
-                return [strip_version(dep) for dep in script_deps]
+                return [strip_requirement_name(dep) for dep in script_deps]
         except Exception as e:
             LOGGER.warning("Error parsing script metadata: %s", e)
 
@@ -426,10 +400,33 @@ class PyodideBridge:
         return encode_json_str(response)
 
 
+def _dispose_pyodide_lifecycle_items(ctx: RuntimeContext) -> None:
+    registry = ctx.cell_lifecycle_registry
+    for cell_id, lifecycle_items in list(registry.registry.items()):
+        persisted_lifecycle_items = set()
+        for lifecycle_item in list(lifecycle_items):
+            try:
+                should_remove = lifecycle_item.dispose(
+                    context=ctx, deletion=True
+                )
+            except Exception:
+                LOGGER.exception("Failed to dispose Pyodide lifecycle item")
+                persisted_lifecycle_items.add(lifecycle_item)
+                continue
+
+            if not should_remove:
+                persisted_lifecycle_items.add(lifecycle_item)
+
+        if persisted_lifecycle_items:
+            registry.registry[cell_id] = persisted_lifecycle_items
+        else:
+            del registry.registry[cell_id]
+
+
 def _launch_pyodide_kernel(
     control_queue: asyncio.Queue[CommandMessage],
     set_ui_element_queue: asyncio.Queue[BatchableCommand],
-    completion_queue: asyncio.Queue[CodeCompletionCommand],
+    completion_queue: asyncio.Queue[OutOfBandCommand],
     input_queue: asyncio.Queue[str],
     on_message: Callable[[KernelMessage], None],
     session_mode: SessionMode,
@@ -438,9 +435,14 @@ def _launch_pyodide_kernel(
     user_config: MarimoConfig,
 ) -> RestartableTask:
     from marimo._output.formatters.formatters import register_formatters
+    from marimo._runtime._wasm import (
+        shutdown_wasm_runtime_work_async,
+        wait_for_wasm_runtime_work_async,
+    )
     from marimo._runtime.kernel_lifecycle import (
         KernelArgs,
         asyncio_queue_reader,
+        collapse_out_of_band,
         create_kernel,
         listen_messages,
         teardown_kernel,
@@ -476,24 +478,17 @@ def _launch_pyodide_kernel(
             control_queue=control_queue,
             set_ui_element_queue=set_ui_element_queue,
             virtual_file_storage=None,
-            print_override_fn=None,
         )
     )
 
     if is_edit_mode:
-        signal.signal(signal.SIGINT, handlers.construct_interrupt_handler(ctx))
+        signal.signal(signal.SIGINT, handlers.construct_interrupt_handler())
 
-    async def listen_completion() -> None:
+    async def listen_out_of_band() -> None:
         while True:
-            request = await completion_queue.get()
-            while not completion_queue.empty():
-                # discard stale requests to avoid choking the runtime
-                request = await completion_queue.get()
-            LOGGER.debug("received completion request %s", request)
-            # 5 is arbitrary, but is a good limit:
-            # too high will cause long load times
-            # too low can be not as useful
-            kernel.code_completion(request, docstrings_limit=5)
+            first = await completion_queue.get()
+            for command in collapse_out_of_band(completion_queue, first=first):
+                kernel.dispatch_out_of_band(command, docstrings_limit=5)
 
     async def listen() -> None:
         try:
@@ -504,9 +499,24 @@ def _launch_pyodide_kernel(
                     set_ui_element_queue,
                     asyncio_queue_reader,
                 ),
-                listen_completion(),
+                listen_out_of_band(),
             )
         finally:
-            teardown_kernel(kernel, ctx)
+            try:
+                try:
+                    _dispose_pyodide_lifecycle_items(ctx)
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to dispose Pyodide lifecycle items"
+                    )
+                try:
+                    await wait_for_wasm_runtime_work_async()
+                    await shutdown_wasm_runtime_work_async()
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to shut down Pyodide WASM runtime work"
+                    )
+            finally:
+                teardown_kernel(kernel, ctx)
 
     return RestartableTask(listen)

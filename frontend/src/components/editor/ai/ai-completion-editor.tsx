@@ -26,7 +26,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
-import { stagedAICellsAtom } from "@/core/ai/staged-cells";
+import { stripWrappingBackticks } from "@/core/ai/strip-wrapping-backticks";
 import { type AiCompletionCell, includeOtherCellsAtom } from "@/core/ai/state";
 import type { CellId } from "@/core/cells/ids";
 import { getCodes } from "@/core/codemirror/copilot/getCodes";
@@ -44,6 +44,7 @@ import {
   RejectCompletionButton,
 } from "./completion-handlers";
 import { addContextCompletion, getAICompletionBody } from "./completion-utils";
+import { stagedAICellsAtom } from "@/core/ai/staged-cells";
 
 const Original = CodeMirrorMerge.Original;
 const Modified = CodeMirrorMerge.Modified;
@@ -122,7 +123,6 @@ export const AiCompletionEditor: React.FC<Props> = ({
     api: runtimeManager.getAiURL("completion").toString(),
     headers: runtimeManager.headers(),
     initialInput: initialPrompt,
-    streamProtocol: "text",
     // Throttle the messages and data updates to 100ms
     experimental_throttle: 100,
     body: {
@@ -142,13 +142,14 @@ export const AiCompletionEditor: React.FC<Props> = ({
       });
     },
     onFinish: (_prompt, completion) => {
-      // Remove trailing new lines
-      setCompletion(completion.trimEnd());
+      setCompletion(stripWrappingBackticks(completion).trimEnd());
     },
   });
 
   const inputRef = React.useRef<ReactCodeMirrorRef>(null);
-  const completion = untrimmedCompletion.trimEnd();
+  const completion = stripWrappingBackticks(untrimmedCompletion, {
+    streaming: isLoading,
+  }).trimEnd();
 
   const initialSubmit = useCallback(() => {
     if (triggerImmediately && !isLoading && initialPrompt) {
@@ -192,9 +193,12 @@ export const AiCompletionEditor: React.FC<Props> = ({
     setCompletion("");
   };
 
+  // Reject discards the suggestion but keeps the prompt open for refinement.
   const handleDeclineCompletion = () => {
-    declineChange();
+    stop();
     setCompletion("");
+    setShowInputPrompt(true);
+    inputRef.current?.view?.focus();
   };
 
   const showCompletionBanner =
@@ -220,7 +224,7 @@ export const AiCompletionEditor: React.FC<Props> = ({
         showInputPrompt={showInputPrompt}
         setShowInputPrompt={setShowInputPrompt}
         runCell={runCell}
-        className="mt-4 mb-3 w-128"
+        className="mt-4 mb-3 w-lg"
       />
     </div>
   );

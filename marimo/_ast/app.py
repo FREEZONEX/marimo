@@ -66,7 +66,6 @@ from marimo._schemas.serialization import (
 from marimo._types.ids import CellId_t
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from types import FrameType, TracebackType
     from typing import TypeGuard
 
@@ -175,7 +174,7 @@ class _SetupContext:
     ) -> _SetupContext:
         """When called with parameters, update the setup cell config.
 
-        The setup cell was already registered when ``app.setup`` ran
+        The setup cell was already registered when `app.setup` ran
         (the property getter); this call updates that cell's config in
         place rather than re-registering.
         """
@@ -259,7 +258,6 @@ class App:
         self._cell_manager = CellManager(prefix=cell_prefix)
         self._graph = dataflow.DirectedGraph()
         self._execution_context: ExecutionContext | None = None
-        self._runner = dataflow.Runner(self._graph)
         self._header: str | None = None
 
         self._unparsable_code: list[str] = []
@@ -328,6 +326,7 @@ class App:
                             refs=cell_impl.refs,
                             sql_refs=cell_impl.sql_refs,
                             temporaries=cell_impl.temporaries,
+                            closed_over_temporaries=cell_impl.closed_over_temporaries,
                             variable_data=cell_impl.variable_data,
                             deleted_refs=cell_impl.deleted_refs,
                             body=cell_impl.body,
@@ -780,17 +779,23 @@ class App:
     async def _run_cell_async(
         self, cell: Cell, kwargs: dict[str, Any]
     ) -> tuple[Any, _Namespace]:
+        from marimo._runtime.runner import by_refs
+
         self._maybe_initialize()
-        output, defs = await self._runner.run_cell_async(
-            cell._cell.cell_id, kwargs
+        output, defs = await by_refs.run_cell_async(
+            self._graph, cell._cell.cell_id, kwargs
         )
         return output, _Namespace(defs, owner=self)
 
     def _run_cell_sync(
         self, cell: Cell, kwargs: dict[str, Any]
     ) -> tuple[Any, _Namespace]:
+        from marimo._runtime.runner import by_refs
+
         self._maybe_initialize()
-        output, defs = self._runner.run_cell_sync(cell._cell.cell_id, kwargs)
+        output, defs = by_refs.run_cell_sync(
+            self._graph, cell._cell.cell_id, kwargs
+        )
         return output, _Namespace(defs, owner=self)
 
     async def _set_ui_element_value(
@@ -1000,11 +1005,6 @@ class InternalApp:
     ) -> None:
         self._app._execution_context = execution_context
 
-    @property
-    def runner(self) -> dataflow.Runner:
-        self._app._maybe_initialize()
-        return self._app._runner
-
     def update_config(self, updates: dict[str, Any]) -> _AppConfig:
         return self.config.update(updates)
 
@@ -1031,12 +1031,12 @@ class InternalApp:
     ) -> InternalApp:
         """Rewrite the cell list from textual fields, in place.
 
-        Mutates ``self._app._cell_manager`` rather than replacing it,
-        so any caller holding ``app.cell_manager`` or
-        ``app.cell_manager.document`` (notably ``Session.document``)
+        Mutates `self._app._cell_manager` rather than replacing it,
+        so any caller holding `app.cell_manager` or
+        `app.cell_manager.document` (notably `Session.document`)
         continues to see live state without rebinding.
 
-        Cells that survive the rewrite keep their compiled ``Cell``;
+        Cells that survive the rewrite keep their compiled `Cell`;
         callers from save flows pass the frontend's snapshot, which
         renames/reorders/reconfigures cells but doesn't recompile.
         """
@@ -1053,7 +1053,8 @@ class InternalApp:
                 config=config,
                 cell=prev_compiled.get(cell_id),
             )
-        cm._replace_state_from(rebuilt)
+
+        cm.apply_diff_from(rebuilt, source="cell-manager")
         return self
 
     async def run_cell_async(

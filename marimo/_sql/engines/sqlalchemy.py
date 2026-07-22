@@ -23,9 +23,12 @@ from marimo._data.models import (
     Schema,
 )
 from marimo._dependencies.dependencies import DependencyManager
-from marimo._sql.engines.types import InferenceConfig, SQLConnection
+from marimo._sql.engines.types import (
+    InferenceConfig,
+    SQLConnection,
+    default_inference_config,
+)
 from marimo._sql.utils import (
-    CHEAP_DISCOVERY_DATABASES,
     convert_to_output,
     sql_type_to_data_type,
 )
@@ -90,10 +93,10 @@ def safe_execute(
         fallback: Value returned when the wrapped function raises.
         message: Message written to the logger on failure.
         log_level: Logger level – must be one of
-            ``'debug'``, ``'info'``, ``'warning'``, or ``'error'``.
+            `'debug'`, `'info'`, `'warning'`, or `'error'`.
         silent_exceptions: Exception types that should return *fallback*
             without any logging.  Useful for expected control-flow
-            exceptions like ``NotImplementedError``.
+            exceptions like `NotImplementedError`.
     """
 
     def decorator(func: Callable[P, T]) -> Callable[P, T | F]:
@@ -164,8 +167,8 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         this opens a connection, executes the command, and yields an
         inspector bound to that connection.
 
-        For all other dialects, it yields ``self.inspector`` (which may
-        be ``None``).
+        For all other dialects, it yields `self.inspector` (which may
+        be `None`).
 
         Usage::
 
@@ -245,11 +248,7 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
 
     @property
     def inference_config(self) -> InferenceConfig:
-        return InferenceConfig(
-            auto_discover_schemas="auto",
-            auto_discover_tables="auto",
-            auto_discover_columns=False,
-        )
+        return default_inference_config()
 
     def get_default_database(self) -> str | None:
         """Get the current database name.
@@ -451,6 +450,7 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
                     name=database_name,
                     dialect=self.dialect,
                     schemas=schemas,
+                    schemas_resolved=should_include_schemas,
                     engine=self._engine_name,
                 )
             )
@@ -477,8 +477,11 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         database: str | None,
         include_tables: bool,
         include_table_details: bool,
+        schema_path: list[str] | None = None,
     ) -> list[Schema]:
         """Get all schemas and optionally their tables. Keys are schema names."""
+        if schema_path:
+            return []  # SQLAlchemy schemas don't nest
 
         if database is None:
             schema_names: list[str] = []
@@ -493,16 +496,28 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
 
         schemas: list[Schema] = []
 
+        meta_schemas = self._get_meta_schemas()
         for schema in schema_names:
+            # Eager table discovery is skipped for meta schemas.
+            # The user can still expand the schema to lazily fetch them
+            # so we mark `tables_resolved=False` to reflect that no enumeration actually ran.
+            did_resolve_tables = (
+                include_tables and schema.lower() not in meta_schemas
+            )
             tables: list[DataTable] = []
-            meta_schemas = self._get_meta_schemas()
-            if schema.lower() not in meta_schemas and include_tables:
+            if did_resolve_tables:
                 tables = self.get_tables_in_schema(
                     schema=schema,
                     database=database if database is not None else "",
                     include_table_details=include_table_details,
                 )
-            schemas.append(Schema(name=schema, tables=tables))
+            schemas.append(
+                Schema(
+                    name=schema,
+                    tables=tables,
+                    tables_resolved=did_resolve_tables,
+                )
+            )
 
         return schemas
 
@@ -535,9 +550,15 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
             ), inspector.get_view_names(schema=schema)
 
     def get_tables_in_schema(
-        self, *, schema: str, database: str, include_table_details: bool
+        self,
+        *,
+        schema: str,
+        database: str,
+        include_table_details: bool,
+        schema_path: list[str] | None = None,
     ) -> list[DataTable]:
         """Return all tables in a schema."""
+        del schema_path  # SQLAlchemy schemas don't nest
 
         table_names, view_names = self._get_table_names(
             schema=schema, database=database
@@ -641,9 +662,15 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
         return index_columns
 
     def get_table_details(
-        self, *, table_name: str, schema_name: str, database_name: str
+        self,
+        *,
+        table_name: str,
+        schema_name: str,
+        database_name: str,
+        schema_path: list[str] | None = None,
     ) -> DataTable | None:
         """Get a single table from the engine."""
+        del schema_path  # SQLAlchemy schemas don't nest
 
         columns = self._get_columns(
             table_name, schema=schema_name, database=database_name
@@ -712,17 +739,6 @@ class SQLAlchemyEngine(SQLConnection["Engine"]):
     ) -> DataType | None:
         col_type = engine_type.as_generic()
         return sql_type_to_data_type(str(col_type))
-
-    def _resolve_should_auto_discover(
-        self,
-        value: bool | Literal["auto"],
-    ) -> bool:
-        if value == "auto":
-            return self._is_cheap_discovery()
-        return value
-
-    def _is_cheap_discovery(self) -> bool:
-        return self.dialect.lower() in CHEAP_DISCOVERY_DATABASES
 
     @staticmethod
     def is_cursor_result(result: Any) -> bool:

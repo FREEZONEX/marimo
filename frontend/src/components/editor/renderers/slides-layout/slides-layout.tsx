@@ -3,6 +3,7 @@ import React, { useMemo, useState } from "react";
 import { useAtomValue } from "jotai";
 import { numColumnsAtom } from "@/core/cells/cells";
 import type { CellId } from "@/core/cells/ids";
+import { kioskModeAtom } from "@/core/mode";
 import type { ICellRendererProps } from "../types";
 import type { SlidesLayout } from "./types";
 import { computeSlideCellsInfo } from "./compute-slide-cells";
@@ -21,24 +22,25 @@ export const SlidesLayoutRenderer: React.FC<Props> = ({
   cells,
   mode,
 }) => {
-  const isReading = mode === "read";
+  // Kiosk clients (e.g. reveal.js's speaker-view iframes) are read-only and
+  // shouldn't show authoring chrome, so we collapse to the read-mode layout.
+  const kioskMode = useAtomValue(kioskModeAtom);
+  const isReading = mode === "read" || kioskMode;
   const numColumns = useAtomValue(numColumnsAtom);
   const isMultiColumn = numColumns > 1;
   const [activeCellId, setActiveCellId] = useState<CellId | null>(null);
 
-  const { cellsWithOutput, skippedIds, slideTypes, startCellIndex } = useMemo(
-    () => computeSlideCellsInfo(cells, layout),
-    [cells, layout],
-  );
+  const { slideCells, skippedIds, noOutputIds, slideTypes, startCellIndex } =
+    useMemo(() => computeSlideCellsInfo(cells, layout), [cells, layout]);
 
   const activeSlideIndex = activeCellId
-    ? cellsWithOutput.findIndex((c) => c.id === activeCellId)
+    ? slideCells.findIndex((c) => c.id === activeCellId)
     : startCellIndex;
   const resolvedIndex =
     activeSlideIndex === -1 ? startCellIndex : activeSlideIndex;
 
   const handleSlideChange = useEvent((index: number) => {
-    const cell = cellsWithOutput[index];
+    const cell = slideCells[index];
     if (cell) {
       setActiveCellId(cell.id);
     }
@@ -46,20 +48,30 @@ export const SlidesLayoutRenderer: React.FC<Props> = ({
 
   const slides = (
     <LazySlidesComponent
-      cellsWithOutput={cellsWithOutput}
+      slideCells={slideCells}
       layout={layout}
       setLayout={setLayout}
+      noOutputIds={noOutputIds}
       activeIndex={resolvedIndex}
       onSlideChange={handleSlideChange}
-      configWidth={300}
-      mode={mode}
-      isEditable={mode !== "read"}
+      configWidth={280}
+      mode={isReading ? "read" : mode}
+      isEditable={!isReading}
     />
   );
 
   if (isReading) {
-    // Cap the deck height and derive width from height via aspect-video so it stays 16:9 without
-    // ballooning to the full viewport on wide screens.
+    // In kiosk mode (e.g. reveal.js's speaker-view iframes), anchor to the
+    // iframe viewport with `dvh`/`dvw` so the deck resizes with the popup
+    // window. The non-kiosk read mode keeps its 16:9 cap so the deck doesn't
+    // balloon to the full viewport on wide screens.
+    if (kioskMode) {
+      return (
+        <div className="flex h-dvh w-dvw overflow-hidden bg-background">
+          {slides}
+        </div>
+      );
+    }
     return (
       <div className="p-4 flex flex-1 items-center justify-center min-h-0">
         <div className="h-full max-h-[95vh] aspect-video max-w-full flex">
@@ -70,15 +82,14 @@ export const SlidesLayoutRenderer: React.FC<Props> = ({
   }
 
   return (
-    <div className="pr-18 pb-2 flex flex-row gap-2 min-h-0">
+    <div className="flex-1 pr-18 pb-2 flex flex-row gap-2 min-h-0">
       <SlidesMinimap
-        cells={cellsWithOutput}
+        cells={slideCells}
         thumbnailWidth={220}
         canReorder={!isMultiColumn}
-        activeCellId={
-          activeCellId ?? cellsWithOutput[startCellIndex]?.id ?? null
-        }
+        activeCellId={activeCellId ?? slideCells[startCellIndex]?.id ?? null}
         skippedIds={skippedIds}
+        noOutputIds={noOutputIds}
         slideTypes={slideTypes}
         onSlideClick={handleSlideChange}
       />

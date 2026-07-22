@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+from marimo._ast.variables import is_mangled_local
 from marimo._config.config import DEFAULT_CONFIG
 from marimo._dependencies.dependencies import DependencyManager
 from marimo._messaging.cell_output import CellChannel
@@ -329,26 +330,6 @@ class TestExecution:
 
         # Make sure the array and its child are updated
         assert k.globals["state"] == 5
-
-    async def test_set_local_var_ui_element_value(
-        self, any_kernel: Kernel
-    ) -> None:
-        k = any_kernel
-        await k.run([ExecuteCellCommand("0", "import marimo as mo")])
-        await k.run(
-            [ExecuteCellCommand("1", "_s = mo.ui.slider(0, 10, value=1); _s")]
-        )
-        # _s's name is mangled to _cell_1_s because it is local
-        assert k.globals["_cell_1_s"].value == 1
-
-        element_id = k.globals["_cell_1_s"]._id
-        # This shouldn't crash the kernel, and s's value should still be
-        # updated
-        await k.set_ui_element_value(
-            UpdateUIElementCommand.from_ids_and_values([(element_id, 5)]),
-            notify_frontend=False,
-        )
-        assert k.globals["_cell_1_s"].value == 5
 
     async def test_creation_with_ui_element_value(
         self, any_kernel: Kernel
@@ -1677,6 +1658,71 @@ except NameError:
         # Does not pollute globals, reverts back to 10
         assert k.globals["z"] == 10
 
+    @staticmethod
+    async def test_run_scratch_with_mo_cache_decorator(
+        mocked_kernel: MockedKernel,
+    ) -> None:
+        """Regression test: @mo.cache decoration inside the scratchpad must
+        not raise `KeyError: '__scratch__'`.
+
+        Before the fix that registers SCRATCH_CELL_ID in the kernel's main
+        graph during run_scratchpad, the cache decorator's `_set_context`
+        crashed at `graph.cells[cell_id]` because `__scratch__` lived only
+        in the Runner's local graph, never in `self.graph`.
+        """
+        k = mocked_kernel.k
+        await k.run_scratchpad(
+            "import marimo as mo\n@mo.cache\ndef f(x): return x * 2\nf(3)"
+        )
+        # No KeyError leaked
+        assert not any(
+            "__scratch__" in m for m in mocked_kernel.stderr.messages
+        )
+        # __scratch__ does not linger in the main graph after teardown
+        assert SCRATCH_CELL_ID not in k.graph.cells
+        # Scratchpad does not pollute globals
+        assert "f" not in k.globals
+
+    @staticmethod
+    async def test_run_scratch_with_persistent_cache_context(
+        mocked_kernel: MockedKernel,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """Regression test: `with mo.persistent_cache(...)` in scratchpad
+        must not raise CacheException via the parallel
+        `_cache_context.trace` code path.
+        """
+        k = mocked_kernel.k
+        await k.run_scratchpad(
+            "import marimo as mo\n"
+            "from pathlib import Path\n"
+            f"with mo.persistent_cache('scratch_test', save_path=Path({str(tmp_path)!r})):\n"
+            "    x = sum(range(100))\n"
+            "x"
+        )
+        assert not any(
+            "CacheException" in m or "Could not resolve cell" in m
+            for m in mocked_kernel.stderr.messages
+        )
+        assert SCRATCH_CELL_ID not in k.graph.cells
+
+    @staticmethod
+    async def test_run_scratch_with_mo_cache_cleans_up_after_crash(
+        mocked_kernel: MockedKernel,
+    ) -> None:
+        """Regression test: if the scratchpad raises AFTER decorating,
+        `__scratch__` is still unregistered from the kernel graph (the
+        `try/finally` correctness guard).
+        """
+        k = mocked_kernel.k
+        await k.run_scratchpad(
+            "import marimo as mo\n"
+            "@mo.cache\n"
+            "def f(x): return x * 2\n"
+            "raise RuntimeError('intentional')"
+        )
+        assert SCRATCH_CELL_ID not in k.graph.cells
+
     async def test_rename(
         self, any_kernel: Kernel, exec_req: ExecReqProvider
     ) -> None:
@@ -1694,9 +1740,71 @@ except NameError:
         self, k: Kernel, exec_req: ExecReqProvider
     ) -> None:
         await k.run([er := exec_req.get("_x = 1")])
-        assert k.globals[f"_cell_{er.cell_id}_x"] == 1
-        await k.run([ExecuteCellCommand(er.cell_id, "None")])
-        assert f"_cell_{er.cell_id}_x" not in k.globals
+        assert not any(is_mangled_local(name) for name in k.globals)
+
+    async def test_temporary_closed_over_by_function_not_deleted(
+        self, k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        await k.run([exec_req.get("_x = 1\ndef fn():\n    return _x")])
+        assert k.globals["fn"]() == 1
+
+    async def test_temporary_closed_over_by_lambda_not_deleted(
+        self, k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        await k.run([exec_req.get("_x = 1\nlam = lambda: _x")])
+        assert k.globals["lam"]() == 1
+
+    async def test_temporary_closed_over_by_class_not_deleted(
+        self, k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        await k.run(
+            [
+                exec_req.get(
+                    "_x = 1\nclass C:\n    def m(self):\n        return _x"
+                )
+            ]
+        )
+        assert k.globals["C"]().m() == 1
+
+    async def test_transitive_temporary_closed_over_not_deleted(
+        self, k: Kernel, exec_req: ExecReqProvider
+    ) -> None:
+        # `foo` closes over the private helper `_helper`, which in turn closes
+        # over `_data`; both temporaries must survive for `foo` to be callable.
+        await k.run(
+            [
+                exec_req.get(
+                    "_data = 1\n"
+                    "def _helper():\n    return _data\n"
+                    "def foo():\n    return _helper()"
+                )
+            ]
+        )
+        assert k.globals["foo"]() == 1
+
+    async def test_temporary_last_expression_retained_as_output(
+        self, k: Kernel
+    ) -> None:
+        # A cell whose last expression is a temporary UI element: the temporary
+        # is deleted from globals, but the kernel should hang on to a reference.
+        # This is needed for RPCs in particular.
+        await k.run(
+            [ExecuteCellCommand(cell_id="0", code="import marimo as mo")]
+        )
+        await k.run(
+            [
+                ExecuteCellCommand(
+                    cell_id="1",
+                    code="_s = mo.ui.slider(0, 10, value=1); _s",
+                )
+            ]
+        )
+        # The temporary is gone from globals ...
+        assert not any(is_mangled_local(name) for name in k.globals)
+        # ... but the kernel retains it as the cell's output.
+        output = k.graph.cells["1"].output
+        assert isinstance(output, UIElement)
+        assert output.value == 1
 
     async def test_private_recursive_function(
         self, any_kernel: Kernel, exec_req: ExecReqProvider
@@ -1773,6 +1881,37 @@ except NameError:
                 assert cell_notification.run_id is None
             else:
                 assert cell_notification.run_id is not None
+
+    async def test_serialization_hint_cleared_only_on_demotion(
+        self, mocked_kernel: MockedKernel, exec_req: ExecReqProvider
+    ) -> None:
+        import msgspec
+
+        k = mocked_kernel.k
+
+        def serialization_hints() -> list[str | None]:
+            stream = MockStream(mocked_kernel.stream)
+            return [
+                cn.serialization
+                for op in stream.operations
+                if op["op"] == "cell-op"
+                for cn in [parse_raw(op, CellNotification)]
+                if cn.serialization is not msgspec.UNSET
+            ]
+
+        # A top-level definition advertises its reusability hint.
+        req = exec_req.get("def foo():\n    return 1")
+        await k.run([req])
+        assert serialization_hints() == ["Valid"]
+
+        # Editing it into a plain assignment clears the hint exactly once
+        # (an explicit None, not an omitted/UNSET field).
+        await k.run([exec_req.get_with_id(req.cell_id, "x = 1")])
+        assert serialization_hints() == ["Valid", None]
+
+        # Re-running the now-ordinary cell emits no further serialization op.
+        await k.run([exec_req.get_with_id(req.cell_id, "x = 2")])
+        assert serialization_hints() == ["Valid", None]
 
     async def test_sync_graph_basic(self, execution_kernel: Kernel) -> None:
         """Test basic synchronization: file changes cell B in A→B→C chain.
@@ -2554,6 +2693,28 @@ class TestStoredOutput:
         assert len(output_ops) > 0
         op_names = [op.get("op") for op in stream.operations]
         assert "missing-package-alert" in op_names
+
+    async def test_marimo_submodule_not_reported_as_missing(
+        self, mocked_kernel: MockedKernel, exec_req: ExecReqProvider
+    ) -> None:
+        """A failed `import marimo.<x>` must not raise a missing-package alert.
+
+        marimo is always installed; a missing submodule can't be fixed by
+        installing marimo, so we never nudge callers (e.g. code_mode) to
+        install it.
+        """
+        k = mocked_kernel.k
+        assert k.packages_callbacks.package_manager is not None
+
+        await k.run(
+            [
+                exec_req.get("import marimo.this_submodule_does_not_exist"),
+            ]
+        )
+
+        stream = MockStream(mocked_kernel.stream)
+        op_names = [op.get("op") for op in stream.operations]
+        assert "missing-package-alert" not in op_names
 
 
 class TestDisable:
@@ -3634,6 +3795,35 @@ class TestErrorHandling:
         assert errors[0].exception_type == "ValueError"
         assert errors[0].traceback is not None
         assert "ValueError" in errors[0].traceback
+
+    async def test_name_error_includes_suggestion(
+        self, mocked_kernel: MockedKernel, exec_req: ExecReqProvider
+    ) -> None:
+        """A NameError's "Did you mean: ..." suggestion should not be
+        dropped from the error message (regression test)."""
+        k = mocked_kernel.k
+        await k.run(
+            [
+                exec_req.get("aaa = 1"),
+                exec_req.get("print(aa)"),
+            ]
+        )
+        cell_notifications = mocked_kernel.stream.cell_notifications
+        error_cell_notification = _filter_to_error_ops(cell_notifications)
+        assert len(error_cell_notification) == 1
+        errors = _parse_error_output(error_cell_notification[0])
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], MarimoExceptionRaisedError)
+        assert errors[0].exception_type == "NameError"
+        # The base message is stable across all supported Python versions.
+        assert errors[0].msg.startswith("name 'aa' is not defined")
+        # Python 3.13 was the first release where `TracebackException`
+        # exposes the "Did you mean: ..." hint via `format_exception_only`,
+        # which is what the runtime uses to build the message. On 3.10-3.12
+        # the helper degrades to the base message; see test_tracebacks.py.
+        if sys.version_info >= (3, 13):
+            assert "Did you mean: 'aaa'?" in errors[0].msg
 
     async def test_error_handling_in_run_mode_stop(
         self, run_mode_kernel: MockedKernel, exec_req: ExecReqProvider

@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
-from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,30 +16,15 @@ from marimo._lint.rule_engine import EarlyStoppingConfig, RuleEngine
 from marimo._loggers import capture_output
 from marimo._schemas.serialization import NotebookSerialization
 from marimo._utils import async_path
+from marimo._utils.generated_with import (
+    contents_differ_excluding_generated_with,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
     from marimo._config.config import LintConfig
     from marimo._lint.rules.base import LintRule
-
-
-def contents_differ_excluding_generated_with(
-    original: str, generated: str
-) -> bool:
-    """Compare file contents while ignoring __generated_with differences.
-
-    This prevents unnecessary file writes when only the __generated_with
-    version metadata differs between the original and generated content.
-    """
-    # Regex to match the __generated_with line
-    pattern = r"^__generated_with = .*$"
-
-    # Remove __generated_with lines from both contents
-    orig_cleaned = re.sub(pattern, "", original, flags=re.MULTILINE).strip()
-    gen_cleaned = re.sub(pattern, "", generated, flags=re.MULTILINE).strip()
-
-    return orig_cleaned != gen_cleaned
 
 
 async def _to_async_iterator(
@@ -120,7 +103,7 @@ class Linter:
     def _rule_engine_for_file(self, file_path: str) -> RuleEngine:
         """Return a RuleEngine for the given file.
 
-        If the file contains PEP 723 ``[tool.marimo.lint]`` metadata and no
+        If the file contains PEP 723 `[tool.marimo.lint]` metadata and no
         explicit rules were provided, create a per-file engine that merges
         the file-level config with the global lint config.
         """
@@ -208,8 +191,11 @@ class Linter:
             file_status.skipped = True
             file_status.message = f"Skipped: {file_path} (empty file)"
         elif load_result.status == "invalid":
-            if self.ignore_scripts:
-                # Skip this file silently when ignore_scripts is enabled
+            # Markdown is skipped unconditionally: `marimo check` globs all
+            # `.md`/`.qmd` files, and most are plain documentation. Failing on
+            # them (as with non-marimo Python scripts) would be too noisy.
+            if self.ignore_scripts or file_path.endswith((".md", ".qmd")):
+                # Skip this file silently when ignore_scripts is enabled (or for plain markdown).
                 file_status.skipped = True
                 file_status.message = (
                     f"Skipped: {file_path} (not a marimo notebook)"

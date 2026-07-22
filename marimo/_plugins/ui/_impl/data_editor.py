@@ -128,7 +128,7 @@ class data_editor(
     https://github.com/marimo-team/marimo/issues.
 
     The data can be supplied as:
-    1. a Pandas, Polars, or Pyarrow DataFrame
+    1. an eager dataframe (e.g., Polars, Pandas, PyArrow)
     2. a list of dicts, with one dict for each row, keyed by column names
     3. a dict of lists, with each list representing a column
 
@@ -240,7 +240,14 @@ class data_editor(
         self, value: DataEdits
     ) -> RowOrientedData | ColumnOrientedData | IntoDataFrame:
         self._edits = value
-        return apply_edits(deepcopy(self._data), value)
+        # list/dict edit paths mutate in place, so deepcopy first.
+        # The dataframe path constructs a new native frame via narwhals
+        # without mutating the input — and not all dataframes are picklable
+        # (e.g., DuckDBPyRelation), so skip the deepcopy in that case.
+        data = self._data
+        if isinstance(data, (list, dict)):
+            data = deepcopy(data)
+        return apply_edits(data, value)
 
     def __hash__(self) -> int:
         return id(self)
@@ -332,16 +339,9 @@ def _convert_value(
                 return datetime.date.fromisoformat(value)
             elif dtype == nw.Duration:
                 return datetime.timedelta(microseconds=float(value))
-            elif dtype == nw.Float32 or dtype == nw.Float64:
+            elif hasattr(dtype, "is_float") and dtype.is_float():
                 return float(value)
-            elif (
-                dtype == nw.Int16
-                or dtype == nw.Int32
-                or dtype == nw.Int64
-                or dtype == nw.UInt16
-                or dtype == nw.UInt32
-                or dtype == nw.UInt64
-            ):
+            elif hasattr(dtype, "is_integer") and dtype.is_integer():
                 return int(value)
             elif (
                 dtype == nw.String

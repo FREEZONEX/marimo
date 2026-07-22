@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock, patch
 
 import narwhals.stable.v2 as nw
@@ -64,9 +64,19 @@ class TestDataframes:
     @staticmethod
     @pytest.mark.parametrize(
         "df",
+        create_dataframes({"A": [1, 2, 3], "B": ["a", "a", "a"]}),
+    )
+    def test_dataframe_supports_dataframe_backends(df: Any) -> None:
+        subject = ui.dataframe(df)
+        # Construction should succeed and the value should round-trip to the
+        # original native type for each supported dataframe backend.
+        assert type(subject.value) is type(df)
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        "df",
         create_dataframes(
             {"A": [1, 2, 3], "B": ["a", "a", "a"]},
-            exclude=["pyarrow", "duckdb", "lazy-polars"],
         ),
     )
     def test_dataframe(df: IntoDataFrame) -> None:
@@ -82,6 +92,8 @@ class TestDataframes:
             [["A", "integer", "int64"], ["B", "string", "string"]],
             # pandas 3.x
             [["A", "integer", "int64"], ["B", "string", "str"]],
+            # pyarrow / duckdb (via narwhals)
+            [["A", "integer", "Int64"], ["B", "string", "String"]],
         ]
         assert subject._get_column_values(
             GetColumnValuesArgs(column="A")
@@ -136,7 +148,6 @@ class TestDataframes:
         "df",
         create_dataframes(
             {"1": [1, 2, 3], "2": ["a", "a", "a"]},
-            exclude=["pyarrow", "duckdb", "lazy-polars"],
         ),
     )
     def test_dataframe_page_size(df: IntoDataFrame) -> None:
@@ -171,7 +182,6 @@ class TestDataframes:
         "df",
         create_dataframes(
             {"A": [1, 2], "B": ["a", "b"]},
-            exclude=["pyarrow", "duckdb", "lazy-polars"],
         ),
     )
     def test_dataframe_format_mapping(df: IntoDataFrame) -> None:
@@ -193,18 +203,15 @@ class TestDataframes:
         [
             *create_dataframes(
                 {"A": [], "B": []},
-                exclude=["pyarrow", "duckdb", "lazy-polars"],
             ),  # Empty DataFrame
             *create_dataframes(
                 {"A": [1], "B": ["a"]},
-                exclude=["pyarrow", "duckdb", "lazy-polars"],
             ),  # Single row DataFrame
             *create_dataframes(
                 {
                     "A": range(1, 1001),
                     "B": [f"value_{i}" for i in range(1, 1001)],
                 },
-                exclude=["pyarrow", "duckdb", "lazy-polars"],
             ),  # Large DataFrame
         ],
     )
@@ -236,7 +243,6 @@ class TestDataframes:
         "df",
         create_dataframes(
             {"A": range(100), "B": ["a"] * 100},
-            exclude=["pyarrow", "duckdb", "lazy-polars"],
         ),
     )
     def test_dataframe_with_custom_page_size(df: IntoDataFrame) -> None:
@@ -285,7 +291,6 @@ class TestDataframes:
         "df",
         create_dataframes(
             {"A": range(1000), "B": ["a"] * 1000},
-            exclude=["pyarrow", "duckdb", "lazy-polars"],
         ),
     )
     def test_dataframe_with_limit(df: IntoDataFrame) -> None:
@@ -387,7 +392,7 @@ class TestDataframes:
     @pytest.mark.skipif(
         not HAS_DEPS, reason="optional dependencies not installed"
     )
-    @pytest.mark.parametrize("format_type", ["csv", "json", "parquet"])
+    @pytest.mark.parametrize("format_type", ["csv", "tsv", "json", "parquet"])
     def test_dataframe_download_formats(format_type) -> None:
         df = pd.DataFrame(
             {
@@ -405,6 +410,25 @@ class TestDataframes:
         data_bytes = from_data_uri(download_url)[1]
         assert len(data_bytes) > 0
         assert type(subject.value) is type(df)
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not HAS_DEPS, reason="optional dependencies not installed"
+    )
+    def test_dataframe_download_tsv_ignores_csv_separator() -> None:
+        # download_csv_separator configures CSV only; TSV always uses a tab.
+        df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+        subject = ui.dataframe(df, download_csv_separator=";")
+
+        tsv = from_data_uri(
+            subject._download_as(DownloadAsArgs(format="tsv")).url
+        )[1].decode("utf-8")
+        csv = from_data_uri(
+            subject._download_as(DownloadAsArgs(format="csv")).url
+        )[1].decode("utf-8")
+
+        assert tsv.splitlines()[0] == "a\tb"
+        assert csv.splitlines()[0] == "a;b"
 
     @staticmethod
     @pytest.mark.skipif(
@@ -439,6 +463,44 @@ class TestDataframes:
     @pytest.mark.skipif(
         not HAS_DEPS, reason="optional dependencies not installed"
     )
+    def test_dataframe_filter_rows_accepts_legacy_where_list() -> None:
+        # A filter_rows transform with a legacy list-shaped `where` must still
+        # filter the data instead of silently returning the original df.
+        df = pd.DataFrame(
+            {
+                "name": ["Alice", "Bob", "Charlie"],
+                "age": [25, 30, 35],
+            }
+        )
+        subject = ui.dataframe(df)
+
+        result = subject._convert_value(
+            {
+                "transforms": [
+                    {
+                        "type": "filter_rows",
+                        "operation": "keep_rows",
+                        "where": [
+                            {
+                                "type": "condition",
+                                "column_id": "age",
+                                "operator": ">",
+                                "value": 27,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        assert subject._error is None
+        assert type(result) is type(df)
+        assert sorted(result["name"].tolist()) == ["Bob", "Charlie"]
+
+    @staticmethod
+    @pytest.mark.skipif(
+        not HAS_DEPS, reason="optional dependencies not installed"
+    )
     def test_dataframe_download_empty() -> None:
         df = pd.DataFrame({"A": [], "B": []})
         subject = ui.dataframe(df)
@@ -461,9 +523,7 @@ class TestDataframes:
         with pytest.raises(ValueError) as exc_info:
             subject._download_as(DownloadAsArgs(format="xml"))
 
-        assert "format must be one of 'csv', 'json', or 'parquet'" in str(
-            exc_info.value
-        )
+        assert "format must be one of" in str(exc_info.value)
         assert type(subject.value) is type(df)
 
     @staticmethod
@@ -474,14 +534,13 @@ class TestDataframes:
         "df",
         create_dataframes(
             {"A": [1, 2, 3], "B": ["x", "y", "z"]},
-            exclude=["pyarrow", "duckdb", "lazy-polars"],
         ),
     )
     def test_dataframe_download_different_backends(df) -> None:
         subject = ui.dataframe(df)
 
         # Test that download works with different dataframe backends
-        for format_type in ["csv", "json", "parquet"]:
+        for format_type in ["csv", "tsv", "json", "parquet"]:
             try:
                 download_url = subject._download_as(
                     DownloadAsArgs(format=format_type)
@@ -525,7 +584,7 @@ class TestDataframes:
                 return_value="utf-8",
             ),
             patch(
-                "marimo._output.data.data.csv",
+                "marimo._output.data.data.any_data",
                 return_value=mock_vfile,
             ),
         ):
@@ -541,7 +600,6 @@ class TestDataframes:
         "df",
         create_dataframes(
             {"A": [1, 2, 3], "B": ["a", "b", "c"]},
-            exclude=["pyarrow", "duckdb", "lazy-polars"],
         ),
     )
     def test_dataframe_error_handling(df: IntoDataFrame) -> None:
@@ -886,37 +944,38 @@ def test_base_exception_handling():
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
-def test_dataframe_render_args_carry_size_bytes() -> None:
+def test_dataframe_get_size_bytes_rpc_extrapolates() -> None:
     import pandas as pd
 
-    df = pd.DataFrame({"a": [1, 2, 3]})
+    from marimo._plugins.ui._impl.table import GetSizeBytesResponse
+
+    df = pd.DataFrame({"a": list(range(2000))})
     subject = ui.dataframe(df)
-    args = subject._component_args  # type: ignore[attr-defined]
-    assert args["size-bytes"] == len(
-        subject._manager.to_json(strict_json=True)
-    )
+    resp = subject._get_size_bytes(EmptyArgs())
+    assert isinstance(resp, GetSizeBytesResponse)
+    assert resp.size_bytes is not None
+    exact = len(subject._manager.to_json(strict_json=True))
+    assert abs(resp.size_bytes - exact) / exact < 0.25
 
 
 @pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
-def test_dataframe_get_dataframe_response_carries_size_bytes() -> None:
+def test_dataframe_get_size_bytes_rpc_returns_none_on_serialization_failure() -> (
+    None
+):
+    from unittest.mock import patch
+
     import pandas as pd
 
-    df = pd.DataFrame({"a": [1, 2, 3]})
-    subject = ui.dataframe(df)
-    response = subject._get_dataframe(EmptyArgs())
-    assert response.size_bytes == len(
-        subject._manager.to_json(strict_json=True)
-    )
+    from marimo._plugins.ui._impl.table import GetSizeBytesResponse
 
+    subject = ui.dataframe(pd.DataFrame({"a": [1, 2, 3]}))
+    manager_cls = type(subject._manager)
 
-@pytest.mark.skipif(not HAS_DEPS, reason="optional dependencies not installed")
-def test_dataframe_get_json_size_bytes_fails_open() -> None:
-    import pandas as pd
+    def _raise(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("boom")
 
-    subject = ui.dataframe(pd.DataFrame({"a": [1]}))
+    with patch.object(manager_cls, "to_json_str", _raise):
+        resp = subject._get_size_bytes(EmptyArgs())
 
-    class _Boom:
-        def to_json(self, **_: object) -> str:
-            raise RuntimeError("boom")
-
-    assert subject._get_json_size_bytes(_Boom()) is None  # type: ignore[arg-type]
+    assert isinstance(resp, GetSizeBytesResponse)
+    assert resp.size_bytes is None

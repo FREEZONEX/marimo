@@ -86,7 +86,8 @@ The chat panel currently supports the following modes:
 
 - **Manual**: No tool access; the AI responds based only on the conversation and manually injected context
 - **Ask**: Enables read-only [AI tools](tools.md) and [tools from added MCP Client servers](mcp.md#mcp-client) for context gathering, allowing the assistant to inspect your notebooks
-- **Agent** (beta): Enables all tools in **Ask Mode** plus additional tools to [edit notebook cells (add, remove, update) and run stale cells](tools.md#editing-agent-mode-only).
+- **Agent**: Enables all tools in **Ask Mode** plus additional tools to [edit notebook cells (add, remove, update) and run stale cells](tools.md#editing-agent-mode-only)
+- **Code mode**: Gives the assistant access to the [notebook kernel](tools.md#code-mode) which allows the assistant to inspect the marimo runtime and manipulate the notebook in powerful ways.
 
 ??? tip "See the chat panel in action"
 
@@ -151,6 +152,19 @@ You can configure the following providers:
 * and any OpenAI-compatible provider
 
 See the [llm_providers](../configuration/llm_providers.md) guide for detailed instructions on how to configure each provider.
+
+## Hide AI actions and panels
+
+If you don't use marimo's AI assistant, you can hide AI actions and panels in the editor:
+
+```toml title="marimo.toml"
+[ai]
+enabled = false
+```
+
+This hides AI assistant surfaces such as the Chat panel and Generate with AI. Code completion settings including GitHub Copilot, remain available.
+
+You can still collaborate with an AI agent using [marimo pair](../generate_with_ai/marimo_pair.md).
 
 ## Agents
 

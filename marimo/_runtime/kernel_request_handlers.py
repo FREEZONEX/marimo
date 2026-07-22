@@ -9,6 +9,7 @@ from marimo._messaging.notebook.document import (
     NotebookDocument,
     notebook_document_context,
 )
+from marimo._messaging.notebook.outputs import notebook_outputs_context
 from marimo._messaging.notification import (
     CompletedRunNotification,
     FunctionCallResultNotification,
@@ -103,12 +104,13 @@ class KernelRequestHandlers:
         try:
             with (
                 notebook_document_context(doc),
+                notebook_outputs_context(request.cell_outputs),
                 http_request_context(request.request),
             ):
                 await self._kernel.run_scratchpad(request.code)
         finally:
-            # Always emit completion so a waiting ``ScratchCellListener``
-            # doesn't block forever if ``run_scratchpad`` raises.
+            # Always emit completion so a waiting `ScratchCellListener`
+            # doesn't block forever if `run_scratchpad` raises.
             broadcast_notification(
                 CompletedRunNotification(run_id=request.run_id)
             )
@@ -165,13 +167,14 @@ class KernelRequestHandlers:
     async def _handle_function_call(
         self, request: InvokeFunctionCommand
     ) -> None:
-        status, ret, _ = await self._kernel.function_call_request(request)
+        status, ret, found = await self._kernel.function_call_request(request)
         LOGGER.debug("Function returned with status %s", status)
         broadcast_notification(
             FunctionCallResultNotification(
                 function_call_id=request.function_call_id,
                 return_value=ret,
                 status=status,
+                found=found,
             ),
         )
 

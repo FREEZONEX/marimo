@@ -1817,7 +1817,7 @@ def _extract_bars_numpy(
         selected_indices = np.where(pos_mask)[0]
 
         # Iterate only over selected indices
-        for i in selected_indices:
+        for i in selected_indices.tolist():
             if not _bar_value_in_selection_range(
                 trace, i, value_data[i], value_min, value_max
             ):
@@ -2031,9 +2031,9 @@ def _compute_waterfall_bar_extents(
     Waterfall bars stack on top of each other, so the visual position of
     each bar depends on the cumulative sum of preceding relative bars:
 
-    * ``"absolute"`` — bar runs from *base* to y[i]; resets running total.
-    * ``"relative"`` — bar runs from running_total to running_total + y[i].
-    * ``"total"``    — bar runs from *base* to running_total (display only;
+    * `"absolute"` — bar runs from *base* to y[i]; resets running total.
+    * `"relative"` — bar runs from running_total to running_total + y[i].
+    * `"total"`    — bar runs from *base* to running_total (display only;
       does not alter the running total).
     """
     running_total = base
@@ -2385,13 +2385,13 @@ def _append_violin_points_to_selection(
     """Expand violin plot selections into individual underlying data points.
 
     Handles three cases:
-    - Range/lasso with individual points already sent by Plotly (``points``
+    - Range/lasso with individual points already sent by Plotly (`points`
       enabled): Plotly already delivered the right individual data points via
-      the ``onSelected`` event; pass them through unchanged.
-    - Range/lasso without individual points (``points`` disabled): extract
+      the `onSelected` event; pass them through unchanged.
+    - Range/lasso without individual points (`points` disabled): extract
       all underlying sample rows whose category position overlaps the selection
       range from the figure data.
-    - Click events (no range/lasso): the frontend sends ``pointNumbers`` for
+    - Click events (no range/lasso): the frontend sends `pointNumbers` for
       the clicked violin element; expand these into one dict per sample row so
       Python callers get row-level data.
     """
@@ -2573,7 +2573,7 @@ def _extract_violin_points_from_range(
     horizontal) and the value axis are compared against the selection range.
     Only sample rows whose category group overlaps the selection *and* whose
     individual value falls within the value-axis bounds are returned.  When the
-    value-axis range is absent from ``range_data`` (e.g. a selection spanning
+    value-axis range is absent from `range_data` (e.g. a selection spanning
     the full y-axis) all rows in matching categories are included.
     """
     if DependencyManager.numpy.has():
@@ -2588,7 +2588,7 @@ def _extract_violin_points_numpy(
 
     Filters by both the category axis (which violin group falls inside the
     selection box) and the value axis (which individual sample values fall
-    inside the selection box).  When ``points`` is disabled in the Plotly
+    inside the selection box).  When `points` is disabled in the Plotly
     figure, Plotly does not send individual point coordinates, so we derive
     inclusion from the underlying trace arrays.
     """
@@ -2736,18 +2736,18 @@ def _append_box_points_to_selection(
     """Expand box plot selections into individual underlying data points.
 
     Handles three cases:
-    - Range/lasso with individual points already sent by Plotly (``boxpoints``
+    - Range/lasso with individual points already sent by Plotly (`boxpoints`
       enabled): Plotly already delivered the right individual data points via
-      the ``onSelected`` event; pass them through unchanged.
-    - Range/lasso without individual points (``boxpoints`` disabled): extract
+      the `onSelected` event; pass them through unchanged.
+    - Range/lasso without individual points (`boxpoints` disabled): extract
       all underlying sample rows whose category position overlaps the selection
       range from the figure data.
-    - Click events (no range/lasso): the frontend sends ``pointNumbers`` for
+    - Click events (no range/lasso): the frontend sends `pointNumbers` for
       the clicked box/whisker element; expand these into one dict per sample
       row so Python callers get row-level data.
 
-    This also handles strip charts (``px.strip()``) which are rendered as
-    ``go.Box`` traces with ``boxpoints="all"`` and transparent fills.
+    This also handles strip charts (`px.strip()`) which are rendered as
+    `go.Box` traces with `boxpoints="all"` and transparent fills.
     """
     all_points = cast(list[dict[str, Any]], selection_data.get("points", []))
     all_indices = cast(list[Any], selection_data.get("indices", []))
@@ -3564,11 +3564,9 @@ def _extract_funnel_stages_numpy(
         val_mask = val_arr >= val_min
 
         mask = cat_mask & val_mask
-        for i in np.where(mask)[0]:
+        for i in np.where(mask)[0].tolist():
             selected.append(
-                _build_funnel_stage_point(
-                    trace, trace_idx, int(i), x_data, y_data
-                )
+                _build_funnel_stage_point(trace, trace_idx, i, x_data, y_data)
             )
 
     return selected

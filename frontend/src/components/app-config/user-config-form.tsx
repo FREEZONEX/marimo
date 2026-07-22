@@ -58,7 +58,11 @@ import { AiConfig } from "./ai-config";
 import { formItemClasses, SettingGroup } from "./common";
 import { DataForm } from "./data-form";
 import { applyManualInjections, getDirtyValues } from "./get-dirty-values";
-import { IsOverridden } from "./is-overridden";
+import {
+  IsOverridden,
+  OverriddenFormField,
+  useConfigOverride,
+} from "./is-overridden";
 import { OptionalFeatures } from "./optional-features";
 
 const categories = [
@@ -215,6 +219,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
   });
 
   const isWasmRuntime = isWasm();
+  const getOverride = useConfigOverride();
   const htmlCheckboxId = useId();
   const ipynbCheckboxId = useId();
 
@@ -224,10 +229,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
         return (
           <>
             <SettingGroup title="Autosave">
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="save.autosave"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <FormItem className={formItemClasses}>
                     <FormLabel className="font-normal">
                       Autosave enabled
@@ -235,57 +240,61 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                     <FormControl>
                       <Checkbox
                         data-testid="autosave-checkbox"
-                        checked={field.value === "after_delay"}
-                        disabled={field.disabled}
+                        checked={override.value === "after_delay"}
+                        disabled={field.disabled || override.isOverridden}
                         onCheckedChange={(checked) => {
                           field.onChange(checked ? "after_delay" : "off");
                         }}
                       />
                     </FormControl>
                     <FormMessage />
-                    <IsOverridden userConfig={config} name="save.autosave" />
+                    <IsOverridden override={override} />
                   </FormItem>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="save.autosave_delay"
-                render={({ field }) => (
-                  <FormItem className={formItemClasses}>
-                    <FormLabel>Autosave delay (seconds)</FormLabel>
-                    <FormControl>
-                      <NumberField
-                        aria-label="Autosave delay"
-                        data-testid="autosave-delay-input"
-                        className="m-0 w-24"
-                        isDisabled={
-                          form.getValues("save.autosave") !== "after_delay"
-                        }
-                        {...field}
-                        value={field.value / 1000}
-                        minValue={1}
-                        onChange={(value) => {
-                          field.onChange(value * 1000);
-                          if (!Number.isNaN(value)) {
-                            onSubmit(form.getValues());
+                render={({ field, override }) => {
+                  const autosave = getOverride(
+                    "save.autosave",
+                    form.getValues("save.autosave"),
+                  );
+                  return (
+                    <FormItem className={formItemClasses}>
+                      <FormLabel>Autosave delay (seconds)</FormLabel>
+                      <FormControl>
+                        <NumberField
+                          aria-label="Autosave delay"
+                          data-testid="autosave-delay-input"
+                          className="m-0 w-24"
+                          isDisabled={
+                            autosave.value !== "after_delay" ||
+                            override.isOverridden
                           }
-                        }}
-                      />
-                    </FormControl>
-                    <FormMessage />
-                    <IsOverridden
-                      userConfig={config}
-                      name="save.autosave_delay"
-                    />
-                  </FormItem>
-                )}
+                          {...field}
+                          value={override.value / 1000}
+                          minValue={1}
+                          onChange={(value) => {
+                            field.onChange(value * 1000);
+                            if (!Number.isNaN(value)) {
+                              onSubmit(form.getValues());
+                            }
+                          }}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                      <IsOverridden override={override} />
+                    </FormItem>
+                  );
+                }}
               />
               {/* auto_download is a runtime setting in the backend, but it makes
                * more sense as an autosave setting. */}
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="runtime.default_auto_download"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col gap-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Save cell outputs as</FormLabel>
@@ -295,9 +304,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                             <Checkbox
                               id={htmlCheckboxId}
                               checked={
-                                Array.isArray(field.value) &&
-                                field.value.includes("html")
+                                Array.isArray(override.value) &&
+                                override.value.includes("html")
                               }
+                              disabled={override.isOverridden}
                               onCheckedChange={() => {
                                 const currentValue = Array.isArray(field.value)
                                   ? field.value
@@ -313,9 +323,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                             <Checkbox
                               id={ipynbCheckboxId}
                               checked={
-                                Array.isArray(field.value) &&
-                                field.value.includes("ipynb")
+                                Array.isArray(override.value) &&
+                                override.value.includes("ipynb")
                               }
+                              disabled={override.isOverridden}
                               onCheckedChange={() => {
                                 const currentValue = Array.isArray(field.value)
                                   ? field.value
@@ -332,10 +343,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         </div>
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="runtime.default_auto_download"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
                     <FormDescription>
                       When enabled, marimo will periodically save notebooks in
@@ -348,10 +356,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
               />
             </SettingGroup>
             <SettingGroup title="Formatting">
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="save.format_on_save"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <FormItem className={formItemClasses}>
                     <FormLabel className="font-normal">
                       Format on save
@@ -359,25 +367,22 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                     <FormControl>
                       <Checkbox
                         data-testid="format-on-save-checkbox"
-                        checked={field.value}
-                        disabled={field.disabled}
+                        checked={override.value}
+                        disabled={field.disabled || override.isOverridden}
                         onCheckedChange={(checked) => {
                           field.onChange(checked);
                         }}
                       />
                     </FormControl>
                     <FormMessage />
-                    <IsOverridden
-                      userConfig={config}
-                      name="save.format_on_save"
-                    />
+                    <IsOverridden override={override} />
                   </FormItem>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="formatting.line_length"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Line length</FormLabel>
@@ -387,7 +392,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                           data-testid="line-length-input"
                           className="m-0 w-24"
                           {...field}
-                          value={field.value}
+                          value={override.value}
+                          isDisabled={override.isOverridden}
                           minValue={1}
                           maxValue={1000}
                           onChange={(value) => {
@@ -400,10 +406,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="formatting.line_length"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
 
                     <FormDescription>
@@ -414,10 +417,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
               />
             </SettingGroup>
             <SettingGroup title="Autocomplete">
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="completion.activate_on_typing"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel className="font-normal">
@@ -426,18 +429,15 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <FormControl>
                         <Checkbox
                           data-testid="autocomplete-checkbox"
-                          checked={field.value}
-                          disabled={field.disabled}
+                          checked={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           onCheckedChange={(checked) => {
                             field.onChange(Boolean(checked));
                           }}
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="completion.activate_on_typing"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
                     <FormDescription>
                       When unchecked, code completion is still available through
@@ -482,10 +482,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   suggestions.
                 </FormDescription>
               </div>
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="completion.signature_hint_on_typing"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel className="font-normal">
@@ -494,22 +494,52 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <FormControl>
                         <Checkbox
                           data-testid="signature-hint-on-type-checkbox"
-                          checked={field.value ?? false}
-                          disabled={field.disabled}
+                          checked={override.value ?? false}
+                          disabled={field.disabled || override.isOverridden}
                           onCheckedChange={(checked) => {
                             field.onChange(Boolean(checked));
                           }}
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="completion.signature_hint_on_typing"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
                     <FormDescription>
                       Display signature hints while typing within function
                       calls.
+                    </FormDescription>
+                  </div>
+                )}
+              />
+              <OverriddenFormField
+                control={form.control}
+                name="completion.auto_close_pairs"
+                render={({ field, override }) => (
+                  <div className="flex flex-col space-y-1">
+                    <FormItem className={formItemClasses}>
+                      <FormLabel className="font-normal">
+                        Auto-close pairs
+                      </FormLabel>
+                      <FormControl>
+                        <Checkbox
+                          data-testid="auto-close-pairs-checkbox"
+                          checked={override.value ?? true}
+                          disabled={field.disabled || override.isOverridden}
+                          onCheckedChange={(checked) => {
+                            field.onChange(Boolean(checked));
+                          }}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                      <IsOverridden override={override} />
+                    </FormItem>
+                    <FormDescription>
+                      Automatically insert closing brackets{" "}
+                      <code className="text-xs">{"()"}</code>,{" "}
+                      <code className="text-xs">{"[]"}</code>,{" "}
+                      <code className="text-xs">{"{}"}</code>, and quotes{" "}
+                      <code className="text-xs">{`""`}</code>,{" "}
+                      <code className="text-xs">{`''`}</code> when opening one.
                     </FormDescription>
                   </div>
                 )}
@@ -528,10 +558,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                 different features may conflict.
               </FormDescription>
 
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="language_servers.pylsp.enabled"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col gap-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>
@@ -547,20 +577,17 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <FormControl>
                         <Checkbox
                           data-testid="pylsp-checkbox"
-                          checked={field.value}
-                          disabled={field.disabled}
+                          checked={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           onCheckedChange={(checked) => {
                             field.onChange(Boolean(checked));
                           }}
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="language_servers.pylsp.enabled"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
-                    {field.value && !capabilities.pylsp && (
+                    {override.value && !capabilities.pylsp && (
                       <Banner kind="danger">
                         The Python Language Server is not available in your
                         current environment. Please install{" "}
@@ -571,10 +598,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="language_servers.basedpyright.enabled"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col gap-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>
@@ -590,20 +617,17 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <FormControl>
                         <Checkbox
                           data-testid="basedpyright-checkbox"
-                          checked={field.value}
-                          disabled={field.disabled}
+                          checked={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           onCheckedChange={(checked) => {
                             field.onChange(Boolean(checked));
                           }}
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="language_servers.basedpyright.enabled"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
-                    {field.value && !capabilities.basedpyright && (
+                    {override.value && !capabilities.basedpyright && (
                       <Banner kind="danger">
                         basedpyright is not available in your current
                         environment. Please install{" "}
@@ -614,10 +638,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="language_servers.pyrefly.enabled"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col gap-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>
@@ -633,20 +657,17 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <FormControl>
                         <Checkbox
                           data-testid="pyrefly-checkbox"
-                          checked={field.value}
-                          disabled={field.disabled}
+                          checked={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           onCheckedChange={(checked) => {
                             field.onChange(Boolean(checked));
                           }}
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="language_servers.pyrefly.enabled"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
-                    {field.value && !capabilities.pyrefly && (
+                    {override.value && !capabilities.pyrefly && (
                       <Banner kind="danger">
                         Pyrefly is not available in your current environment.
                         Please install <Kbd className="inline">pyrefly</Kbd> in
@@ -656,10 +677,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="language_servers.ty.enabled"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col gap-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>
@@ -675,20 +696,17 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <FormControl>
                         <Checkbox
                           data-testid="ty-checkbox"
-                          checked={field.value}
-                          disabled={field.disabled}
+                          checked={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           onCheckedChange={(checked) => {
                             field.onChange(Boolean(checked));
                           }}
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="language_servers.ty.enabled"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
-                    {field.value && !capabilities.ty && (
+                    {override.value && !capabilities.ty && (
                       <Banner kind="danger">
                         ty is not available in your current environment. Please
                         install <Kbd className="inline">ty</Kbd> in your
@@ -698,10 +716,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="diagnostics.enabled"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <FormItem className={formItemClasses}>
                     <FormLabel>
                       <Badge variant="defaultOutline" className="mr-2">
@@ -712,28 +730,25 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                     <FormControl>
                       <Checkbox
                         data-testid="diagnostics-checkbox"
-                        checked={field.value}
-                        disabled={field.disabled}
+                        checked={override.value}
+                        disabled={field.disabled || override.isOverridden}
                         onCheckedChange={(checked) => {
                           field.onChange(Boolean(checked));
                         }}
                       />
                     </FormControl>
                     <FormMessage />
-                    <IsOverridden
-                      userConfig={config}
-                      name="diagnostics.enabled"
-                    />
+                    <IsOverridden override={override} />
                   </FormItem>
                 )}
               />
             </SettingGroup>
 
             <SettingGroup title="Keymap">
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="keymap.preset"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Keymap</FormLabel>
@@ -741,8 +756,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         <NativeSelect
                           data-testid="keymap-select"
                           onChange={(e) => field.onChange(e.target.value)}
-                          value={field.value}
-                          disabled={field.disabled}
+                          value={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           className="inline-flex mr-2"
                         >
                           {KEYMAP_PRESETS.map((option) => (
@@ -753,15 +768,15 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         </NativeSelect>
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden userConfig={config} name="keymap.preset" />
+                      <IsOverridden override={override} />
                     </FormItem>
                   </div>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="keymap.destructive_delete"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel className="font-normal">
@@ -770,18 +785,15 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <FormControl>
                         <Checkbox
                           data-testid="destructive-delete-checkbox"
-                          checked={field.value}
-                          disabled={field.disabled}
+                          checked={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           onCheckedChange={(checked) => {
                             field.onChange(Boolean(checked));
                           }}
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="keymap.destructive_delete"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
                     <FormDescription className="flex items-center gap-1">
                       Allow deleting non-empty cells
@@ -822,10 +834,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
         return (
           <>
             <SettingGroup title="Display">
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="display.default_width"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Default width</FormLabel>
@@ -833,8 +845,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         <NativeSelect
                           data-testid="user-config-width-select"
                           onChange={(e) => field.onChange(e.target.value)}
-                          value={field.value}
-                          disabled={field.disabled}
+                          value={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           className="inline-flex mr-2"
                         >
                           {getAppWidths().map((option) => (
@@ -845,10 +857,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         </NativeSelect>
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="display.default_width"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
 
                     <FormDescription>
@@ -858,10 +867,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="display.theme"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Theme</FormLabel>
@@ -869,8 +878,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         <NativeSelect
                           data-testid="theme-select"
                           onChange={(e) => field.onChange(e.target.value)}
-                          value={field.value}
-                          disabled={field.disabled}
+                          value={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           className="inline-flex mr-2"
                         >
                           {THEMES.map((option) => (
@@ -881,7 +890,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         </NativeSelect>
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden userConfig={config} name="display.theme" />
+                      <IsOverridden override={override} />
                     </FormItem>
 
                     <FormDescription>
@@ -891,10 +900,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="display.code_editor_font_size"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <FormItem className={formItemClasses}>
                     <FormLabel>Code editor font size (px)</FormLabel>
                     <FormControl>
@@ -904,7 +913,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                           data-testid="code-editor-font-size-input"
                           className="m-0 w-24"
                           {...field}
-                          value={field.value}
+                          value={override.value}
+                          isDisabled={override.isOverridden}
                           minValue={8}
                           maxValue={32}
                           onChange={(value) => {
@@ -915,17 +925,14 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       </span>
                     </FormControl>
                     <FormMessage />
-                    <IsOverridden
-                      userConfig={config}
-                      name="display.code_editor_font_size"
-                    />
+                    <IsOverridden override={override} />
                   </FormItem>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="display.locale"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Locale</FormLabel>
@@ -939,8 +946,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                               field.onChange(e.target.value);
                             }
                           }}
-                          value={field.value || LOCALE_SYSTEM_VALUE}
-                          disabled={field.disabled}
+                          value={override.value || LOCALE_SYSTEM_VALUE}
+                          disabled={field.disabled || override.isOverridden}
                           className="inline-flex mr-2"
                         >
                           <option value={LOCALE_SYSTEM_VALUE}>System</option>
@@ -952,7 +959,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         </NativeSelect>
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden userConfig={config} name="display.locale" />
+                      <IsOverridden override={override} />
                     </FormItem>
 
                     <FormDescription>
@@ -963,25 +970,23 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                   </div>
                 )}
               />
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="display.reference_highlighting"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Reference highlighting</FormLabel>
                       <FormControl>
                         <Checkbox
                           data-testid="reference-highlighting-checkbox"
-                          checked={field.value}
+                          checked={override.value}
+                          disabled={override.isOverridden}
                           onCheckedChange={field.onChange}
                         />
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="display.reference_highlighting"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
 
                     <FormDescription>
@@ -993,10 +998,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
               />
             </SettingGroup>
             <SettingGroup title="Outputs">
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 name="display.cell_output"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Cell output area</FormLabel>
@@ -1004,8 +1009,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         <NativeSelect
                           data-testid="cell-output-select"
                           onChange={(e) => field.onChange(e.target.value)}
-                          value={field.value}
-                          disabled={field.disabled}
+                          value={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           className="inline-flex mr-2"
                         >
                           {["above", "below"].map((option) => (
@@ -1016,10 +1021,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         </NativeSelect>
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="display.cell_output"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
 
                     <FormDescription>
@@ -1035,11 +1037,11 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
         return (
           <>
             <SettingGroup title="Package Management">
-              <FormField
+              <OverriddenFormField
                 control={form.control}
                 disabled={isWasmRuntime}
                 name="package_management.manager"
-                render={({ field }) => (
+                render={({ field, override }) => (
                   <div className="flex flex-col space-y-1">
                     <FormItem className={formItemClasses}>
                       <FormLabel>Manager</FormLabel>
@@ -1047,8 +1049,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         <NativeSelect
                           data-testid="package-manager-select"
                           onChange={(e) => field.onChange(e.target.value)}
-                          value={field.value}
-                          disabled={field.disabled}
+                          value={override.value}
+                          disabled={field.disabled || override.isOverridden}
                           className="inline-flex mr-2"
                         >
                           {PackageManagerNames.map((option) => (
@@ -1059,10 +1061,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                         </NativeSelect>
                       </FormControl>
                       <FormMessage />
-                      <IsOverridden
-                        userConfig={config}
-                        name="package_management.manager"
-                      />
+                      <IsOverridden override={override} />
                     </FormItem>
 
                     <FormDescription>
@@ -1086,17 +1085,17 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
               />
             </SettingGroup>
             <SettingGroup title="Data">
-              <DataForm form={form} config={config} onSubmit={onSubmit} />
+              <DataForm form={form} onSubmit={onSubmit} />
             </SettingGroup>
           </>
         );
       case "runtime":
         return (
           <SettingGroup title="Runtime configuration">
-            <FormField
+            <OverriddenFormField
               control={form.control}
               name="runtime.auto_instantiate"
-              render={({ field }) => (
+              render={({ field, override }) => (
                 <div className="flex flex-col gap-y-1">
                   <FormItem className={formItemClasses}>
                     <FormLabel className="font-normal">
@@ -1105,16 +1104,13 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                     <FormControl>
                       <Checkbox
                         data-testid="auto-instantiate-checkbox"
-                        disabled={field.disabled}
-                        checked={field.value}
+                        disabled={field.disabled || override.isOverridden}
+                        checked={override.value}
                         onCheckedChange={field.onChange}
                       />
                     </FormControl>
                     <FormMessage />
-                    <IsOverridden
-                      userConfig={config}
-                      name="runtime.auto_instantiate"
-                    />
+                    <IsOverridden override={override} />
                   </FormItem>
 
                   <FormDescription>
@@ -1123,10 +1119,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                 </div>
               )}
             />
-            <FormField
+            <OverriddenFormField
               control={form.control}
               name="runtime.on_cell_change"
-              render={({ field }) => (
+              render={({ field, override }) => (
                 <div className="flex flex-col gap-y-1">
                   <FormItem className={formItemClasses}>
                     <FormLabel className="font-normal">
@@ -1136,7 +1132,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <NativeSelect
                         data-testid="on-cell-change-select"
                         onChange={(e) => field.onChange(e.target.value)}
-                        value={field.value}
+                        value={override.value}
+                        disabled={override.isOverridden}
                         className="inline-flex mr-2"
                       >
                         {["lazy", "autorun"].map((option) => (
@@ -1147,10 +1144,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       </NativeSelect>
                     </FormControl>
                     <FormMessage />
-                    <IsOverridden
-                      userConfig={config}
-                      name="runtime.on_cell_change"
-                    />
+                    <IsOverridden override={override} />
                   </FormItem>
                   <FormDescription>
                     Whether marimo should automatically run cells or just mark
@@ -1162,10 +1156,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                 </div>
               )}
             />
-            <FormField
+            <OverriddenFormField
               control={form.control}
               name="runtime.auto_reload"
-              render={({ field }) => (
+              render={({ field, override }) => (
                 <div className="flex flex-col gap-y-1">
                   <FormItem className={formItemClasses}>
                     <FormLabel className="font-normal">
@@ -1175,8 +1169,8 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       <NativeSelect
                         data-testid="auto-reload-select"
                         onChange={(e) => field.onChange(e.target.value)}
-                        value={field.value}
-                        disabled={isWasmRuntime}
+                        value={override.value}
+                        disabled={isWasmRuntime || override.isOverridden}
                         className="inline-flex mr-2"
                       >
                         {["off", "lazy", "autorun"].map((option) => (
@@ -1187,10 +1181,7 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       </NativeSelect>
                     </FormControl>
                     <FormMessage />
-                    <IsOverridden
-                      userConfig={config}
-                      name="runtime.auto_reload"
-                    />
+                    <IsOverridden override={override} />
                   </FormItem>
                   <FormDescription>
                     Whether marimo should automatically reload modules before
@@ -1202,10 +1193,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
               )}
             />
 
-            <FormField
+            <OverriddenFormField
               control={form.control}
               name="runtime.reactive_tests"
-              render={({ field }) => (
+              render={({ field, override }) => (
                 <div className="flex flex-col gap-y-1">
                   <FormItem className={formItemClasses}>
                     <FormLabel className="font-normal">
@@ -1214,15 +1205,13 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                     <FormControl>
                       <Checkbox
                         data-testid="reactive-test-checkbox"
-                        checked={field.value}
+                        checked={override.value}
+                        disabled={override.isOverridden}
                         onCheckedChange={field.onChange}
                       />
                     </FormControl>
                   </FormItem>
-                  <IsOverridden
-                    userConfig={config}
-                    name="runtime.reactive_tests"
-                  />
+                  <IsOverridden override={override} />
                   <FormMessage />
                   <FormDescription>
                     Enable reactive pytest tests in notebook. When a cell
@@ -1280,10 +1269,10 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                 </div>
               )}
             />
-            <FormField
+            <OverriddenFormField
               control={form.control}
               name="experimental.external_agents"
-              render={({ field }) => (
+              render={({ field, override }) => (
                 <div className="flex flex-col gap-y-1">
                   <FormItem className={formItemClasses}>
                     <FormLabel className="font-normal">
@@ -1292,15 +1281,13 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                     <FormControl>
                       <Checkbox
                         data-testid="external-agents-checkbox"
-                        checked={field.value === true}
+                        checked={override.value === true}
+                        disabled={override.isOverridden}
                         onCheckedChange={field.onChange}
                       />
                     </FormControl>
                   </FormItem>
-                  <IsOverridden
-                    userConfig={config}
-                    name="experimental.external_agents"
-                  />
+                  <IsOverridden override={override} />
                   <FormDescription>
                     Enable experimental external agents such as Claude Code and
                     Gemini CLI. Learn more in the{" "}
@@ -1308,6 +1295,58 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
                       docs
                     </ExternalLink>
                     .
+                  </FormDescription>
+                </div>
+              )}
+            />
+            <OverriddenFormField
+              control={form.control}
+              name="experimental.debugger"
+              render={({ field, override }) => (
+                <div className="flex flex-col gap-y-1">
+                  <FormItem className={formItemClasses}>
+                    <FormLabel className="font-normal">Debugger</FormLabel>
+                    <FormControl>
+                      <Checkbox
+                        data-testid="debugger-checkbox"
+                        checked={override.value === true}
+                        disabled={override.isOverridden}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                  <IsOverridden override={override} />
+                  <FormDescription>
+                    Enable the live debugger: a clickable breakpoint gutter,
+                    current-line highlighting while a cell runs, and dropping
+                    into <Kbd className="inline">pdb</Kbd> at breakpoints. This
+                    change requires a page refresh to take effect.
+                  </FormDescription>
+                </div>
+              )}
+            />
+            <OverriddenFormField
+              control={form.control}
+              name="experimental.line_timing"
+              render={({ field, override }) => (
+                <div className="flex flex-col gap-y-1">
+                  <FormItem className={formItemClasses}>
+                    <FormLabel className="font-normal">Line Timing</FormLabel>
+                    <FormControl>
+                      <Checkbox
+                        data-testid="line-timing-checkbox"
+                        checked={override.value === true}
+                        disabled={override.isOverridden}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                  <IsOverridden override={override} />
+                  <FormDescription>
+                    Highlight the line a cell is currently executing in green,
+                    with an elapsed timer next to long-running lines. Adds
+                    tracing overhead to every run while enabled. This change
+                    requires a page refresh to take effect.
                   </FormDescription>
                 </div>
               )}
@@ -1334,7 +1373,11 @@ export const UserConfigForm: React.FC<UserConfigFormProps> = ({
     <Form {...form}>
       <form
         ref={formElement}
-        onChange={submitMode === "auto" ? form.handleSubmit(onSubmit) : undefined}
+        onChange={
+          submitMode === "auto"
+            ? form.handleSubmit((values) => onSubmit(values))
+            : undefined
+        }
         className="flex text-pretty overflow-hidden"
       >
         <div className="w-full gap-2 flex flex-col overflow-auto">

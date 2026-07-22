@@ -108,6 +108,55 @@ class VariableData:
         )
 
 
+def _defers_ref_resolution(datum: VariableData) -> bool:
+    """Whether a definition resolves its references lazily, at call time.
+
+    Functions, lambdas, and classes (via their methods) read the names they
+    reference from the enclosing scope when they are *called*, not when they
+    are defined — i.e. they bind those names late. This is true regardless of
+    whether the definition actually captures anything: a function that
+    references nothing simply has empty `required_refs`. Contrast with eager
+    definitions like `y = _x + 1`, which read `_x` at definition time.
+    """
+    return datum.kind in ("function", "class") or (
+        "_lambda" in datum.required_refs
+    )
+
+
+def get_closure_refs(
+    variable_data: dict[Name, list[VariableData]],
+) -> set[Name]:
+    """Return the names that functions, lambdas, and classes close over.
+
+    Because closures resolve their references at call time, the names they
+    depend on must stay in scope even when they would otherwise be considered
+    temporary. References are followed transitively through closures: if a
+    closure references a private helper that is itself a closure, that helper's
+    references are included too.
+    """
+    refs: set[Name] = set()
+    # Seed the search with every reference made by a late-binding definition;
+    # these are the names that must survive so the definitions stay callable.
+    frontier: set[Name] = {
+        ref
+        for data in variable_data.values()
+        for datum in data
+        if _defers_ref_resolution(datum)
+        for ref in datum.required_refs
+    }
+    while frontier:
+        ref = frontier.pop()
+        if ref in refs:
+            continue
+        refs.add(ref)
+        # Only late-binding definitions defer resolution to call time, so only
+        # their references need to be retained transitively.
+        for datum in variable_data.get(ref, []):
+            if _defers_ref_resolution(datum):
+                frontier |= datum.required_refs - refs
+    return refs
+
+
 @dataclass
 class Block:
     """A scope in which names are declared."""
@@ -710,6 +759,8 @@ class ScopedVisitor(ast.NodeVisitor):
                 # so that later statements don't create refs to tables defined in earlier statements
                 defined_names: set[str] = set()
 
+                has_sqlglot = DependencyManager.sqlglot.has()
+
                 for statement_sql in statement_queries:
                     # Parse the refs and defs of each statement
                     # Add all tables/dbs created in the query to the defs
@@ -754,14 +805,17 @@ class ScopedVisitor(ast.NodeVisitor):
                         self._define(None, _catalog, VariableData("catalog"))
                         defined_names.add(_catalog)
 
-                    sql_refs = find_sql_refs_cached(statement_sql)
+                    if has_sqlglot:
+                        sql_refs = find_sql_refs_cached(statement_sql)
 
-                    for ref in sql_refs:
-                        name = ref.qualified_name
-                        # Cells that define the same name aren't cycles, so we skip them
-                        if name in defined_names:
-                            continue
-                        self._add_ref(None, name, deleted=False, sql_ref=ref)
+                        for ref in sql_refs:
+                            name = ref.qualified_name
+                            # Cells that define the same name aren't cycles, so we skip them
+                            if name in defined_names:
+                                continue
+                            self._add_ref(
+                                None, name, deleted=False, sql_ref=ref
+                            )
 
         # Visit arguments, keyword args, etc.
         self.generic_visit(node)
