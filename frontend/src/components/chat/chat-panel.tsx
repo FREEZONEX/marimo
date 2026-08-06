@@ -22,7 +22,6 @@ import {
   NotebookText,
   PlusIcon,
   SparklesIcon,
-  SettingsIcon,
   CodeIcon,
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
@@ -145,8 +144,6 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
   activeChatId,
   setActiveChat,
 }) => {
-  const [settingsOpen, setSettingsOpen] = useState(false);
-
   return (
     <div className="flex border-b px-2 py-1 justify-between shrink-0 items-center">
       <Tooltip content="New chat">
@@ -155,27 +152,6 @@ const ChatHeader: React.FC<ChatHeaderProps> = ({
         </Button>
       </Tooltip>
       <div className="flex items-center gap-2">
-        <Tooltip content="AI Settings">
-          <Button
-            aria-label="AI Settings"
-            variant="text"
-            size="icon"
-            onClick={() => setSettingsOpen(true)}
-          >
-            <SettingsIcon className="h-4 w-4" />
-          </Button>
-        </Tooltip>
-        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
-          <DialogContent className="w-full sm:max-w-md">
-            <DialogHeader>
-              <DialogTitle>AI Settings</DialogTitle>
-            </DialogHeader>
-            <UserConfigForm
-              submitMode="manual"
-              onSubmitted={() => setSettingsOpen(false)}
-            />
-          </DialogContent>
-        </Dialog>
         <ChatHistoryPopover
           activeChatId={activeChatId}
           setActiveChat={setActiveChat}
